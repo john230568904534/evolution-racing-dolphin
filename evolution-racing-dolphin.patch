@@ -19,6 +19,20 @@
  extern const Info<AspectMode> GFX_ASPECT_RATIO;
  extern const Info<int> GFX_CUSTOM_ASPECT_RATIO_WIDTH;
  extern const Info<int> GFX_CUSTOM_ASPECT_RATIO_HEIGHT;
+--- a/Source/Core/VideoBackends/Vulkan/ObjectCache.cpp
++++ b/Source/Core/VideoBackends/Vulkan/ObjectCache.cpp
+@@ -145,8 +145,10 @@
+   }};
+ 
+   // Utility samplers aren't dynamically indexed.
++  // Evolution Racing dolphin-lit17s9: utility sampler 0 also in the vertex stage (emit_quads scenery reads its mesh there)
+   static const std::array<VkDescriptorSetLayoutBinding, 9> utility_sampler_bindings{{
+-      {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT},
++      {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
++       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT},
+       {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT},
+       {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT},
+       {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT},
 --- a/Source/Core/VideoBackends/Vulkan/VKStreamBuffer.cpp
 +++ b/Source/Core/VideoBackends/Vulkan/VKStreamBuffer.cpp
 @@ -47,7 +47,12 @@
@@ -463,7 +477,7 @@
    std::shared_ptr<VideoCommon::CustomAssetLibrary> m_library;
 --- a/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.cpp
 +++ b/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.cpp
-@@ -0,0 +1,3816 @@
+@@ -0,0 +1,4977 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -477,7 +491,14 @@
 +#include <cstring>
 +#include <cstdlib>
 +#include <map>
++#include <chrono>
++#include <future>
 +#include <span>
++#include <thread>
++
++#include <tinygltf/tiny_gltf.h>
++#include <tinygltf/stb_image.h>
++#include <tinygltf/stb_image_write.h>
 +
 +#include "Common/Buffer.h"
 +#include "Common/FileUtil.h"
@@ -490,6 +511,8 @@
 +#include "Core/System.h"
 +
 +#include "VideoCommon/AbstractGfx.h"
++#include "VideoCommon/BPMemory.h"
++#include "VideoCommon/XFMemory.h"
 +#include "VideoCommon/AbstractPipeline.h"
 +#include "VideoCommon/AbstractShader.h"
 +#include "VideoCommon/AbstractTexture.h"
@@ -1014,6 +1037,1095 @@
 +}
 +}  // namespace
 +
++// ---- Evolution Racing dolphin-lit17s9 / lit17s10: scenery ----
++namespace PC5090Scenery
++{
++int s_sc_refs = 0;
++std::string s_sc_dump;  // slot file "debug_dump": a folder that gets each mesh's base colour (<= 512 px) as PNG
++// the world draws' GX fog (the race's own distance fog), captured with the view matrix they use
++struct ScFog
++{
++  float a = 0.0f, c = 0.0f, bmag = 1.0f, bshift = 1.0f;
++  float fsel = 0.0f, far_z = 0.0f, z_range = 0.0f, persp = 1.0f;
++  std::array<float, 3> col{};
++};
++struct ScView
++{
++  u64 frame = ~0ull;
++  bool have_ram = false;
++  float ram[12]{};
++  struct Cand
++  {
++    std::array<float, 12> m;
++    u32 n;
++    ScFog fog;
++  };
++  std::vector<Cand> cands;
++  u32 draws = 0;
++};
++ScView s_scv;
++
++ScFog CurrentFog()
++{
++  ScFog f;
++  const u32 fsel = static_cast<u32>(bpmem.fog.c_proj_fsel.fsel.Value());
++  if (g_ActiveConfig.bDisableFog || fsel == 0)
++    return f;
++  f.a = bpmem.fog.GetA();
++  f.c = bpmem.fog.GetC();
++  if (!std::isfinite(f.a) || !std::isfinite(f.c))
++    return f;
++  f.fsel = static_cast<float>(fsel);
++  f.bmag = static_cast<float>(bpmem.fog.b_magnitude);
++  f.bshift = static_cast<float>(bpmem.fog.b_shift);
++  f.persp = bpmem.fog.c_proj_fsel.proj == FogProjection::Perspective ? 1.0f : 0.0f;
++  f.far_z = xfmem.viewport.farZ;
++  f.z_range = xfmem.viewport.zRange;
++  f.col = {bpmem.fog.color.r / 255.0f, bpmem.fog.color.g / 255.0f, bpmem.fog.color.b / 255.0f};
++  return f;
++}
++
++bool ReadU32(u32 a, u32* o)
++{
++  auto& memory = Core::System::GetInstance().GetMemory();
++  const u8* p = memory.GetPointerForRange(a, 4);
++  if (!p)
++    return false;
++  u32 v;
++  std::memcpy(&v, p, 4);
++  *o = Common::swap32(v);
++  return true;
++}
++
++bool ReadRamView(float* V)
++{
++  u32 rel = 0, cam = 0;
++  if (!ReadU32(0x800030C8, &rel) || rel < 0x80000000u || rel >= 0x81800000u || !ReadU32(rel + 0x1BAFAC, &cam) ||
++      cam < 0x80000000u || cam >= 0x81800000u - 0x200)
++    return false;
++  for (u32 i = 0; i < 12; i++)
++  {
++    u32 w = 0;
++    if (!ReadU32(cam + 0xdc + 4 * i, &w))
++      return false;
++    std::memcpy(&V[i], &w, 4);
++    if (!std::isfinite(V[i]))
++      return false;
++  }
++  for (int i = 0; i < 3; i++)
++    for (int j = 0; j < 3; j++)
++    {
++      const float d = V[i * 4] * V[j * 4] + V[i * 4 + 1] * V[j * 4 + 1] + V[i * 4 + 2] * V[j * 4 + 2];
++      if (std::abs(d - (i == j ? 1.0f : 0.0f)) > 0.02f)
++        return false;
++    }
++  return true;
++}
++
++// the race gate: venue (top half of [REL + 0x197DE0], < 256 = a race), course slot (u16 at REL + 0x18B5AC), attract
++// demo (REL + 0x17D2FC nonzero); false when the REL is not there
++bool ReadGate(u32* venue, u32* slot, bool* demo)
++{
++  u32 rel = 0, word = 0, sw = 0, d = 0;
++  if (!ReadU32(0x800030C8, &rel) || rel < 0x80000000u || rel >= 0x81800000u || !ReadU32(rel + 0x197DE0, &word))
++    return false;
++  *venue = word >> 16;
++  *demo = ReadU32(rel + 0x17D2FC, &d) && d != 0;
++  *slot = 0xFFFF;
++  if (ReadU32((rel + 0x18B5AC) & ~3u, &sw))
++    *slot = (sw >> (((rel + 0x18B5AC) & 2u) ? 0 : 16)) & 0xFFFFu;
++  return true;
++}
++
++// ---- the scene of one course slot (CPU side, built on a worker thread) ----
++struct ScImage
++{
++  u32 w = 0, h = 0;
++  std::vector<std::vector<u8>> mips;  // RGBA8, level 0 first
++};
++struct ScMeshData
++{
++  std::string file;
++  std::vector<float> verts;  // 8 floats per vertex: pos xyz, normal xyz, uv; 3 vertices per triangle
++  ScImage color, orm, emissive;
++  std::array<float, 4> base{1.0f, 1.0f, 1.0f, 1.0f};
++  std::array<float, 3> em{0.0f, 0.0f, 0.0f};
++  std::array<float, 3> center{};
++  float radius = 0.0f;
++  bool ok = false;
++};
++struct ScInstance
++{
++  int mesh = -1;
++  std::array<float, 12> W{};  // model -> world (rotation x scale, translation), row-major 3x4
++  std::array<float, 3> wc{};  // bounding sphere (world)
++  float wr = 0.0f;
++  float glow = 0.0f;
++};
++struct ScLight
++{
++  std::array<float, 3> sun{0.45f, 0.8f, 0.35f};  // towards the sun (world)
++  std::array<float, 3> sun_col{1.0f, 0.97f, 0.92f};
++  std::array<float, 3> amb{0.42f, 0.44f, 0.48f};
++  std::array<float, 4> haze{0.0f, 0.0f, 0.0f, 0.0f};  // rgb, metres (0 = none; the game's fog always applies)
++  float spec = 0.35f;
++};
++struct ScScene
++{
++  int slot = -1;
++  std::vector<ScMeshData> meshes;
++  std::vector<ScInstance> inst;
++  ScLight light;
++};
++
++bool KeepRawImage(tinygltf::Image* image, const int, std::string*, std::string*, int, int, const unsigned char* bytes,
++                  int size, void*)
++{
++  image->image.assign(bytes, bytes + size);  // decoded later, only the maps the scenery uses
++  image->width = -1;
++  image->height = -1;
++  return true;
++}
++
++void BuildMips(ScImage* img)
++{
++  while (img->mips.size() < 14)
++  {
++    const u32 w = std::max(img->w >> (img->mips.size() - 1), 1u), h = std::max(img->h >> (img->mips.size() - 1), 1u);
++    if (w == 1 && h == 1)
++      break;
++    const u32 nw = std::max(w / 2, 1u), nh = std::max(h / 2, 1u);
++    const auto& src = img->mips.back();
++    std::vector<u8> dst(static_cast<size_t>(nw) * nh * 4);
++    for (u32 y = 0; y < nh; y++)
++      for (u32 x = 0; x < nw; x++)
++        for (u32 c = 0; c < 4; c++)
++        {
++          const u32 x0 = std::min(x * 2, w - 1), x1 = std::min(x * 2 + 1, w - 1);
++          const u32 y0 = std::min(y * 2, h - 1), y1 = std::min(y * 2 + 1, h - 1);
++          const u32 s = src[(static_cast<size_t>(y0) * w + x0) * 4 + c] + src[(static_cast<size_t>(y0) * w + x1) * 4 + c] +
++                        src[(static_cast<size_t>(y1) * w + x0) * 4 + c] + src[(static_cast<size_t>(y1) * w + x1) * 4 + c];
++          dst[(static_cast<size_t>(y) * nw + x) * 4 + c] = static_cast<u8>((s + 2) / 4);
++        }
++    img->mips.push_back(std::move(dst));
++  }
++}
++
++bool DecodeTexture(const tinygltf::Model& m, int tex, u32 max_side, ScImage* out)
++{
++  if (tex < 0 || tex >= static_cast<int>(m.textures.size()))
++    return false;
++  const int src = m.textures[tex].source;
++  if (src < 0 || src >= static_cast<int>(m.images.size()))
++    return false;
++  const auto& img = m.images[src];
++  const unsigned char* bytes = img.image.data();
++  size_t size = img.image.size();
++  if (img.bufferView >= 0 && img.image.empty() && img.bufferView < static_cast<int>(m.bufferViews.size()))
++  {
++    const auto& bv = m.bufferViews[img.bufferView];
++    if (bv.buffer < 0 || bv.buffer >= static_cast<int>(m.buffers.size()) ||
++        bv.byteOffset + bv.byteLength > m.buffers[bv.buffer].data.size())
++      return false;
++    bytes = m.buffers[bv.buffer].data.data() + bv.byteOffset;
++    size = bv.byteLength;
++  }
++  if (!bytes || size == 0)
++    return false;
++  int w = 0, h = 0, n = 0;
++  stbi_uc* px = stbi_load_from_memory(bytes, static_cast<int>(size), &w, &h, &n, 4);
++  if (!px || w <= 0 || h <= 0)
++  {
++    if (px)
++      stbi_image_free(px);
++    return false;
++  }
++  out->w = static_cast<u32>(w);
++  out->h = static_cast<u32>(h);
++  out->mips.clear();
++  out->mips.emplace_back(px, px + static_cast<size_t>(w) * h * 4);
++  stbi_image_free(px);
++  BuildMips(out);
++  while ((out->w > max_side || out->h > max_side) && out->mips.size() > 1)
++  {
++    out->mips.erase(out->mips.begin());
++    out->w = std::max(out->w / 2, 1u);
++    out->h = std::max(out->h / 2, 1u);
++  }
++  return true;
++}
++
++// an accessor's element i, component k as float (float, normalised u8 / u16, or index types)
++struct Acc
++{
++  const u8* base = nullptr;
++  size_t stride = 0, count = 0;
++  int ctype = 0, ncomp = 0;
++  bool normalized = false;
++  bool Open(const tinygltf::Model& m, int idx)
++  {
++    if (idx < 0 || idx >= static_cast<int>(m.accessors.size()))
++      return false;
++    const auto& a = m.accessors[idx];
++    if (a.bufferView < 0 || a.bufferView >= static_cast<int>(m.bufferViews.size()) || a.sparse.isSparse)
++      return false;
++    const auto& bv = m.bufferViews[a.bufferView];
++    if (bv.buffer < 0 || bv.buffer >= static_cast<int>(m.buffers.size()))
++      return false;
++    const auto& buf = m.buffers[bv.buffer].data;
++    ctype = a.componentType;
++    ncomp = tinygltf::GetNumComponentsInType(a.type);
++    const int csize = tinygltf::GetComponentSizeInBytes(ctype);
++    if (ncomp <= 0 || csize <= 0)
++      return false;
++    stride = bv.byteStride ? bv.byteStride : static_cast<size_t>(ncomp * csize);
++    count = a.count;
++    normalized = a.normalized;
++    const size_t off = bv.byteOffset + a.byteOffset;
++    if (count == 0 || off + (count - 1) * stride + static_cast<size_t>(ncomp * csize) > buf.size())
++      return false;
++    base = buf.data() + off;
++    return true;
++  }
++  float F(size_t i, int k) const
++  {
++    const u8* p = base + i * stride;
++    switch (ctype)
++    {
++    case TINYGLTF_COMPONENT_TYPE_FLOAT:
++    {
++      float v;
++      std::memcpy(&v, p + 4 * k, 4);
++      return v;
++    }
++    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:
++      return normalized ? p[k] / 255.0f : p[k];
++    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
++    {
++      u16 v;
++      std::memcpy(&v, p + 2 * k, 2);
++      return normalized ? v / 65535.0f : v;
++    }
++    case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:
++    {
++      u32 v;
++      std::memcpy(&v, p + 4 * k, 4);
++      return static_cast<float>(v);
++    }
++    default:
++      return 0.0f;
++    }
++  }
++  u32 U(size_t i) const
++  {
++    const u8* p = base + i * stride;
++    if (ctype == TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE)
++      return p[0];
++    if (ctype == TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT)
++    {
++      u16 v;
++      std::memcpy(&v, p, 2);
++      return v;
++    }
++    u32 v;
++    std::memcpy(&v, p, 4);
++    return v;
++  }
++};
++
++using Mat4 = std::array<float, 16>;  // column-major (glTF)
++Mat4 MatMul(const Mat4& a, const Mat4& b)
++{
++  Mat4 r{};
++  for (int c = 0; c < 4; c++)
++    for (int rr = 0; rr < 4; rr++)
++      r[c * 4 + rr] = a[0 * 4 + rr] * b[c * 4 + 0] + a[1 * 4 + rr] * b[c * 4 + 1] + a[2 * 4 + rr] * b[c * 4 + 2] +
++                      a[3 * 4 + rr] * b[c * 4 + 3];
++  return r;
++}
++Mat4 NodeLocal(const tinygltf::Node& n)
++{
++  Mat4 m{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++  if (n.matrix.size() == 16)
++  {
++    for (int i = 0; i < 16; i++)
++      m[i] = static_cast<float>(n.matrix[i]);
++    return m;
++  }
++  float s[3] = {1, 1, 1}, q[4] = {0, 0, 0, 1}, t[3] = {0, 0, 0};
++  if (n.scale.size() == 3)
++    for (int i = 0; i < 3; i++)
++      s[i] = static_cast<float>(n.scale[i]);
++  if (n.rotation.size() == 4)
++    for (int i = 0; i < 4; i++)
++      q[i] = static_cast<float>(n.rotation[i]);
++  if (n.translation.size() == 3)
++    for (int i = 0; i < 3; i++)
++      t[i] = static_cast<float>(n.translation[i]);
++  const float x = q[0], y = q[1], z = q[2], w = q[3];
++  const float R[9] = {1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w),
++                      2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w),
++                      2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y)};  // column-major
++  for (int c = 0; c < 3; c++)
++    for (int r = 0; r < 3; r++)
++      m[c * 4 + r] = R[c * 3 + r] * s[c];
++  m[12] = t[0];
++  m[13] = t[1];
++  m[14] = t[2];
++  return m;
++}
++
++void AppendPrimitive(const tinygltf::Model& m, const tinygltf::Primitive& pr, const Mat4& M, std::vector<float>* out)
++{
++  if (pr.mode != -1 && pr.mode != TINYGLTF_MODE_TRIANGLES)
++    return;
++  const auto pit = pr.attributes.find("POSITION");
++  if (pit == pr.attributes.end())
++    return;
++  Acc P, N, T, I;
++  if (!P.Open(m, pit->second) || P.ncomp < 3)
++    return;
++  bool hasn = false, hast = false;
++  if (const auto it = pr.attributes.find("NORMAL"); it != pr.attributes.end())
++    hasn = N.Open(m, it->second) && N.ncomp >= 3 && N.count == P.count;
++  if (const auto it = pr.attributes.find("TEXCOORD_0"); it != pr.attributes.end())
++    hast = T.Open(m, it->second) && T.ncomp >= 2 && T.count == P.count;
++  const bool indexed = pr.indices >= 0 && I.Open(m, pr.indices);
++  const size_t n = indexed ? I.count : P.count;
++  out->reserve(out->size() + n / 3 * 3 * 8);
++  for (size_t t = 0; t + 2 < n; t += 3)
++  {
++    u32 vi[3];
++    bool ok = true;
++    for (int k = 0; k < 3; k++)
++    {
++      vi[k] = indexed ? I.U(t + k) : static_cast<u32>(t + k);
++      ok = ok && vi[k] < P.count;
++    }
++    if (!ok)
++      continue;
++    float p[3][3], nn[3][3];
++    for (int k = 0; k < 3; k++)
++    {
++      const float x = P.F(vi[k], 0), y = P.F(vi[k], 1), z = P.F(vi[k], 2);
++      for (int r = 0; r < 3; r++)
++        p[k][r] = M[0 * 4 + r] * x + M[1 * 4 + r] * y + M[2 * 4 + r] * z + M[3 * 4 + r];
++    }
++    const float e1[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]};
++    const float e2[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
++    float fn[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
++    const float fl = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
++    if (fl < 1e-12f)
++      continue;
++    for (float& x : fn)
++      x /= fl;
++    for (int k = 0; k < 3; k++)
++    {
++      if (hasn)
++      {
++        const float x = N.F(vi[k], 0), y = N.F(vi[k], 1), z = N.F(vi[k], 2);
++        float v[3];
++        for (int r = 0; r < 3; r++)
++          v[r] = M[0 * 4 + r] * x + M[1 * 4 + r] * y + M[2 * 4 + r] * z;
++        const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
++        if (l > 1e-12f)
++          for (int r = 0; r < 3; r++)
++            nn[k][r] = v[r] / l;
++        else
++          for (int r = 0; r < 3; r++)
++            nn[k][r] = fn[r];
++      }
++      else
++      {
++        for (int r = 0; r < 3; r++)
++          nn[k][r] = fn[r];
++      }
++      out->insert(out->end(), {p[k][0], p[k][1], p[k][2], nn[k][0], nn[k][1], nn[k][2],
++                               hast ? T.F(vi[k], 0) : 0.0f, hast ? T.F(vi[k], 1) : 0.0f});
++    }
++  }
++}
++
++void WalkNode(const tinygltf::Model& m, int ni, const Mat4& parent, int depth, std::vector<float>* out, int* material)
++{
++  if (ni < 0 || ni >= static_cast<int>(m.nodes.size()) || depth > 32)
++    return;
++  const auto& n = m.nodes[ni];
++  const Mat4 M = MatMul(parent, NodeLocal(n));
++  if (n.mesh >= 0 && n.mesh < static_cast<int>(m.meshes.size()))
++    for (const auto& pr : m.meshes[n.mesh].primitives)
++    {
++      if (*material < 0)
++        *material = pr.material;
++      AppendPrimitive(m, pr, M, out);
++    }
++  for (int c : n.children)
++    WalkNode(m, c, M, depth + 1, out, material);
++}
++
++// glTF 2.0 (.glb / .gltf): every triangle of the default scene, node transforms applied; the first material's base
++// colour (+ factor), metallic-roughness map (R = occlusion as the portal's files pack it, G roughness, B metal) and
++// emissive map (+ factor). One material per file (more: the first one's maps for all).
++bool LoadGltfMesh(const std::string& path, u32 max_side, ScMeshData* d)
++{
++  tinygltf::Model m;
++  tinygltf::TinyGLTF loader;
++  loader.SetImageLoader(KeepRawImage, nullptr);
++  std::string err, warn;
++  const bool glb = path.size() > 4 && (path.ends_with(".glb") || path.ends_with(".GLB"));
++  const bool ok = glb ? loader.LoadBinaryFromFile(&m, &err, &warn, path) : loader.LoadASCIIFromFile(&m, &err, &warn, path);
++  if (!ok)
++  {
++    std::fprintf(stderr, "SCENERY cannot read %s: %s\n", path.c_str(), err.c_str());
++    return false;
++  }
++  const Mat4 I{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++  int material = -1;
++  const int scene = m.defaultScene >= 0 && m.defaultScene < static_cast<int>(m.scenes.size()) ? m.defaultScene : 0;
++  if (!m.scenes.empty())
++    for (int ni : m.scenes[scene].nodes)
++      WalkNode(m, ni, I, 0, &d->verts, &material);
++  else
++    for (int ni = 0; ni < static_cast<int>(m.nodes.size()); ni++)
++      WalkNode(m, ni, I, 0, &d->verts, &material);
++  if (d->verts.empty())
++    return false;
++  if (material >= 0 && material < static_cast<int>(m.materials.size()))
++  {
++    const auto& mat = m.materials[material];
++    const auto& pbr = mat.pbrMetallicRoughness;
++    for (int i = 0; i < 4 && i < static_cast<int>(pbr.baseColorFactor.size()); i++)
++      d->base[i] = static_cast<float>(pbr.baseColorFactor[i]);
++    for (int i = 0; i < 3 && i < static_cast<int>(mat.emissiveFactor.size()); i++)
++      d->em[i] = static_cast<float>(mat.emissiveFactor[i]);
++    DecodeTexture(m, pbr.baseColorTexture.index, max_side, &d->color);
++    const int orm = pbr.metallicRoughnessTexture.index >= 0 ? pbr.metallicRoughnessTexture.index : mat.occlusionTexture.index;
++    DecodeTexture(m, orm, std::max(max_side / 2, 256u), &d->orm);
++    if (mat.emissiveTexture.index >= 0)
++      DecodeTexture(m, mat.emissiveTexture.index, max_side, &d->emissive);
++  }
++  return true;
++}
++
++// OBJ: "v x y z" and "f a[/..] b[/..] c[/..] ..." (fans), flat normals -> 8 floats per vertex (uv 0)
++bool LoadObjMesh(const std::string& path, std::vector<float>* out)
++{
++  std::string text;
++  if (!File::ReadFileToString(path, text))
++    return false;
++  std::vector<std::array<float, 3>> v;
++  size_t pos = 0;
++  while (pos < text.size())
++  {
++    size_t eol = text.find('\n', pos);
++    if (eol == std::string::npos)
++      eol = text.size();
++    const std::string line = text.substr(pos, eol - pos);
++    pos = eol + 1;
++    if (line.size() > 2 && line[0] == 'v' && line[1] == ' ')
++    {
++      std::array<float, 3> p{};
++      if (std::sscanf(line.c_str() + 2, "%f %f %f", &p[0], &p[1], &p[2]) == 3)
++        v.push_back(p);
++    }
++    else if (line.size() > 2 && line[0] == 'f' && line[1] == ' ')
++    {
++      std::vector<int> idx;
++      const char* c = line.c_str() + 2;
++      while (*c)
++      {
++        while (*c == ' ' || *c == '\t' || *c == '\r')
++          c++;
++        if (!*c)
++          break;
++        char* end = nullptr;
++        const long k = std::strtol(c, &end, 10);
++        if (end == c)
++          break;
++        idx.push_back(k < 0 ? static_cast<int>(v.size()) + static_cast<int>(k) : static_cast<int>(k) - 1);
++        c = end;
++        while (*c && *c != ' ' && *c != '\t')
++          c++;
++      }
++      for (size_t t = 1; t + 1 < idx.size(); t++)
++      {
++        const int tri[3] = {idx[0], idx[t], idx[t + 1]};
++        bool ok = true;
++        for (int k : tri)
++          ok = ok && k >= 0 && k < static_cast<int>(v.size());
++        if (!ok)
++          continue;
++        const auto& a = v[tri[0]];
++        const auto& b = v[tri[1]];
++        const auto& d = v[tri[2]];
++        const float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
++        const float e2[3] = {d[0] - a[0], d[1] - a[1], d[2] - a[2]};
++        float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
++        const float l = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
++        if (l < 1e-12f)
++          continue;
++        for (float& x : n)
++          x /= l;
++        for (int k : tri)
++          out->insert(out->end(), {v[k][0], v[k][1], v[k][2], n[0], n[1], n[2], 0.0f, 0.0f});
++      }
++    }
++  }
++  return !out->empty();
++}
++
++// height > 0: scaled (uniformly) to this many metres tall; base: the bounding box's bottom middle moved to the origin
++// (the portal's master files are 1 unit tall round the origin, their game files metres standing on y = 0)
++bool LoadMesh(const std::string& path, u32 max_side, float height, bool base, ScMeshData* d)
++{
++  d->file = path;
++  const bool obj = path.size() > 4 && (path.ends_with(".obj") || path.ends_with(".OBJ"));
++  if (!(obj ? LoadObjMesh(path, &d->verts) : LoadGltfMesh(path, max_side, d)))
++    return false;
++  float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
++  const auto box = [&] {
++    for (int k = 0; k < 3; k++)
++    {
++      lo[k] = 1e30f;
++      hi[k] = -1e30f;
++    }
++    for (size_t i = 0; i + 7 < d->verts.size(); i += 8)
++      for (int k = 0; k < 3; k++)
++      {
++        lo[k] = std::min(lo[k], d->verts[i + k]);
++        hi[k] = std::max(hi[k], d->verts[i + k]);
++      }
++  };
++  box();
++  if ((height > 0.0f && hi[1] > lo[1]) || base)
++  {
++    const float s = height > 0.0f && hi[1] > lo[1] ? height / (hi[1] - lo[1]) : 1.0f;
++    const float o[3] = {base ? (lo[0] + hi[0]) * 0.5f : 0.0f, base ? lo[1] : 0.0f, base ? (lo[2] + hi[2]) * 0.5f : 0.0f};
++    for (size_t i = 0; i + 7 < d->verts.size(); i += 8)
++      for (int k = 0; k < 3; k++)
++        d->verts[i + k] = (d->verts[i + k] - o[k]) * s;
++    box();
++  }
++  float r2 = 0.0f;
++  for (int k = 0; k < 3; k++)
++    d->center[k] = (lo[k] + hi[k]) * 0.5f;
++  for (size_t i = 0; i + 7 < d->verts.size(); i += 8)
++  {
++    const float dx = d->verts[i] - d->center[0], dy = d->verts[i + 1] - d->center[1], dz = d->verts[i + 2] - d->center[2];
++    r2 = std::max(r2, dx * dx + dy * dy + dz * dz);
++  }
++  d->radius = std::sqrt(r2);
++  d->ok = true;
++  float uvlo[2] = {1e30f, 1e30f}, uvhi[2] = {-1e30f, -1e30f};
++  for (size_t i = 0; i + 7 < d->verts.size(); i += 8)
++    for (int k = 0; k < 2; k++)
++    {
++      uvlo[k] = std::min(uvlo[k], d->verts[i + 6 + k]);
++      uvhi[k] = std::max(uvhi[k], d->verts[i + 6 + k]);
++    }
++  if (const std::string dd = s_sc_dump; !dd.empty() && !d->color.mips.empty())
++  {
++    size_t l = 0;
++    while (l + 1 < d->color.mips.size() && (d->color.w >> l) > 512)
++      l++;
++    const std::string out = std::string(dd) + "/" + path.substr(path.find_last_of('/') + 1) + ".png";
++    stbi_write_png(out.c_str(), static_cast<int>(std::max(d->color.w >> l, 1u)), static_cast<int>(std::max(d->color.h >> l, 1u)), 4,
++                   d->color.mips[l].data(), static_cast<int>(std::max(d->color.w >> l, 1u)) * 4);
++  }
++  std::fprintf(stderr, "SCENERY mesh %s: %zu triangles, %.1f m tall, radius %.1f m, uv %.2f..%.2f / %.2f..%.2f, "
++               "colour %ux%u orm %ux%u emissive %ux%u\n", path.c_str(), d->verts.size() / 24, hi[1] - lo[1], d->radius,
++               uvlo[0], uvhi[0], uvlo[1], uvhi[1], d->color.w, d->color.h, d->orm.w, d->orm.h, d->emissive.w,
++               d->emissive.h);
++  return true;
++}
++
++// world = Ry(-yaw) Rx(-pitch) Rz(roll) x scale + pos: yaw + = clockwise seen from above, pitch + = the model's front
++// (+Z) up, roll + = about the front axis (right-hand rule); 0 / 0 / 0 = the model's axes are the world's
++std::array<float, 12> WorldMatrix(const std::array<float, 3>& pos, float yaw, float pitch, float roll, float s)
++{
++  const float a = -yaw * 3.14159265f / 180.0f, b = -pitch * 3.14159265f / 180.0f, c = roll * 3.14159265f / 180.0f;
++  const float ca = std::cos(a), sa = std::sin(a), cb = std::cos(b), sb = std::sin(b), cc = std::cos(c), sc = std::sin(c);
++  const float Ry[9] = {ca, 0, sa, 0, 1, 0, -sa, 0, ca};
++  const float Rx[9] = {1, 0, 0, 0, cb, -sb, 0, sb, cb};
++  const float Rz[9] = {cc, -sc, 0, sc, cc, 0, 0, 0, 1};
++  float T[9], R[9];
++  for (int i = 0; i < 3; i++)
++    for (int j = 0; j < 3; j++)
++      T[i * 3 + j] = Ry[i * 3] * Rx[j] + Ry[i * 3 + 1] * Rx[3 + j] + Ry[i * 3 + 2] * Rx[6 + j];
++  for (int i = 0; i < 3; i++)
++    for (int j = 0; j < 3; j++)
++      R[i * 3 + j] = T[i * 3] * Rz[j] + T[i * 3 + 1] * Rz[3 + j] + T[i * 3 + 2] * Rz[6 + j];
++  return {R[0] * s, R[1] * s, R[2] * s, pos[0], R[3] * s, R[4] * s, R[5] * s, pos[1], R[6] * s, R[7] * s, R[8] * s, pos[2]};
++}
++
++float JNum(const picojson::object& o, const char* k, float def)
++{
++  const auto it = o.find(k);
++  return it != o.end() && it->second.is<double>() ? static_cast<float>(it->second.get<double>()) : def;
++}
++template <size_t N>
++void JArr(const picojson::object& o, const char* k, std::array<float, N>* out)
++{
++  const auto it = o.find(k);
++  if (it == o.end() || !it->second.is<picojson::array>())
++    return;
++  const auto& a = it->second.get<picojson::array>();
++  for (size_t i = 0; i < N && i < a.size(); i++)
++    if (a[i].is<double>())
++      (*out)[i] = static_cast<float>(a[i].get<double>());
++}
++
++// <dir>/slotNN.json (docs SCENERY-LIT17S10.md); legacy: one OBJ mesh at one spot
++std::unique_ptr<ScScene> LoadScene(std::string dir, int slot, std::string legacy_mesh, std::array<float, 3> lpos,
++                                   float lyaw, float lscale)
++{
++  auto sc = std::make_unique<ScScene>();
++  sc->slot = slot;
++  const auto t0 = std::chrono::steady_clock::now();
++  if (!legacy_mesh.empty())
++  {
++    sc->meshes.resize(1);
++    if (LoadMesh(legacy_mesh, 2048, 0.0f, false, &sc->meshes[0]))
++    {
++      ScInstance in;
++      in.mesh = 0;
++      in.W = WorldMatrix(lpos, lyaw, 0.0f, 0.0f, lscale);
++      sc->inst.push_back(in);
++    }
++  }
++  else
++  {
++    char name[32];
++    std::snprintf(name, sizeof(name), "/slot%02d.json", slot);
++    const std::string file = dir + name;
++    std::string text;
++    if (!File::ReadFileToString(file, text))
++      return sc;  // no scenery on this course
++    picojson::value root;
++    const std::string perr = picojson::parse(root, text);
++    if (!perr.empty() || !root.is<picojson::object>())
++    {
++      std::fprintf(stderr, "SCENERY %s: not JSON (%s)\n", file.c_str(), perr.c_str());
++      return sc;
++    }
++    const auto& o = root.get<picojson::object>();
++    if (const auto it = o.find("light"); it != o.end() && it->second.is<picojson::object>())
++    {
++      const auto& l = it->second.get<picojson::object>();
++      JArr(l, "sun", &sc->light.sun);
++      JArr(l, "sun_colour", &sc->light.sun_col);
++      JArr(l, "ambient", &sc->light.amb);
++      JArr(l, "haze", &sc->light.haze);
++      sc->light.spec = JNum(l, "specular", sc->light.spec);
++    }
++    const u32 max_side = static_cast<u32>(std::clamp(JNum(o, "texture_max", 4096.0f), 64.0f, 8192.0f));
++    s_sc_dump = o.count("debug_dump") && o.at("debug_dump").is<std::string>() ? o.at("debug_dump").get<std::string>() : "";
++    std::map<std::string, int> by_name;
++    std::vector<std::string> files;
++    std::vector<std::array<float, 2>> fits;  // height, base pivot
++    if (const auto it = o.find("meshes"); it != o.end() && it->second.is<picojson::array>())
++      for (const auto& e : it->second.get<picojson::array>())
++      {
++        if (!e.is<picojson::object>())
++          continue;
++        const auto& mo = e.get<picojson::object>();
++        const auto f = mo.find("file");
++        if (f == mo.end() || !f->second.is<std::string>())
++          continue;
++        const std::string& fn = f->second.get<std::string>();
++        if (fn.empty() || fn.find("..") != std::string::npos || fn[0] == '/')
++          continue;
++        const auto nm = mo.find("name");
++        by_name[nm != mo.end() && nm->second.is<std::string>() ? nm->second.get<std::string>() : fn] =
++            static_cast<int>(files.size());
++        files.push_back(dir + "/" + fn);
++        fits.push_back({JNum(mo, "height", 0.0f), mo.count("pivot") && mo.at("pivot").is<std::string>() &&
++                                                       mo.at("pivot").get<std::string>() == "base" ? 1.0f : 0.0f});
++      }
++    if (files.size() > 64)
++    {
++      files.resize(64);
++      fits.resize(64);
++    }
++    sc->meshes.resize(files.size());
++    {
++      std::vector<std::thread> th;
++      for (size_t i = 0; i < files.size(); i++)
++        th.emplace_back([&, i] {
++          if (!LoadMesh(files[i], max_side, fits[i][0], fits[i][1] > 0.5f, &sc->meshes[i]))
++            std::fprintf(stderr, "SCENERY cannot load mesh %s\n", files[i].c_str());
++        });
++      for (auto& t : th)
++        t.join();
++    }
++    if (const auto it = o.find("instances"); it != o.end() && it->second.is<picojson::array>())
++      for (const auto& e : it->second.get<picojson::array>())
++      {
++        if (!e.is<picojson::object>() || sc->inst.size() >= 1024)
++          continue;
++        const auto& io = e.get<picojson::object>();
++        ScInstance in;
++        const auto mi = io.find("mesh");
++        if (mi == io.end())
++          continue;
++        if (mi->second.is<double>())
++          in.mesh = static_cast<int>(mi->second.get<double>());
++        else if (mi->second.is<std::string>() && by_name.count(mi->second.get<std::string>()))
++          in.mesh = by_name[mi->second.get<std::string>()];
++        if (in.mesh < 0 || in.mesh >= static_cast<int>(sc->meshes.size()) || !sc->meshes[in.mesh].ok)
++          continue;
++        std::array<float, 3> pos{};
++        JArr(io, "pos", &pos);
++        in.W = WorldMatrix(pos, JNum(io, "yaw", 0.0f), JNum(io, "pitch", 0.0f), JNum(io, "roll", 0.0f),
++                           std::max(JNum(io, "scale", 1.0f), 1e-4f));
++        in.glow = JNum(io, "glow", 0.0f);
++        sc->inst.push_back(in);
++      }
++  }
++  // world bounding spheres
++  for (auto& in : sc->inst)
++  {
++    const auto& md = sc->meshes[in.mesh];
++    const auto& W = in.W;
++    for (int r = 0; r < 3; r++)
++      in.wc[r] = W[r * 4] * md.center[0] + W[r * 4 + 1] * md.center[1] + W[r * 4 + 2] * md.center[2] + W[r * 4 + 3];
++    const float s = std::sqrt(W[0] * W[0] + W[4] * W[4] + W[8] * W[8]);
++    in.wr = md.radius * s;
++  }
++  size_t tris = 0;
++  for (const auto& md : sc->meshes)
++    tris += md.verts.size() / 24;
++  std::fprintf(stderr, "SCENERY slot %d: %zu meshes (%zu triangles), %zu instances, loaded in %.2f s\n", slot,
++               sc->meshes.size(), tris, sc->inst.size(),
++               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
++  return sc;
++}
++
++struct ScGpuMesh
++{
++  std::unique_ptr<AbstractTexture> verts, color, orm, emissive;
++  u32 nverts = 0;
++};
++constexpr u32 SC_ROW = 4096;  // vertex texture: R32F, 4096 floats a row
++}  // namespace PC5090Scenery
++
++using namespace PC5090Scenery;
++
++struct SceneryState
++{
++  int slot = -2;  // the slot the scene is (being) loaded for
++  std::future<std::unique_ptr<ScScene>> pending;
++  std::unique_ptr<ScScene> scene;
++  std::vector<ScGpuMesh> gpu;
++  size_t step = 0;  // upload steps done (4 per mesh)
++  bool ready = false;
++  std::unique_ptr<AbstractTexture> white, black;
++};
++
++namespace
++{
++std::unique_ptr<AbstractTexture> ScTexture(const ScImage& img, const char* name)
++{
++  if (img.mips.empty())
++    return nullptr;
++  auto t = g_gfx->CreateTexture(TextureConfig(img.w, img.h, static_cast<u32>(img.mips.size()), 1, 1,
++                                              AbstractTextureFormat::RGBA8, 0, AbstractTextureType::Texture_2DArray),
++                                name);
++  if (!t)
++    return nullptr;
++  for (u32 l = 0; l < img.mips.size(); l++)
++  {
++    const u32 w = std::max(img.w >> l, 1u), h = std::max(img.h >> l, 1u);
++    t->Load(l, w, h, w, img.mips[l].data(), img.mips[l].size());
++  }
++  return t;
++}
++std::unique_ptr<AbstractTexture> ScSolid(u32 rgba)
++{
++  auto t = g_gfx->CreateTexture(
++      TextureConfig(1, 1, 1, 1, 1, AbstractTextureFormat::RGBA8, 0, AbstractTextureType::Texture_2DArray), "scenery 1x1");
++  if (t)
++    t->Load(0, 1, 1, 1, reinterpret_cast<const u8*>(&rgba), 4);
++  return t;
++}
++}  // namespace
++
++bool EmitQuadsSceneryActive()
++{
++  return s_sc_refs > 0;
++}
++
++// the RAM view of the frame (read once a frame), and every perspective draw's position matrix near it, by count,
++// each with the GX fog it was drawn with
++void EmitQuadsSceneryNoteDraw(const float* m)
++{
++  if (s_scv.frame != s_global_frame)
++  {
++    s_scv.frame = s_global_frame;
++    s_scv.have_ram = ReadRamView(s_scv.ram);
++    s_scv.cands.clear();
++    s_scv.draws = 0;
++  }
++  s_scv.draws++;
++  if (!s_scv.have_ram)
++    return;
++  const float* V = s_scv.ram;
++  for (int r = 0; r < 3; r++)
++  {
++    for (int c = 0; c < 3; c++)
++      if (std::abs(m[r * 4 + c] - V[r * 4 + c]) > 0.05f)
++        return;
++    if (std::abs(m[r * 4 + 3] - V[r * 4 + 3]) > 10.0f)
++      return;
++  }
++  for (auto& c : s_scv.cands)
++  {
++    if (std::memcmp(c.m.data(), m, sizeof(float) * 12) == 0)
++    {
++      c.n++;
++      return;
++    }
++  }
++  if (s_scv.cands.size() < 16)
++  {
++    ScView::Cand c;
++    std::copy(m, m + 12, c.m.begin());
++    c.n = 1;
++    c.fog = CurrentFog();
++    s_scv.cands.push_back(c);
++  }
++}
++
++// lit17s10: load the slot's scene in the background when the slot changes, then upload it a texture a frame
++void EmitQuadsAction::SceneryPoll(int slot)
++{
++  if (!m_sc)
++    m_sc = std::make_unique<SceneryState>();
++  SceneryState& S = *m_sc;
++  if (S.pending.valid())
++  {
++    if (S.pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
++      return;
++    auto sc = S.pending.get();
++    if (sc && sc->slot == S.slot)
++    {
++      S.scene = std::move(sc);
++      S.gpu.clear();
++      S.gpu.resize(S.scene->meshes.size());
++      S.step = 0;
++      S.ready = false;
++    }
++  }
++  if (slot != S.slot && slot >= 0)
++  {
++    S.slot = slot;
++    S.scene.reset();
++    S.gpu.clear();
++    S.ready = false;
++    S.pending = std::async(std::launch::async, LoadScene, m_sc_dir, slot, m_sc_mesh_file, m_sc_pos, m_sc_yaw,
++                           m_sc_scale);
++    return;
++  }
++  if (!S.scene || S.ready)
++    return;
++  if (!S.white)
++  {
++    S.white = ScSolid(0xFFFFFFFFu);
++    S.black = ScSolid(0xFF000000u);
++  }
++  // one upload a frame: mesh i = steps 4i .. 4i + 3 (vertices, base colour, ORM, emissive)
++  const size_t total = S.scene->meshes.size() * 4;
++  if (S.step < total)
++  {
++    const size_t i = S.step / 4;
++    ScMeshData& md = S.scene->meshes[i];
++    ScGpuMesh& g = S.gpu[i];
++    switch (S.step % 4)
++    {
++    case 0:
++      if (md.ok)
++      {
++        const u32 n = static_cast<u32>(md.verts.size());
++        const u32 h = std::max((n + SC_ROW - 1) / SC_ROW, 1u);
++        md.verts.resize(static_cast<size_t>(h) * SC_ROW, 0.0f);
++        g.verts = g_gfx->CreateTexture(TextureConfig(SC_ROW, h, 1, 1, 1, AbstractTextureFormat::R32F, 0,
++                                                     AbstractTextureType::Texture_2DArray),
++                                       "scenery vertices");
++        if (g.verts)
++        {
++          g.verts->Load(0, SC_ROW, h, SC_ROW, reinterpret_cast<const u8*>(md.verts.data()), md.verts.size() * 4);
++          g.nverts = n / 8;
++        }
++        std::vector<float>().swap(md.verts);
++      }
++      break;
++    case 1:
++      g.color = ScTexture(md.color, "scenery base colour");
++      md.color.mips.clear();
++      break;
++    case 2:
++      g.orm = ScTexture(md.orm, "scenery orm");
++      md.orm.mips.clear();
++      break;
++    case 3:
++      g.emissive = ScTexture(md.emissive, "scenery emissive");
++      md.emissive.mips.clear();
++      break;
++    }
++    S.step++;
++  }
++  if (S.step >= total)
++    S.ready = true;
++}
++
++void EmitQuadsAction::EmitScenery(const EmitQuadsAnchor& target)
++{
++  if (target.projection_rows[3][3] != 0.0f)
++    return;  // the world's perspective draws only
++  u32 venue = 0, slot = 0;
++  bool demo = false;
++  if (!ReadGate(&venue, &slot, &demo) || venue >= 256 || demo)
++    return;
++  if (m_sc_course >= 0 && static_cast<u32>(m_sc_course) != venue)
++    return;
++  if (m_sc_slot >= 0 && static_cast<u32>(m_sc_slot) != slot)
++    return;
++  SceneryPoll(static_cast<int>(slot));
++  if (!m_sc || !m_sc->ready || !m_sc->scene || m_sc->scene->inst.empty())
++    return;
++  if (g_framebuffer_manager->IsEFBStereo())
++    return;
++
++  float ram[12];
++  const bool have_ram = ReadRamView(ram);
++  const ScView::Cand* best = nullptr;
++  if (m_sc_gpu_view && s_scv.frame == s_global_frame)
++  {
++    for (const auto& c : s_scv.cands)
++      if (!best || c.n > best->n)
++        best = &c;
++  }
++  float V[12];
++  if (best)
++    std::copy(best->m.begin(), best->m.end(), V);
++  else if (have_ram)
++    std::copy(ram, ram + 12, V);
++  else
++    return;
++  ScFog fog;
++  if (best)
++    fog = best->fog;
++  else if (s_scv.frame == s_global_frame && !s_scv.cands.empty())
++    fog = s_scv.cands[0].fog;
++
++  if (!EnsureResources(target))
++    return;
++  const AbstractPipeline* pipeline = GetPipeline(target);
++  if (!pipeline)
++    return;
++  const ScScene& sc = *m_sc->scene;
++  const ScLight& L = sc.light;
++  // view-space light: towards the sun and world up through the view's rotation
++  const auto rot = [&](const std::array<float, 3>& w) {
++    std::array<float, 3> v{};
++    for (int r = 0; r < 3; r++)
++      v[r] = V[r * 4] * w[0] + V[r * 4 + 1] * w[1] + V[r * 4 + 2] * w[2];
++    const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
++    if (l > 1e-6f)
++      for (float& x : v)
++        x /= l;
++    return v;
++  };
++  const auto sunv = rot(L.sun);
++  const auto upv = rot({0.0f, 1.0f, 0.0f});
++  // frustum planes in view space from the projection rows (left, right, bottom, top)
++  const auto& P = target.projection_rows;
++  std::array<std::array<float, 4>, 4> planes;
++  for (int k = 0; k < 4; k++)
++  {
++    const int row = k / 2;
++    const float sg = (k % 2) ? -1.0f : 1.0f;
++    for (int c = 0; c < 4; c++)
++      planes[k][c] = P[3][c] + sg * P[row][c];
++    const float l = std::sqrt(planes[k][0] * planes[k][0] + planes[k][1] * planes[k][1] + planes[k][2] * planes[k][2]);
++    if (l > 1e-12f)
++      for (float& x : planes[k])
++        x /= l;
++  }
++
++  EmitQuadsUniforms u{};
++  u.projection = target.projection_rows;
++  u.pixel_center = target.pixel_center;
++  const float vw = std::max(target.viewport[0], 1.0f), vh = std::max(target.viewport[1], 1.0f);
++  u.viewport = {vw, vh, 1.0f / vw, 1.0f / vh};
++  {
++    const auto& vs = g_gfx->GetStoredViewportAndScissor();
++    u.depth_range = {vs.viewport_near_depth, vs.viewport_far_depth, 0.0f, 0.0f};
++  }
++  u.ram = {fog.a, fog.c, fog.bmag, fog.bshift, fog.fsel, fog.far_z, fog.z_range, fog.persp};
++  u.player = {fog.col[0], fog.col[1], fog.col[2], fog.fsel > 0.0f ? 1.0f : 0.0f};
++  u.model_min = {L.haze[0], L.haze[1], L.haze[2], L.haze[3]};
++  u32 drawn = 0, culled = 0;
++  for (const ScInstance& in : sc.inst)
++  {
++    const ScGpuMesh& g = m_sc->gpu[in.mesh];
++    if (!g.verts || g.nverts == 0)
++      continue;
++    float c[3];
++    for (int r = 0; r < 3; r++)
++      c[r] = V[r * 4] * in.wc[0] + V[r * 4 + 1] * in.wc[1] + V[r * 4 + 2] * in.wc[2] + V[r * 4 + 3];
++    bool vis = c[2] - in.wr < 0.0f;  // something of it in front of the camera (view looks down -z)
++    if (vis && m_sc_max_dist > 0.0f)
++      vis = std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]) - in.wr < m_sc_max_dist;
++    for (int k = 0; k < 4 && vis; k++)
++      vis = planes[k][0] * c[0] + planes[k][1] * c[1] + planes[k][2] * c[2] + planes[k][3] > -in.wr;
++    if (!vis)
++    {
++      culled++;
++      continue;
++    }
++    const ScMeshData& md = sc.meshes[in.mesh];
++    for (int r = 0; r < 3; r++)
++      for (int k = 0; k < 4; k++)
++      {
++        float x = V[r * 4 + 0] * in.W[k] + V[r * 4 + 1] * in.W[4 + k] + V[r * 4 + 2] * in.W[8 + k];
++        if (k == 3)
++          x += V[r * 4 + 3];
++        u.matrix[r][k] = x;
++      }
++    u.info = {target.time_ms, g.nverts, drawn, m_frame_counter};
++    u.params = {sunv[0], sunv[1], sunv[2], in.glow, L.sun_col[0], L.sun_col[1], L.sun_col[2], L.spec,
++                L.amb[0], L.amb[1], L.amb[2], g.orm ? 1.0f : 0.0f, upv[0], upv[1], upv[2], g.emissive ? 1.0f : 0.0f};
++    u.target = {md.base[0], md.base[1], md.base[2], md.base[3]};
++    u.target_far = {md.em[0], md.em[1], md.em[2], 0.0f};
++    g_vertex_manager->UploadUtilityUniforms(&u, sizeof(u));
++    g_gfx->SetPipeline(pipeline);
++    g_gfx->SetTexture(0, g.verts.get());
++    g_gfx->SetSamplerState(0, RenderState::GetPointSamplerState());
++    SamplerState ss = RenderState::GetLinearSamplerState();
++    ss.tm0.wrap_u = WrapMode::Repeat;
++    ss.tm0.wrap_v = WrapMode::Repeat;
++    ss.tm0.anisotropic_filtering = 3;  // 8x
++    g_gfx->SetTexture(1, g.color ? g.color.get() : m_sc->white.get());
++    g_gfx->SetSamplerState(1, ss);
++    g_gfx->SetTexture(2, g.orm ? g.orm.get() : m_sc->white.get());
++    g_gfx->SetSamplerState(2, ss);
++    g_gfx->SetTexture(3, g.emissive ? g.emissive.get() : m_sc->black.get());
++    g_gfx->SetSamplerState(3, ss);
++    g_gfx->Draw(0, g.nverts);
++    drawn++;
++  }
++  m_emits_this_frame++;
++  if (m_sc_trace)
++  {
++    m_sc_trace--;
++    std::fprintf(stderr, "SCENERY f=%llu venue %u slot %u view %s drawn %u culled %u fog sel %.0f a %.4g c %.4g "
++                 "V=[%.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f]\n",
++                 static_cast<unsigned long long>(s_global_frame), venue, slot, best ? "gpu" : "ram", drawn, culled,
++                 fog.fsel, fog.a, fog.c, V[0], V[1], V[2], V[3], V[4], V[5], V[6], V[7], V[8], V[9], V[10], V[11]);
++  }
++}
++
 +std::unique_ptr<EmitQuadsAction> EmitQuadsAction::Create(const picojson::value& json_data)
 +{
 +  if (!json_data.is<picojson::object>())
@@ -1310,6 +2422,46 @@
 +    action->m_skip_within_ms = static_cast<float>(*n);
 +  if (const auto n = ReadNumericFromJson<double>(obj, "trace"))
 +    action->m_trace = static_cast<u32>(std::max(*n, 0.0));
++  // Evolution Racing dolphin-lit17s9 / s10 scenery (see EmitQuadsAction.h, SCENERY-LIT17S10.md)
++  if (const auto it = obj.find("scenery"); it != obj.end() && it->second.is<picojson::object>())
++  {
++    const auto& g = it->second.get<picojson::object>();
++    const auto num = [&](const char* k, float def) {
++      const auto n = ReadNumericFromJson<double>(g, k);
++      return n ? static_cast<float>(*n) : def;
++    };
++    action->m_sc_dir = ReadStringFromJson(g, "dir").value_or("");
++    action->m_sc_mesh_file = ReadStringFromJson(g, "mesh_file").value_or("");
++    if (action->m_sc_dir.empty() && action->m_sc_mesh_file.empty())
++    {
++      ERROR_LOG_FMT(VIDEO, "emit_quads scenery: needs \"dir\" (or a step-1 \"mesh_file\")");
++      return nullptr;
++    }
++    if (const auto p = g.find("pos"); p != g.end() && p->second.is<picojson::array>())
++    {
++      const auto& arr = p->second.get<picojson::array>();
++      for (size_t i = 0; i < 3 && i < arr.size(); i++)
++        if (arr[i].is<double>())
++          action->m_sc_pos[i] = static_cast<float>(arr[i].get<double>());
++    }
++    action->m_sc_yaw = -num("yaw", 0.0f);  // step 1's yaw turned the other way round (+ = counter-clockwise)
++    action->m_sc_scale = num("scale", 1.0f);
++    action->m_sc_course = static_cast<int>(num("course", -1.0f));
++    action->m_sc_slot = static_cast<int>(num("slot", -1.0f));
++    action->m_sc_trace = static_cast<u32>(std::max(num("trace", 0.0f), 0.0f));
++    action->m_sc_max_dist = std::max(num("max_dist", 0.0f), 0.0f);
++    if (const auto v = ReadStringFromJson(g, "view"))
++      action->m_sc_gpu_view = *v != "ram";
++    action->m_quads = 1;
++    action->m_max_emits_per_frame = 1;
++    action->m_depth_test = true;
++    action->m_depth_write = true;
++    action->m_scenery = true;
++    s_sc_refs++;
++    std::fprintf(stderr, "SCENERY action: %s course %d slot %d view %s\n",
++                 action->m_sc_dir.empty() ? action->m_sc_mesh_file.c_str() : action->m_sc_dir.c_str(),
++                 action->m_sc_course, action->m_sc_slot, action->m_sc_gpu_view ? "gpu" : "ram");
++  }
 +  NOTICE_LOG_FMT(VIDEO, "emit_quads: {} quads, vs '{}', ps '{}', texture '{}', skip_original {}",
 +                 action->m_quads, vs_file.value_or("-"), ps_file.value_or("-"),
 +                 action->m_texture_file.empty() ? "<target>" : action->m_texture_file,
@@ -1345,6 +2497,11 @@
 +    s_dm_refs = 0;
 +    DmClear();
 +  }
++  if (m_scenery)
++    s_sc_refs = std::max(s_sc_refs - 1, 0);
++  if (m_sc && m_sc->pending.valid())
++    m_sc->pending.wait();
++  m_sc.reset();
 +  m_pipelines.clear();
 +  m_scene.reset();
 +  m_depth.reset();
@@ -1396,6 +2553,14 @@
 +
 +void EmitQuadsAction::OnFrameEnd()
 +{
++  if (m_scenery && !m_failed)
++  {
++    // lit17s10: the slot's scene loads (and uploads) as soon as the slot is set, before the race draws
++    u32 venue = 0, slot = 0;
++    bool demo = false;
++    if (ReadGate(&venue, &slot, &demo) && !demo && slot < 256 && (m_sc_slot < 0 || static_cast<u32>(m_sc_slot) == slot))
++      SceneryPoll(static_cast<int>(slot));
++  }
 +  if (m_pr && !m_pr_override && m_trace && m_pr_count_frame[0] > 0)
 +  {
 +    const auto& c = m_pr_count_frame;
@@ -1477,7 +2642,12 @@
 +  DepthState depth = anchor.depth_state;
 +  if (!m_depth_test)
 +    depth = RenderState::GetNoDepthTestingDepthState();
-+  depth.update_enable = false;  // effects never write depth
++  depth.update_enable = m_depth_write;  // effects never write depth (lit17s9: scenery does)
++  if (m_depth_write)
++  {
++    depth.test_enable = true;
++    depth.func = anchor.depth_state.test_enable ? anchor.depth_state.func.Value() : CompareMode::LEqual;
++  }
 +
 +  const FramebufferState fb = g_framebuffer_manager->GetEFBFramebufferState();
 +  const u64 key = (static_cast<u64>(fb.hex) << 32) | (static_cast<u64>(depth.hex & 0xff) << 24) |
@@ -1737,6 +2907,11 @@
 +  }
 +  if (!m_emit || m_emits_this_frame >= m_max_emits_per_frame)
 +    return;
++  if (m_scenery)
++  {
++    EmitScenery(target);  // lit17s9
++    return;
++  }
 +  if (m_night_only && NightLook() == 0)
 +    return;  // lit17s8: day course / menus / no night pass installed
 +  // lit17s6: the night pass costs nothing on a day course / in the menus (no copies, no draw), and runs once a frame
@@ -4282,7 +5457,7 @@
 +}  // namespace DamageFx
 --- a/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.h
 +++ b/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.h
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,377 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -4312,6 +5487,7 @@
 +class AbstractPipeline;
 +class AbstractShader;
 +class AbstractTexture;
++struct SceneryState;  // Evolution Racing dolphin-lit17s10 (EmitQuadsAction.cpp)
 +
 +// Computed on the CPU by VertexManagerBase from the target draw's vertices.
 +struct EmitQuadsAnchor
@@ -4609,7 +5785,36 @@
 +  bool m_damage_track = false;  // Evolution Racing dolphin-lit17: "damage" (this action keeps the damage tracker on)
 +  bool m_surface_track = false;  // Evolution Racing dolphin-lit17s: "surface_layer" (surface layer state on, docs SURFACE-LAYER-LIT17S.md)
 +  bool m_hull_track = false;    // Evolution Racing dolphin-lit17c: "hull_fx" (speed heat / grip state on, eq_hx_*)
++
++  // Evolution Racing dolphin-lit17s9/s10 SCENERY. "scenery": {"dir": folder, "course": venue id (-1 any), "slot": course slot
++  // (-1 any), "view": "gpu" | "ram", "max_dist": m (0 = no limit), "trace": n} (lit17s10, docs SCENERY-LIT17S10.md):
++  // every course slot's own scenery file <dir>/slotNN.json lists glTF / OBJ meshes and their instances (world
++  // position, yaw / pitch / roll, scale); loaded in the background when the slot changes, uploaded a texture a
++  // frame, drawn in races only, one draw per visible instance (CPU frustum cull), depth test + depth WRITE, lit by the
++  // file's sun / ambient and the game's own GX fog. Step 1 form: {"mesh_file": "x.obj", "pos", "yaw", "scale"} =
++  // one instance. World -> view: the race camera's view matrix (RAM, camera struct [REL + 0x1BAFAC] + 0xdc),
++  // replaced by the exact GX position matrix of this frame's world draws ("gpu").
++  bool m_scenery = false;
++  std::string m_sc_dir;
++  std::string m_sc_mesh_file;  // step 1: one OBJ, one instance
++  std::array<float, 3> m_sc_pos{};
++  float m_sc_yaw = 0.0f;
++  float m_sc_scale = 1.0f;
++  int m_sc_course = -1;
++  int m_sc_slot = -1;
++  bool m_sc_gpu_view = true;
++  u32 m_sc_trace = 0;
++  float m_sc_max_dist = 0.0f;
++  bool m_depth_write = false;
++  std::unique_ptr<SceneryState> m_sc;
++  void EmitScenery(const EmitQuadsAnchor& target);
++  void SceneryPoll(int slot);
 +};
++
++// Evolution Racing dolphin-lit17s9: every perspective GX draw's position matrix while a scenery action exists (cheap: one
++// compare per draw against the RAM view matrix of the frame)
++bool EmitQuadsSceneryActive();
++void EmitQuadsSceneryNoteDraw(const float* m);
 +
 +// Evolution Racing dolphin-lit17: persistent machine damage. While any emit_quads action has a "damage" object, every frame end
 +// reads each racer block (energy, state, position, surface flags) and turns real impacts (energy lost beyond the
@@ -5819,10 +7024,28 @@
  
      // Now the vertices can be flushed to the GPU. Everything following the CommitBuffer() call
      // must be careful to not upload any utility vertices, as the binding will be lost otherwise.
-@@ -637,10 +872,77 @@
+@@ -637,10 +872,95 @@
      if (num_indices == 0)
        return;
  
++    // Evolution Racing dolphin-lit17s9 scenery: this frame's world view = the perspective draws' position matrices
++    if (EmitQuadsSceneryActive() && xfmem.projection.type == ProjectionType::Perspective)
++    {
++      const u32 nv = m_index_generator.GetNumVerts();
++      const NativeVertexFormat* fmt = VertexLoaderManager::GetCurrentVertexFormat();
++      u32 mtx = g_main_cp_state.matrix_index_a.PosNormalMtxIdx & 0x3f;
++      if (fmt && nv > 0)
++      {
++        const PortableVertexDeclaration& decl = fmt->GetVertexDeclaration();
++        if (decl.posmtx.enable && decl.stride > 0)
++        {
++          const u8* first = m_cur_buffer_pointer - static_cast<size_t>(nv) * static_cast<u32>(decl.stride);
++          mtx = first[decl.posmtx.offset] & 0x3f;
++        }
++      }
++      EmitQuadsSceneryNoteDraw(&xfmem.posMatrices[mtx * 4]);
++    }
++
 +    // Evolution Racing dolphin-lit17: a machine body draw with a "damage" custom pipeline: its damage hits -> custom uniforms
 +    if (damage_draw && !custom_pixel_shader_contents.shaders.empty() &&
 +        custom_pixel_shader_contents.shaders[0].material_uniform_block)
@@ -5897,7 +7120,7 @@
  
      if (!skip)
      {
-@@ -649,20 +951,54 @@
+@@ -649,20 +969,54 @@
        if (m_current_pipeline_object)
        {
          const AbstractPipeline* pipeline_object = m_current_pipeline_object;
@@ -5955,7 +7178,7 @@
      // Even if we skip the draw, emulated state should still be impacted
      OnDraw();
  
-@@ -1063,8 +1399,8 @@
+@@ -1063,8 +1417,8 @@
    // Now we can upload uniforms, as nothing else will override them.
    geometry_shader_manager.SetConstants(primitive_type);
    pixel_shader_manager.SetConstants();
@@ -5966,7 +7189,7 @@
    {
      pixel_shader_manager.custom_constants_dirty = true;
    }
-@@ -1103,8 +1439,10 @@
+@@ -1103,8 +1457,10 @@
      const CustomPixelShaderContents& custom_pixel_shader_contents,
      const VideoCommon::GXPipelineUid& current_pipeline_config,
      const VideoCommon::GXUberPipelineUid& current_uber_pipeline_config,
@@ -5978,7 +7201,7 @@
    if (current_pipeline)
    {
      if (!custom_pixel_shader_contents.shaders.empty())
-@@ -1119,6 +1457,8 @@
+@@ -1119,6 +1475,8 @@
          if (auto pipeline = m_custom_shader_cache->GetPipelineAsync(
                  current_pipeline_config, custom_shaders, current_pipeline->m_config))
          {
@@ -5987,7 +7210,7 @@
            return *pipeline;
          }
        }
-@@ -1132,6 +1472,8 @@
+@@ -1132,6 +1490,8 @@
            if (auto pipeline = m_custom_shader_cache->GetPipelineAsync(
                    current_pipeline_config, custom_shaders, current_pipeline->m_config))
            {
@@ -5996,7 +7219,7 @@
              return *pipeline;
            }
          }
-@@ -1150,6 +1492,8 @@
+@@ -1150,6 +1510,8 @@
          if (auto pipeline = m_custom_shader_cache->GetPipelineAsync(
                  current_pipeline_config, custom_shaders, current_pipeline->m_config))
          {
