@@ -9,12 +9,22 @@ This repository holds only the Dolphin source changes, published under Dolphin's
 see `LICENSE`). It contains no game data, textures, effect packs or 3D assets, and no copy of the game.
 You need your own copy of F-Zero GX.
 
-## Base version
+## Versions
 
-Dolphin commit `409881c34357d0f105fd473167d15ab0bd9c1628`. The patch matches the distributed
-Evolution Racing Dolphin build "lit17s10".
+Every distributed build has a tag `er-<build>` and a GitHub Release pointing at the exact source and build
+script of that build. This tree is build **lit17s10**.
+
+- Base: Dolphin commit `409881c34357d0f105fd473167d15ab0bd9c1628` (with its submodules at that commit)
+- Changes: `evolution-racing-dolphin.patch` (stock -> lit17s10)
+- Build: `build-linux.sh` (the exact CMake options of the distributed Linux build)
 
 ## Apply and build
+
+```sh
+./build-linux.sh            # clones Dolphin 409881c34357d0f105fd473167d15ab0bd9c1628, applies the patch, builds in org.kde.Sdk//6.11
+```
+
+or by hand:
 
 ```sh
 git clone https://github.com/dolphin-emu/dolphin.git
@@ -22,8 +32,8 @@ cd dolphin
 git checkout 409881c34357d0f105fd473167d15ab0bd9c1628
 git submodule update --init --recursive
 git apply /path/to/evolution-racing-dolphin.patch
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target dolphin-emu
 ```
 
 ## What it adds
