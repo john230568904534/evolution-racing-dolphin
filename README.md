@@ -12,10 +12,10 @@ You need your own copy of F-Zero GX.
 ## Versions
 
 Every distributed build has a tag `er-<build>` and a GitHub Release pointing at the exact source and build
-script of that build. This tree is build **lit17s10**.
+script of that build. This tree is build **lit17s28**.
 
 - Base: Dolphin commit `409881c34357d0f105fd473167d15ab0bd9c1628` (with its submodules at that commit)
-- Changes: `evolution-racing-dolphin.patch` (stock -> lit17s10)
+- Changes: `evolution-racing-dolphin.patch` (stock -> lit17s28)
 - Build: `build-linux.sh` (the exact CMake options of the distributed Linux build)
 
 ## Apply and build
