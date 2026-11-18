@@ -13643,6 +13643,17 @@ n#BBd<r1E|0)Bo$~fbTwQpw`$4RQ>lSVg6$!o*cR+r=I@_CVCBu
 literal 0
 HcmV?d00001
 
+--- a/Source/Core/Core/CMakeLists.txt
++++ b/Source/Core/Core/CMakeLists.txt
+@@ -57,6 +57,8 @@
+   ConfigManager.h
+   Core.cpp
+   Core.h
++  ERTest.cpp
++  ERTest.h
+   CoreTiming.cpp
+   CoreTiming.h
+   CPUThreadConfigCallback.cpp
 --- a/Source/Core/Core/Config/GraphicsSettings.cpp
 +++ b/Source/Core/Core/Config/GraphicsSettings.cpp
 @@ -19,6 +19,8 @@
@@ -13667,9 +13678,1329 @@ HcmV?d00001
  extern const Info<AspectMode> GFX_ASPECT_RATIO;
  extern const Info<int> GFX_CUSTOM_ASPECT_RATIO_WIDTH;
  extern const Info<int> GFX_CUSTOM_ASPECT_RATIO_HEIGHT;
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -46,6 +46,7 @@
+ #include "Core/CoreTiming.h"
+ #include "Core/DSPEmulator.h"
+ #include "Core/DolphinAnalytics.h"
++#include "Core/ERTest.h"
+ #include "Core/FifoPlayer/FifoPlayer.h"
+ #include "Core/FreeLookManager.h"
+ #include "Core/HLE/HLE.h"
+@@ -134,7 +135,8 @@
+ 
+ bool GetIsThrottlerTempDisabled()
+ {
+-  return s_is_throttler_temp_disabled;
++  // Evolution Racing Test in game: the speed limit is off while it drives the menus
++  return s_is_throttler_temp_disabled || ERTest::Unthrottled();
+ }
+ 
+ void SetIsThrottlerTempDisabled(bool disable)
+@@ -150,6 +152,7 @@
+ 
+ void OnFrameEnd(Core::System& system)
+ {
++  ERTest::OnFrame(system);
+ #ifdef USE_MEMORYWATCHER
+   if (s_memory_watcher)
+   {
+@@ -347,6 +350,7 @@
+     if (delete_savestate)
+       File::Delete(*savestate_path);
+   }
++  ERTest::OnBoot();  // Evolution Racing Test in game: this boot's test takes over
+ 
+   {
+     std::unique_lock core_lock(s_core_mutex);
+--- a/Source/Core/Core/ERTest.cpp
++++ b/Source/Core/Core/ERTest.cpp
+@@ -0,0 +1,1215 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/ERTest.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <filesystem>
++#include <mutex>
++#include <optional>
++#include <random>
++#include <cstdlib>
++
++#include <fmt/format.h>
++#include <picojson.h>
++
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <fcntl.h>
++#include <sys/file.h>
++#include <unistd.h>
++#endif
++
++#include "Common/CommonTypes.h"
++#include "Common/Crypto/SHA1.h"
++#include "Common/FileSearch.h"
++#include "Common/FileUtil.h"
++#include "Common/IOFile.h"
++#include "Common/Logging/Log.h"
++#include "Common/StringUtil.h"
++#include "Common/Swap.h"
++#include "Common/Version.h"
++#include "Core/Boot/Boot.h"
++#include "Core/Config/MainSettings.h"
++#include "Core/Config/UISettings.h"
++#include "Core/Core.h"
++#include "Core/HW/DVD/DVDInterface.h"
++#include "Core/HW/Memmap.h"
++#include "Core/State.h"
++#include "Core/System.h"
++#include "DiscIO/DiscExtractor.h"
++#include "DiscIO/Volume.h"
++#include "DiscIO/VolumeDisc.h"
++#include "InputCommon/GCPadStatus.h"
++
++namespace ERTest
++{
++namespace
++{
++constexpr char MAGIC[8] = {'E', 'R', 'T', 'E', 'S', 'T', '1', '\n'};
++constexpr const char* GAME_ID = "GFZE01";
++
++// picojson aborts on a wrong type (no exceptions in Dolphin): every read goes through these
++const picojson::value& At(const picojson::value& v, const std::string& key)
++{
++  static const picojson::value null;
++  if (!v.is<picojson::object>())
++    return null;
++  const auto& o = v.get<picojson::object>();
++  const auto it = o.find(key);
++  return it == o.end() ? null : it->second;
++}
++double Num(const picojson::value& v, double def = 0)
++{
++  return v.is<double>() ? v.get<double>() : def;
++}
++std::string Str(const picojson::value& v)
++{
++  return v.is<std::string>() ? v.get<std::string>() : std::string();
++}
++const picojson::array& Arr(const picojson::value& v)
++{
++  static const picojson::array empty;
++  return v.is<picojson::array>() ? v.get<picojson::array>() : empty;
++}
++int HexDigit(char c)
++{
++  if (c >= '0' && c <= '9')
++    return c - '0';
++  if (c >= 'a' && c <= 'f')
++    return c - 'a' + 10;
++  if (c >= 'A' && c <= 'F')
++    return c - 'A' + 10;
++  return -1;
++}
++
++s64 NowMs()
++{
++  return std::chrono::duration_cast<std::chrono::milliseconds>(
++             std::chrono::system_clock::now().time_since_epoch())
++      .count();
++}
++
++std::string Dir()
++{
++  return File::GetUserPath(D_USER_IDX) + "ERTest/";
++}
++
++std::string Hex(const Common::SHA1::Digest& d)
++{
++  std::string s;
++  for (u8 b : d)
++    s += fmt::format("{:02x}", b);
++  return s;
++}
++
++bool SafeName(const std::string& s, bool allow_slash)
++{
++  if (s.empty() || s.size() > 200 || s.find("..") != std::string::npos || s[0] == '/')
++    return false;
++  for (char c : s)
++  {
++    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
++                    c == '_' || c == '-' || c == '.' || (allow_slash && c == '/');
++    if (!ok)
++      return false;
++  }
++  return true;
++}
++
++// ---------------------------------------------------------------- the run script (from the package)
++enum class Op
++{
++  Press,      // buttons held `hold` frames, then `after` frames
++  Wait,       // `after` frames
++  UntilRace,  // until a race runs (the attract demo after boot), at most `timeout` frames
++  LeaveDemo,  // START every `after` frames until no race runs, at most `timeout` frames
++  SaveState,  // fast start for next time (only on a full boot)
++  StartLine,  // until the player's racer sits on the start line, at most `timeout` frames
++  Throttle,   // `after` = 1 normal speed, 0 speed limit off
++  UntilSet,   // until the u32 at `addr` is not 0 (e.g. the race clock: GO), at most `timeout` frames; a status line
++};
++struct Step
++{
++  Op op = Op::Wait;
++  u16 buttons = 0;
++  int hold = 0;
++  int after = 0;
++  int timeout = 0;
++  u32 addr = 0;
++};
++
++struct Racer
++{
++  std::vector<s64> chain;  // p = u32(chain[0]); p = u32(p + chain[i]) ...
++  u32 lap_off = 0, dist_off = 0;
++  float lap_min = 500, lap_max = 100000, start_window = 60;
++};
++
++struct Run
++{
++  std::string nonce, title;
++  std::vector<Step> boot, race;
++  Racer racer;
++  // fast start: RAM writes that point a cup-select state at this test
++  std::string sig;
++  u32 fst_ptr = 0;
++  std::vector<std::pair<u32, std::vector<u8>>> writes;
++  // per write: true = big-endian u32 pointers into the main module (moved with it, written whole)
++  std::vector<bool> write_ptr;
++  // where the package assumed the main module sits in RAM, and the RAM word that holds where it really is (the
++  // first entry of the game's module list) + the module id to check there. The module's address depends on the
++  // disc layout the state was booted with (2026-11-18: 0x1c0 lower than assumed - every fast write landed beside
++  // its target, the game read string bytes as pointers: "Invalid read from 0x61640053").
++  u32 rel_base = 0, rel_head_ptr = 0, rel_id = 0;
++  std::vector<u8> fst;  // this test's file table (from the overlaid disc)
++  std::string state_path, state_meta, state_fst, state_rel;
++  bool use_state = false;
++  s64 t_request = 0, t_boot = 0;
++};
++
++// ---------------------------------------------------------------- shared state
++std::mutex s_mutex;  // guards s_run between host and CPU thread
++std::shared_ptr<Run> s_run;
++std::shared_ptr<Run> s_next;  // loaded, waiting for its boot (the previous test may still be stopping)
++std::atomic<bool> s_active{false};
++std::atomic<bool> s_unthrottled{false};
++std::atomic<u16> s_buttons{0};
++std::atomic<bool> s_save_done{false};
++
++std::vector<std::string> s_download_dirs;
++std::vector<std::string> s_pending_args;  // URLs / package paths not handled yet
++std::vector<std::pair<std::string, s64>> s_waiting;  // nonces asked for, since when (ms)
++std::string s_last_nonce;
++std::filesystem::file_time_type s_begin_file;
++s64 s_last_wait_note = 0;
++
++#ifdef _WIN32
++HANDLE s_lock = INVALID_HANDLE_VALUE;
++#else
++int s_lock = -1;
++#endif
++
++void Status(const std::string& nonce, const std::string& phase, const std::string& text,
++            s64 t_request = 0)
++{
++  picojson::object o;
++  o["nonce"] = picojson::value(nonce);
++  o["phase"] = picojson::value(phase);
++  o["text"] = picojson::value(text);
++  o["t"] = picojson::value(static_cast<double>(NowMs()));
++  if (t_request)
++    o["t_request"] = picojson::value(static_cast<double>(t_request));
++  const std::string path = Dir() + "status.json";
++  File::WriteStringToFile(path + ".tmp", picojson::value(o).serialize(true));
++  File::Rename(path + ".tmp", path);
++  // the history (the demo and support read it)
++  File::IOFile log(Dir() + "status.log", "ab");
++  const std::string line = picojson::value(o).serialize() + "\n";
++  log.WriteString(line);
++  INFO_LOG_FMT(CORE, "ERTest {} {}: {}", nonce, phase, text);
++}
++
++std::string NonceOf(const std::string& arg)
++{
++  // evoracing://test/<nonce>  or  .../er-test-<nonce>.ertest
++  std::string s = arg;
++  const auto q = s.find_first_of("?#");
++  if (q != std::string::npos)
++    s = s.substr(0, q);
++  while (!s.empty() && (s.back() == '/' || s.back() == '\\'))
++    s.pop_back();
++  const auto slash = s.find_last_of("/\\");
++  std::string last = slash == std::string::npos ? s : s.substr(slash + 1);
++  if (last.ends_with(".ertest"))
++    last = last.substr(0, last.size() - 7);
++  if (last.starts_with("er-test-"))
++    last = last.substr(8);
++  if (last.size() < 6 || last.size() > 40 || !SafeName(last, false))
++    return {};
++  return last;
++}
++
++bool ReadU32(Core::System& system, u32 addr, u32* out)
++{
++  if (addr < 0x80000000 || addr > 0x817FFFFC)
++    return false;
++  u32 v;
++  system.GetMemory().CopyFromEmu(&v, addr, 4);
++  *out = Common::swap32(v);
++  return true;
++}
++
++bool ReadF32(Core::System& system, u32 addr, float* out)
++{
++  u32 v;
++  if (!ReadU32(system, addr, &v))
++    return false;
++  std::memcpy(out, &v, 4);
++  return true;
++}
++
++// lap length + race distance of the player's racer, when a race runs
++bool RacerInfo(Core::System& system, const Racer& r, float* lap, float* dist)
++{
++  if (r.chain.empty())
++    return false;
++  u32 p = 0;
++  for (size_t i = 0; i < r.chain.size(); ++i)
++  {
++    const s64 a = i == 0 ? r.chain[0] : static_cast<s64>(p) + r.chain[i];
++    if (a < 0x80000000LL || a > 0x817FFFFCLL || !ReadU32(system, static_cast<u32>(a), &p))
++      return false;
++  }
++  if (!ReadF32(system, p + r.lap_off, lap) || !ReadF32(system, p + r.dist_off, dist))
++    return false;
++  return *lap > r.lap_min && *lap < r.lap_max;
++}
++
++// ---------------------------------------------------------------- CPU thread runner
++// ERTEST_CAPTURE=<s>: after the start line, a screenshot every 30 frames for s seconds (demos / support reports);
++// ERTEST_DEMO_DRIVE=1 holds A meanwhile. Off unless set.
++int CaptureFrames()
++{
++  const char* c = getenv("ERTEST_CAPTURE");
++  return c ? atoi(c) * 60 : 0;
++}
++
++struct Runner
++{
++  int capture = 0;
++  int frames2 = 0;  // emulated frames in the race script (speed check: frames / wall seconds)
++  s64 t2 = 0;
++  std::shared_ptr<Run> run;
++  int phase = 0;  // 0 = first frame, 1 = boot script, 2 = race script, 3 = done
++  size_t step = 0;
++  int frame_in_step = 0;
++  int frame = 0;
++  bool waiting_save = false;
++};
++Runner s_runner;
++
++u16 Buttons(const std::string& name)
++{
++  if (name == "A")
++    return PAD_BUTTON_A;
++  if (name == "B")
++    return PAD_BUTTON_B;
++  if (name == "START")
++    return PAD_BUTTON_START;
++  if (name == "RIGHT")
++    return PAD_BUTTON_RIGHT;
++  if (name == "LEFT")
++    return PAD_BUTTON_LEFT;
++  if (name == "UP")
++    return PAD_BUTTON_UP;
++  if (name == "DOWN")
++    return PAD_BUTTON_DOWN;
++  return 0;
++}
++
++void Finish(Runner& r, bool ok, const std::string& text)
++{
++  s_buttons = 0;
++  s_unthrottled = false;
++  r.phase = 3;
++  const s64 now = NowMs();
++  const std::string t = fmt::format("{} ({:.1f} s after the package, {:.1f} s after boot)", text,
++                                    (now - r.run->t_request) / 1000.0,
++                                    (now - r.run->t_boot) / 1000.0);
++  Status(r.run->nonce, ok ? "racing" : "failed", t, r.run->t_request);
++  Core::DisplayMessage(ok ? "Test in game: " + r.run->title + " - your controller drives" :
++                            "Test in game: " + text,
++                       ok ? 4000 : 10000);
++}
++
++bool ApplyFastWrites(Core::System& system, Runner& r)
++{
++  const Run& run = *r.run;
++  std::string meta, fst_old;
++  if (!File::ReadFileToString(run.state_meta, meta) ||
++      !File::ReadFileToString(run.state_fst, fst_old))
++    return false;
++  picojson::value v;
++  if (!picojson::parse(v, meta).empty() || !v.is<picojson::object>())
++    return false;
++  const u32 fst_addr = static_cast<u32>(Num(At(v, "fst_addr")));
++  // the state is in when RAM holds its file table
++  if (fst_old.size() != run.fst.size() || fst_addr < 0x80000000 ||
++      fst_addr + fst_old.size() > 0x81800000)
++    return false;
++  std::vector<u8> ram(fst_old.size());
++  system.GetMemory().CopyFromEmu(ram.data(), fst_addr, ram.size());
++  if (std::memcmp(ram.data(), fst_old.data(), ram.size()) != 0)
++    return false;
++  // the main program's fields: only the bytes that differ from the run the state was taken in (the regions also hold
++  // words the game relocated at load time - writing the file's bytes over those crashed the game)
++  std::string old_rel;
++  if (!File::ReadFileToString(run.state_rel, old_rel))
++    return false;
++  // where the main module really is in this state's RAM (the package's addresses assume rel_base)
++  s64 delta = 0;
++  if (run.rel_base && run.rel_head_ptr)
++  {
++    u32 head = 0, id = 0;
++    if (!ReadU32(system, run.rel_head_ptr, &head) || !ReadU32(system, head, &id) || id != run.rel_id)
++    {
++      Status(run.nonce, "note", fmt::format("fast start: main module not found in the state (head {:08x}): full boot", head));
++      return false;
++    }
++    delta = static_cast<s64>(head) - static_cast<s64>(run.rel_base);
++  }
++  size_t pos = 0;
++  std::vector<std::pair<u32, std::vector<u8>>> diffs;
++  size_t wi = 0;
++  for (const auto& [addr, bytes] : run.writes)
++  {
++    const bool ptr = wi < run.write_ptr.size() && run.write_ptr[wi];
++    ++wi;
++    if (pos + 8 > old_rel.size())
++      return false;
++    u32 oaddr, olen;
++    std::memcpy(&oaddr, old_rel.data() + pos, 4);
++    std::memcpy(&olen, old_rel.data() + pos + 4, 4);
++    pos += 8;
++    if (oaddr != addr || olen != bytes.size() || pos + olen > old_rel.size())
++      return false;
++    const u8* o = reinterpret_cast<const u8*>(old_rel.data() + pos);
++    pos += olen;
++    if (ptr)
++    {
++      // pointer words: all of them, each moved by delta (they are what the module loader would have written)
++      std::vector<u8> moved(bytes);
++      for (size_t i = 0; i + 4 <= moved.size(); i += 4)
++      {
++        u32 w;
++        std::memcpy(&w, moved.data() + i, 4);
++        w = Common::swap32(static_cast<u32>(static_cast<s64>(Common::swap32(w)) + delta));
++        std::memcpy(moved.data() + i, &w, 4);
++      }
++      diffs.emplace_back(static_cast<u32>(addr + delta), std::move(moved));
++      continue;
++    }
++    for (size_t i = 0; i < bytes.size();)
++    {
++      if (bytes[i] == o[i])
++      {
++        ++i;
++        continue;
++      }
++      size_t j = i;
++      while (j < bytes.size() && bytes[j] != o[j])
++        ++j;
++      diffs.emplace_back(static_cast<u32>(addr + delta) + static_cast<u32>(i),
++                         std::vector<u8>(bytes.begin() + i, bytes.begin() + j));
++      i = j;
++    }
++  }
++  system.GetMemory().CopyToEmu(fst_addr, run.fst.data(), run.fst.size());
++  for (const auto& [addr, bytes] : diffs)
++    system.GetMemory().CopyToEmu(addr, bytes.data(), bytes.size());
++  Status(run.nonce, "note", fmt::format("fast start: {} main-program field runs changed (main module at {:08x}, {:+x} from the package's)",
++                                        diffs.size(), static_cast<u32>(run.rel_base + delta), delta));
++  return true;
++}
++
++std::string SerializeWrites(const std::vector<std::pair<u32, std::vector<u8>>>& writes)
++{
++  std::string out;
++  for (const auto& [addr, bytes] : writes)
++  {
++    const u32 len = static_cast<u32>(bytes.size());
++    out.append(reinterpret_cast<const char*>(&addr), 4);
++    out.append(reinterpret_cast<const char*>(&len), 4);
++    out.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
++  }
++  return out;
++}
++
++// one script step per frame; true = the script ended
++bool StepScript(Core::System& system, Runner& r, const std::vector<Step>& script)
++{
++  if (r.step >= script.size())
++    return true;
++  const Step& s = script[r.step];
++  int& f = r.frame_in_step;
++  bool next = false;
++  float lap = 0, dist = 0;
++  switch (s.op)
++  {
++  case Op::Press:
++    s_buttons = f < s.hold ? s.buttons : 0;
++    next = f >= s.hold + s.after;
++    break;
++  case Op::Wait:
++    next = f >= s.after;
++    break;
++  case Op::UntilRace:
++    next = RacerInfo(system, r.run->racer, &lap, &dist) || f >= s.timeout;
++    break;
++  case Op::LeaveDemo:
++  {
++    const bool racing = RacerInfo(system, r.run->racer, &lap, &dist);
++    const int k = s.after > 0 ? f % s.after : 0;
++    s_buttons = racing && k < 6 ? PAD_BUTTON_START : 0;
++    // no race for 30 frames in a row = on the title screen
++    if (!racing && k >= 36)
++      next = true;
++    if (f >= s.timeout)
++    {
++      Finish(r, false, "the attract demo did not end");
++      return true;
++    }
++    break;
++  }
++  case Op::SaveState:
++    if (!r.run->sig.empty() && !r.run->state_path.empty() && f == 0)
++    {
++      // only when RAM holds exactly the table of the booted disc (else the fast start could not repoint it)
++      u32 fst_addr = 0;
++      std::vector<u8> ram(r.run->fst.size());
++      if (r.run->fst_ptr && ReadU32(system, r.run->fst_ptr, &fst_addr) && fst_addr >= 0x80000000 &&
++          fst_addr + ram.size() <= 0x81800000)
++        system.GetMemory().CopyFromEmu(ram.data(), fst_addr, ram.size());
++      if (!ram.empty() && ram == r.run->fst)
++      {
++        auto run = r.run;
++        s_save_done = false;
++        r.waiting_save = true;
++        Core::QueueHostJob([run, fst_addr](Core::System& sys) {
++          State::SaveAs(sys, run->state_path + ".new");
++          picojson::object o;
++          o["fst_addr"] = picojson::value(static_cast<double>(fst_addr));
++          o["sig"] = picojson::value(run->sig);
++          o["dolphin"] = picojson::value(Common::GetScmRevGitStr());
++          o["made"] = picojson::value(static_cast<double>(NowMs()));
++          File::WriteStringToFile(run->state_fst, std::string(run->fst.begin(), run->fst.end()));
++          File::WriteStringToFile(run->state_rel, SerializeWrites(run->writes));
++          File::WriteStringToFile(run->state_meta + ".new", picojson::value(o).serialize(true));
++          s_save_done = true;
++        });
++      }
++      else
++      {
++        Status(r.run->nonce, "note", "no fast start this time: the file table in RAM is not the disc's");
++      }
++    }
++    next = !r.waiting_save || (s_save_done && f > 2) || f > 600;
++    if (next)
++      r.waiting_save = false;
++    break;
++  case Op::StartLine:
++    if (RacerInfo(system, r.run->racer, &lap, &dist) && dist > -r.run->racer.start_window &&
++        dist < r.run->racer.start_window)
++    {
++      next = true;
++      Status(r.run->nonce, "start_line",
++             fmt::format("on the start line, lap {:.0f} m ({} frames in {:.1f} s since the cup select)", lap,
++                         r.frames2, (NowMs() - r.t2) / 1000.0),
++             r.run->t_request);
++    }
++    else if (f >= s.timeout)
++    {
++      Finish(r, false, "the race did not start (menus out of step?) - close Dolphin and press Test in game again");
++      return true;
++    }
++    break;
++  case Op::Throttle:
++    s_unthrottled = s.after == 0;
++    next = true;
++    break;
++  case Op::UntilSet:
++  {
++    u32 v = 0;
++    next = (ReadU32(system, s.addr, &v) && v != 0) || f >= s.timeout;
++    if (next)
++      Status(r.run->nonce, "countdown", f >= s.timeout ? "no countdown seen" : "the countdown runs",
++             r.run->t_request);
++    break;
++  }
++  }
++  ++f;
++  if (next)
++  {
++    s_buttons = 0;
++    ++r.step;
++    f = 0;
++  }
++  return r.step >= script.size();
++}
++}  // namespace
++
++// ---------------------------------------------------------------- host side
++bool IsLaunchArg(const std::string& arg)
++{
++  return arg.starts_with("evoracing:") || arg.ends_with(".ertest");
++}
++
++bool ClaimOrForward(const std::string& arg)
++{
++  File::CreateFullPath(Dir());
++  const std::string lock = Dir() + "running.lock";
++#ifdef _WIN32
++  s_lock = CreateFileW(UTF8ToWString(lock).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
++                       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
++  const bool mine = s_lock != INVALID_HANDLE_VALUE;
++#else
++  s_lock = open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
++  const bool mine = s_lock >= 0 && flock(s_lock, LOCK_EX | LOCK_NB) == 0;
++  if (!mine && s_lock >= 0)
++  {
++    close(s_lock);
++    s_lock = -1;
++  }
++#endif
++  if (mine)
++    return true;
++  // hand it to the running test Dolphin (it looks for *.wake files)
++  std::random_device rd;
++  const std::string name = Dir() + fmt::format("{:08x}{:08x}", rd(), rd());
++  File::WriteStringToFile(name + ".tmp", arg);
++  File::Rename(name + ".tmp", name + ".wake");
++  return false;
++}
++
++void Begin(const std::string& arg)
++{
++  s_active = true;
++  s_begin_file = std::filesystem::file_time_type::clock::now() - std::chrono::seconds(5);
++  File::CreateFullPath(Dir());
++  if (!arg.empty())
++    s_pending_args.push_back(arg);
++  // anything left from an earlier session is stale
++  for (const std::string& f : Common::DoFileSearch(Dir(), ".wake", false))
++    File::Delete(f);
++}
++
++bool Active()
++{
++  return s_active;
++}
++
++void SetDownloadDirs(std::vector<std::string> dirs)
++{
++  s_download_dirs = std::move(dirs);
++}
++
++void RegisterHandlers()
++{
++#ifdef _WIN32
++  wchar_t exe[MAX_PATH];
++  if (!GetModuleFileNameW(nullptr, exe, MAX_PATH))
++    return;
++  const std::wstring cmd = L"\"" + std::wstring(exe) + L"\" \"%1\"";
++  auto set = [](const std::wstring& key, const wchar_t* name, const std::wstring& value) {
++    HKEY k;
++    if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k,
++                        nullptr) == ERROR_SUCCESS)
++    {
++      RegSetValueExW(k, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value.c_str()),
++                     static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
++      RegCloseKey(k);
++    }
++  };
++  set(L"Software\\Classes\\evoracing", nullptr, L"URL:Evolution Racing Test in game");
++  set(L"Software\\Classes\\evoracing", L"URL Protocol", L"");
++  set(L"Software\\Classes\\evoracing\\shell\\open\\command", nullptr, cmd);
++  set(L"Software\\Classes\\.ertest", nullptr, L"EvolutionRacing.ertest");
++  set(L"Software\\Classes\\EvolutionRacing.ertest", nullptr, L"Evolution Racing test track");
++  set(L"Software\\Classes\\EvolutionRacing.ertest\\shell\\open\\command", nullptr, cmd);
++#endif
++}
++
++namespace
++{
++// the member's own disc: the GFZE01 image in Dolphin's game folders whose main program is the one the browser read
++std::string FindBase(const std::string& want_sha1, const std::string& want_name, std::string* note)
++{
++  const std::string cache = Dir() + "base.json";
++  std::string text;
++  if (File::ReadFileToString(cache, text))
++  {
++    picojson::value v;
++    if (picojson::parse(v, text).empty() && v.is<picojson::object>() &&
++        Str(At(v, "line_sha1")) == want_sha1)
++    {
++      const std::string p = Str(At(v, "path"));
++      if (File::Exists(p) && static_cast<double>(File::GetSize(p)) == Num(At(v, "size")))
++        return p;
++    }
++  }
++  std::vector<std::string> dirs = Config::GetIsoPaths();
++  std::vector<std::string_view> views(dirs.begin(), dirs.end());
++  static constexpr std::array<std::string_view, 7> exts = {".iso", ".gcm", ".ciso", ".gcz",
++                                                            ".rvz", ".wia", ".nfs"};
++  auto paths = Common::DoFileSearch(views, exts, Config::Get(Config::MAIN_RECURSIVE_ISO_PATHS));
++  // the file with the browser's file name first
++  std::stable_partition(paths.begin(), paths.end(), [&](const std::string& p) {
++    return !want_name.empty() && p.ends_with(want_name);
++  });
++  std::string any;
++  for (const std::string& p : paths)
++  {
++    auto vol = DiscIO::CreateVolume(p);
++    if (!vol || vol->GetGameID(DiscIO::PARTITION_NONE) != GAME_ID)
++      continue;
++    if (any.empty())
++      any = p;
++    const auto part = vol->GetGamePartition();
++    std::vector<u8> buf(4 << 20);
++    const u64 n = DiscIO::ReadFile(*vol, part, "enemy_line/line__.bin", buf.data(), buf.size());
++    if (!n)
++      continue;
++    buf.resize(n);
++    if (Hex(Common::SHA1::CalculateDigest(buf)) == want_sha1)
++    {
++      picojson::object o;
++      o["path"] = picojson::value(p);
++      o["size"] = picojson::value(static_cast<double>(File::GetSize(p)));
++      o["line_sha1"] = picojson::value(want_sha1);
++      File::WriteStringToFile(cache, picojson::value(o).serialize(true));
++      return p;
++    }
++  }
++  if (!any.empty())
++    *note = "your disc in Dolphin's game folders is not the one the builder read - testing on " + any;
++  return any;
++}
++
++std::vector<Step> ParseScript(const picojson::value& v)
++{
++  std::vector<Step> out;
++  for (const auto& e : Arr(v))
++  {
++    const auto& a = Arr(e);
++    if (a.empty())
++      continue;
++    auto num = [&](size_t i, int d) { return i < a.size() && a[i].is<double>() ? int(a[i].get<double>()) : d; };
++    const std::string op = Str(a[0]);
++    Step s;
++    if (op == "press")
++    {
++      s.op = Op::Press;
++      s.buttons = Buttons(a.size() > 1 ? Str(a[1]) : "");
++      s.hold = num(2, 6);
++      s.after = num(3, 30);
++    }
++    else if (op == "wait")
++    {
++      s.op = Op::Wait;
++      s.after = num(1, 60);
++    }
++    else if (op == "until_race")
++    {
++      s.op = Op::UntilRace;
++      s.timeout = num(1, 3600);
++    }
++    else if (op == "leave_demo")
++    {
++      s.op = Op::LeaveDemo;
++      s.after = num(1, 240);
++      s.timeout = num(2, 3600);
++    }
++    else if (op == "save_state")
++      s.op = Op::SaveState;
++    else if (op == "start_line")
++    {
++      s.op = Op::StartLine;
++      s.timeout = num(1, 3600);
++    }
++    else if (op == "until_set")
++    {
++      s.op = Op::UntilSet;
++      s.addr = static_cast<u32>(a.size() > 1 && a[1].is<double>() ? a[1].get<double>() : 0);
++      s.timeout = num(2, 1200);
++    }
++    else if (op == "throttle")
++    {
++      s.op = Op::Throttle;
++      s.after = num(1, 1);
++    }
++    else
++      continue;
++    out.push_back(s);
++  }
++  return out;
++}
++
++// a finished package for this nonce? (a browser writes *.crdownload / *.part first and renames at the end)
++std::string FindPackage(const std::string& nonce)
++{
++  for (const std::string& d : s_download_dirs)
++  {
++    const std::string p = d + "/er-test-" + nonce + ".ertest";
++    if (File::Exists(p) && File::GetSize(p) > 16)
++      return p;
++  }
++  return {};
++}
++
++std::unique_ptr<BootParameters> LoadImpl(const std::string& package, std::string* message)
++{
++  const s64 t0 = NowMs();
++  std::string data;
++  if (!File::ReadFileToString(package, data) || data.size() < 12 ||
++      std::memcmp(data.data(), MAGIC, 8) != 0)
++  {
++    *message = "not a Test in game package: " + package;
++    return nullptr;
++  }
++  u32 jlen;
++  std::memcpy(&jlen, data.data() + 8, 4);  // little endian (the browser's DataView)
++  if (12 + static_cast<u64>(jlen) > data.size())
++  {
++    *message = "the package is cut short (still downloading?)";
++    return nullptr;
++  }
++  picojson::value v;
++  const std::string err = picojson::parse(v, data.substr(12, jlen));
++  if (!err.empty() || Num(At(v, "version")) != 1)
++  {
++    *message = "the package is from a newer builder - update this Evolution Racing Dolphin";
++    return nullptr;
++  }
++  const size_t blob0 = 12 + jlen;
++  auto run = std::make_shared<Run>();
++  run->t_request = t0;
++  run->nonce = Str(At(v, "nonce"));
++  run->title = Str(At(v, "title"));
++  if (!SafeName(run->nonce, false))
++  {
++    *message = "bad package id";
++    return nullptr;
++  }
++  Status(run->nonce, "package", "package read: " + run->title);
++
++  // unpack into ERTest/run-<nonce>/files (older runs removed, except the one Dolphin may still read)
++  for (const File::FSTEntry& e : File::ScanDirectoryTree(Dir(), false).children)
++  {
++    if (e.isDirectory && e.virtualName.starts_with("run-") && e.virtualName != "run-" + run->nonce &&
++        e.virtualName != "run-" + s_last_nonce)
++      File::DeleteDirRecursively(e.physicalName);
++  }
++  const std::string root = Dir() + "run-" + run->nonce + "/";
++  File::DeleteDirRecursively(root);
++  File::CreateFullPath(root + "files/");
++  std::string xml = "<wiidisc version=\"1\">\n<id game=\"GFZE\"/>\n<options><section name=\"Evolution Racing\">"
++                    "<option name=\"Test in game\"><choice name=\"On\"><patch id=\"ertest\"/></choice>"
++                    "</option></section></options>\n<patch id=\"ertest\">\n";
++  const auto& files = Arr(At(v, "files"));
++  if (files.empty())
++  {
++    *message = "the package has no files";
++    return nullptr;
++  }
++  for (const auto& f : files)
++  {
++    const std::string path = Str(At(f, "path"));
++    const double doff = Num(At(f, "off"), -1), dsize = Num(At(f, "size"), -1);
++    if (!SafeName(path, true) || doff < 0 || dsize < 0 ||
++        doff + dsize > static_cast<double>(data.size() - blob0))
++    {
++      *message = "bad file in the package: " + path;
++      return nullptr;
++    }
++    const u64 off = static_cast<u64>(doff), size = static_cast<u64>(dsize);
++    if (blob0 + off + size > data.size())
++    {
++      *message = "bad file in the package: " + path;
++      return nullptr;
++    }
++    const std::string out = root + "files/" + path;
++    File::CreateFullPath(out);
++    File::IOFile o(out, "wb");
++    if (!o.WriteBytes(data.data() + blob0 + off, size))
++    {
++      *message = "could not write " + out;
++      return nullptr;
++    }
++    const std::string sha = Str(At(f, "sha1"));
++    if (!sha.empty() &&
++        Hex(Common::SHA1::CalculateDigest(reinterpret_cast<const u8*>(data.data() + blob0 + off),
++                                          size)) != sha)
++    {
++      *message = "damaged package (checksum): " + path;
++      return nullptr;
++    }
++    xml += "<file disc=\"/" + path + "\" external=\"/files/" + path + "\"/>\n";
++  }
++  xml += "</patch>\n</wiidisc>\n";
++  File::WriteStringToFile(root + "er-test.xml", xml);
++
++  // the member's own disc
++  std::string note;
++  const auto& base = At(v, "base");
++  const std::string base_path =
++      FindBase(Str(At(base, "line_sha1")), Str(At(base, "name")), &note);
++  if (base_path.empty())
++  {
++    *message = "no F-Zero GX (USA) disc in Dolphin's game folders: add the folder with your game in "
++               "Config > Paths, then press Test in game again";
++    Status(run->nonce, "failed", *message);
++    return nullptr;
++  }
++  if (!note.empty())
++    Status(run->nonce, "note", note);
++
++  picojson::object desc, riiv, patch, option;
++  desc["type"] = picojson::value("dolphin-game-mod-descriptor");
++  desc["version"] = picojson::value(1.0);
++  desc["base-file"] = picojson::value(base_path);
++  desc["display-name"] = picojson::value("Test in game: " + run->title);
++  option["section-name"] = picojson::value("Evolution Racing");
++  option["option-name"] = picojson::value("Test in game");
++  option["choice"] = picojson::value(1.0);
++  patch["xml"] = picojson::value(root + "er-test.xml");
++  patch["root"] = picojson::value(root);
++  patch["options"] = picojson::value(picojson::array{picojson::value(option)});
++  riiv["patches"] = picojson::value(picojson::array{picojson::value(patch)});
++  desc["riivolution"] = picojson::value(riiv);
++  File::WriteStringToFile(root + "er-test.json", picojson::value(desc).serialize(true));
++
++  // the scripts and the fast start
++  run->boot = ParseScript(At(v, "boot"));
++  run->race = ParseScript(At(v, "race"));
++  const auto& rc = At(v, "racer");
++  for (const auto& x : Arr(At(rc, "chain")))
++    run->racer.chain.push_back(static_cast<s64>(Num(x)));
++  run->racer.lap_off = static_cast<u32>(Num(At(rc, "lap")));
++  run->racer.dist_off = static_cast<u32>(Num(At(rc, "dist")));
++  run->racer.start_window = static_cast<float>(Num(At(rc, "start_window"), 60));
++  if (run->race.empty())
++  {
++    *message = "the package has no race script";
++    return nullptr;
++  }
++  const auto& fast = At(v, "fast");
++  if (SafeName(Str(At(fast, "sig")), false))
++  {
++    run->sig = Str(At(fast, "sig"));
++    run->fst_ptr = static_cast<u32>(Num(At(fast, "fst_ptr")));
++    run->rel_base = static_cast<u32>(Num(At(fast, "rel_base")));
++    run->rel_head_ptr = static_cast<u32>(Num(At(fast, "rel_head_ptr")));
++    run->rel_id = static_cast<u32>(Num(At(fast, "rel_id")));
++    for (const auto& w : Arr(At(fast, "writes")))
++    {
++      const auto& a = Arr(w);
++      if (a.size() < 2)
++        continue;
++      const u32 addr = static_cast<u32>(Num(a[0]));
++      const std::string hx = Str(a[1]);
++      std::vector<u8> bytes(hx.size() / 2);
++      bool ok = !bytes.empty();
++      for (size_t i = 0; i < bytes.size() && ok; ++i)
++      {
++        const int hi = HexDigit(hx[i * 2]), lo = HexDigit(hx[i * 2 + 1]);
++        ok = hi >= 0 && lo >= 0;
++        bytes[i] = static_cast<u8>(hi * 16 + lo);
++      }
++      if (!ok || addr < 0x80000000 || addr + bytes.size() > 0x81800000)
++        continue;
++      const bool ptr = a.size() >= 3 && Num(a[2]) == 1 && bytes.size() % 4 == 0;
++      run->writes.emplace_back(addr, std::move(bytes));
++      run->write_ptr.push_back(ptr);
++    }
++    // one state per Dolphin build + disc + main-program code
++    const std::string key = Hex(Common::SHA1::CalculateDigest(
++                                    run->sig + "|" + Common::GetScmRevGitStr() + "|" + base_path))
++                                .substr(0, 16);
++    run->state_path = Dir() + "state-" + key + ".sav";
++    run->state_meta = Dir() + "state-" + key + ".json";
++    run->state_fst = Dir() + "state-" + key + ".fst";
++    run->state_rel = Dir() + "state-" + key + ".rel";
++    // a state saved last time is promoted once its save finished
++    if (File::Exists(run->state_path + ".new") && File::Exists(run->state_meta + ".new"))
++    {
++      File::Rename(run->state_path + ".new", run->state_path);
++      File::Rename(run->state_meta + ".new", run->state_meta);
++    }
++    run->use_state = File::Exists(run->state_path) && File::Exists(run->state_meta) &&
++                     File::Exists(run->state_fst) && File::Exists(run->state_rel) && !At(v, "full_boot").evaluate_as_boolean();
++  }
++
++  std::optional<std::string> savestate;
++  if (run->use_state)
++    savestate = run->state_path;
++  auto boot = BootParameters::GenerateFromFile(root + "er-test.json",
++                                               BootSessionData(savestate, DeleteSavestateAfterBoot::No));
++  if (!boot || !std::holds_alternative<BootParameters::Disc>(boot->parameters))
++  {
++    *message = "Dolphin could not open your disc with the test track";
++    Status(run->nonce, "failed", *message);
++    return nullptr;
++  }
++  // this test's file table, as the overlaid disc has it (the fast start writes it into a state's RAM)
++  {
++    const auto& vol = *std::get<BootParameters::Disc>(boot->parameters).volume;
++    u32 fst_off = 0, fst_size = 0;
++    vol.Read(0x424, 4, reinterpret_cast<u8*>(&fst_off), DiscIO::PARTITION_NONE);
++    vol.Read(0x428, 4, reinterpret_cast<u8*>(&fst_size), DiscIO::PARTITION_NONE);
++    fst_off = Common::swap32(fst_off);
++    fst_size = Common::swap32(fst_size);
++    if (fst_size > 0 && fst_size < (1 << 20))
++    {
++      run->fst.resize(fst_size);
++      vol.Read(fst_off, fst_size, run->fst.data(), DiscIO::PARTITION_NONE);
++    }
++  }
++  if (run->fst.empty())
++  {
++    run->use_state = false;
++    run->sig.clear();
++  }
++  if (run->use_state)
++  {
++    std::string old;
++    if (!File::ReadFileToString(run->state_fst, old) || old.size() != run->fst.size())
++    {
++      Status(run->nonce, "note", "fast start not possible for this track (other files): full boot");
++      boot = BootParameters::GenerateFromFile(root + "er-test.json");
++      run->use_state = false;
++    }
++  }
++  run->t_boot = NowMs();
++  Status(run->nonce, "boot",
++         fmt::format("{} ({}) on {}", run->use_state ? "fast start from the save state" : "full boot",
++                     run->title, base_path),
++         run->t_request);
++  {
++    std::lock_guard lk(s_mutex);
++    s_run = nullptr;  // the running test (if any) stops driving at once; OnBoot hands the new one over
++    s_buttons = 0;
++    s_unthrottled = false;
++    s_next = run;
++  }
++  s_last_nonce = run->nonce;
++  return boot;
++}
++
++std::unique_ptr<BootParameters> Load(const std::string& package, std::string* message)
++{
++  return LoadImpl(package, message);
++}
++}  // namespace
++
++std::unique_ptr<BootParameters> Poll(std::string* message)
++{
++  message->clear();
++  if (!s_active)
++    return nullptr;
++  // requests handed over by later launches
++  for (const std::string& w : Common::DoFileSearch(Dir(), ".wake", false))
++  {
++    std::string arg;
++    if (File::ReadFileToString(w, arg))
++      s_pending_args.push_back(arg);
++    File::Delete(w);
++  }
++  for (const std::string& arg : s_pending_args)
++  {
++    if (arg.ends_with(".ertest") && File::Exists(arg))
++    {
++      const std::string nonce = NonceOf(arg);
++      std::erase_if(s_waiting, [&](const auto& w) { return w.first == nonce; });
++      s_pending_args.erase(std::find(s_pending_args.begin(), s_pending_args.end(), arg));
++      return Load(arg, message);
++    }
++    const std::string nonce = NonceOf(arg);
++    if (!nonce.empty() &&
++        std::none_of(s_waiting.begin(), s_waiting.end(), [&](const auto& w) { return w.first == nonce; }))
++    {
++      s_waiting.emplace_back(nonce, NowMs());
++      Status(nonce, "waiting", "waiting for the builder's package");
++    }
++  }
++  s_pending_args.clear();
++  // the newest request wins; older ones are dropped
++  if (s_waiting.size() > 1)
++    s_waiting.erase(s_waiting.begin(), s_waiting.end() - 1);
++  if (s_waiting.empty())
++  {
++    // a test Dolphin that is already open also takes a new package without its link (the link may still be on
++    // its way through the desktop): any er-test-*.ertest that arrived since this Dolphin started
++    std::error_code ec;
++    for (const std::string& d : s_download_dirs)
++      for (const auto& e : std::filesystem::directory_iterator(d, ec))
++      {
++        const std::string n = e.path().filename().string();
++        if (!n.starts_with("er-test-") || !n.ends_with(".ertest") || !e.is_regular_file(ec) || e.file_size(ec) < 16)
++          continue;
++        const auto age = std::filesystem::file_time_type::clock::now() - e.last_write_time(ec);
++        const std::string nonce = NonceOf(n);
++        if (ec || nonce.empty() || nonce == s_last_nonce || age > std::chrono::minutes(2) ||
++            e.last_write_time(ec) < s_begin_file)
++          continue;
++        auto boot = Load(e.path().string(), message);
++        File::Delete(e.path().string(), File::IfAbsentBehavior::NoConsoleWarning);
++        return boot;
++      }
++    return nullptr;
++  }
++  const auto [nonce, since] = s_waiting.back();
++  const std::string pkg = FindPackage(nonce);
++  if (!pkg.empty())
++  {
++    s_waiting.clear();
++    auto boot = Load(pkg, message);
++    File::Delete(pkg, File::IfAbsentBehavior::NoConsoleWarning);  // keeps Downloads tidy (no harm if read-only)
++    return boot;
++  }
++  const s64 now = NowMs();
++  if (now - since > 240000)
++  {
++    s_waiting.clear();
++    *message = "no package arrived from the builder in 4 minutes. If your browser asks where to save "
++               "downloads, open the downloaded .ertest file with this Dolphin instead.";
++  }
++  else if (now - since > 45000 && now - s_last_wait_note > 30000)
++  {
++    s_last_wait_note = now;
++    *message = "still waiting for the builder (looking in your Downloads folder for er-test-" + nonce +
++               ".ertest)";
++  }
++  return nullptr;
++}
++
++// ---------------------------------------------------------------- CPU thread
++void OnFrame(Core::System& system)
++{
++  if (!s_active)
++    return;
++  std::shared_ptr<Run> run;
++  {
++    std::lock_guard lk(s_mutex);
++    run = s_run;
++  }
++  Runner& r = s_runner;
++  if (r.run != run)
++  {
++    r = Runner{};
++    r.run = run;
++  }
++  if (run && r.phase == 3 && r.capture > 0)
++  {
++    --r.capture;
++    if (r.frame++ % 30 == 0)
++    {
++      const std::string name = fmt::format("ertest-{}-{:04d}", run->nonce, r.frame / 30);
++      Core::QueueHostJob([name](Core::System& sys) {
++        if (Core::GetState(sys) == Core::State::Running)
++          Core::SaveScreenShot(name);
++      });
++    }
++    const char* d = getenv("ERTEST_DEMO_DRIVE");
++    s_buttons = (d && d[0] == '1' && r.capture > 0) ? PAD_BUTTON_A : 0;
++    return;
++  }
++  if (!run || r.phase == 3)
++    return;
++  if (r.phase == 0)
++  {
++    ++r.frame;
++    if (run->use_state)
++    {
++      if (ApplyFastWrites(system, r))
++      {
++        Status(run->nonce, "state", "save state in, pointed at the test track", run->t_request);
++        s_unthrottled = true;
++        r.phase = 2;
++        r.step = 0;
++        r.frame_in_step = 0;
++        return;
++      }
++      if (r.frame < 30)
++        return;  // the state may need a few frames
++      Status(run->nonce, "note", "the save state did not load: full boot", run->t_request);
++      File::Delete(run->state_path);
++      File::Delete(run->state_meta);
++    }
++    s_unthrottled = true;
++    r.phase = 1;
++    r.step = 0;
++    r.frame_in_step = 0;
++  }
++  if (r.phase == 1)
++  {
++    if (StepScript(system, r, run->boot) && r.phase != 3)
++    {
++      Status(run->nonce, "menus", "at the cup select", run->t_request);
++      r.phase = 2;
++      r.step = 0;
++      r.frame_in_step = 0;
++    }
++    return;
++  }
++  if (r.phase == 2 && r.t2 == 0)
++    r.t2 = NowMs();
++  if (r.phase == 2)
++    ++r.frames2;
++  if (r.phase == 2 && StepScript(system, r, run->race) && r.phase != 3)
++  {
++    Finish(r, true, "in the race");
++    r.capture = CaptureFrames();
++    r.frame = 0;
++  }
++}
++
++bool SwapInto(Core::System& system, std::unique_ptr<BootParameters>& boot)
++{
++  std::shared_ptr<Run> next;
++  {
++    std::lock_guard lk(s_mutex);
++    next = s_next;
++  }
++  if (!next || !next->use_state || !boot || !std::holds_alternative<BootParameters::Disc>(boot->parameters) ||
++      Core::GetState(system) == Core::State::Uninitialized)
++    return false;
++  auto& disc = std::get<BootParameters::Disc>(boot->parameters);
++  if (!disc.volume || disc.volume->GetGameID() != GAME_ID)
++    return false;
++  std::unique_ptr<DiscIO::VolumeDisc> vol = std::move(disc.volume);
++  boot.reset();
++  // the running game keeps its renderer: the new disc goes in and the cup-select state loads over it
++  Core::RunOnCPUThread(system, [&system, vol = std::move(vol), next]() mutable {
++    system.GetDVDInterface().SetDisc(std::move(vol), {});
++    State::LoadAs(system, next->state_path);
++    OnBoot();
++  });
++  Status(next->nonce, "swap", "new disc in the running Dolphin, save state loading", next->t_request);
++  return true;
++}
++
++void OnBoot()
++{
++  std::lock_guard lk(s_mutex);
++  if (s_next)
++  {
++    s_run = std::move(s_next);
++    s_next = nullptr;
++  }
++}
++
++bool Unthrottled()
++{
++  return s_unthrottled;
++}
++
++void FilterPad(int chan, GCPadStatus* pad)
++{
++  if (chan != 0 || !s_active)
++    return;
++  const u16 b = s_buttons;
++  if (!b)
++    return;
++  pad->button |= b;
++  if (b & PAD_BUTTON_A)
++    pad->analogA = 0xFF;
++  if (b & PAD_BUTTON_B)
++    pad->analogB = 0xFF;
++}
++}  // namespace ERTest
+--- a/Source/Core/Core/ERTest.h
++++ b/Source/Core/Core/ERTest.h
+@@ -0,0 +1,55 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// "Test in game" for the Evolution Racing track builder.
++//
++// The builder (in the member's browser, built from the member's own disc image) writes a small package
++// "er-test-<id>.ertest" (the changed game files + a run script) to the Downloads folder and opens
++// evoracing://test/<id>. This Dolphin picks the package up, finds the member's own F-Zero GX disc in its game
++// folders, boots it with the package as a Riivolution file overlay (nothing is written to the disc image) and
++// drives the menus into the race. A save state taken at the first run (on the member's machine, from their disc)
++// makes later runs start in seconds. Only one test Dolphin runs: a second launch hands its request to the first.
++
++#pragma once
++
++#include <memory>
++#include <string>
++#include <vector>
++
++struct BootParameters;
++struct GCPadStatus;
++
++namespace Core
++{
++class System;
++}
++
++namespace ERTest
++{
++// ---------------------------------------------------------------- host (UI) thread
++// "evoracing:..." URL or a path ending in .ertest
++bool IsLaunchArg(const std::string& arg);
++// Takes the single-instance test lock. Returns false when another test Dolphin holds it: the argument was handed
++// to that one and this process should exit.
++bool ClaimOrForward(const std::string& arg);
++// Test mode on for this process, with the launch argument (URL or package path).
++void Begin(const std::string& arg);
++bool Active();
++// Folders the browser downloads into (Downloads of the current user).
++void SetDownloadDirs(std::vector<std::string> dirs);
++// Called a few times a second while Active(): returns the boot of a new test when one is ready. *message gets a
++// short line for the user when something went wrong (empty otherwise).
++std::unique_ptr<BootParameters> Poll(std::string* message);
++// The running emulation takes the new test without stopping (new disc + the cup-select save state). False = not
++// possible (no save state for it, nothing running): stop and boot `boot` as usual.
++bool SwapInto(Core::System& system, std::unique_ptr<BootParameters>& boot);
++// Windows: register evoracing:// and .ertest for this Dolphin.exe (current user, no admin). Elsewhere a no-op.
++void RegisterHandlers();
++
++// ---------------------------------------------------------------- CPU thread
++// A new emulation started (after a save state, if any, is in): the test loaded for it takes over.
++void OnBoot();
++void OnFrame(Core::System& system);
++bool Unthrottled();
++void FilterPad(int chan, GCPadStatus* pad);
++}  // namespace ERTest
 --- a/Source/Core/Core/HW/SI/SI_DeviceGCController.cpp
 +++ b/Source/Core/Core/HW/SI/SI_DeviceGCController.cpp
-@@ -18,6 +18,7 @@
+@@ -9,6 +9,7 @@
+ #include "Common/MsgHandler.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/CoreTiming.h"
++#include "Core/ERTest.h"
+ #include "Core/HW/GCPad.h"
+ #include "Core/HW/ProcessorInterface.h"
+ #include "Core/HW/SI/SI.h"
+@@ -18,6 +19,7 @@
  #include "Core/NetPlayProto.h"
  #include "Core/System.h"
  #include "InputCommon/GCPadStatus.h"
@@ -13677,15 +15008,139 @@ HcmV?d00001
  
  namespace SerialInterface
  {
-@@ -150,6 +151,8 @@
+@@ -150,6 +152,10 @@
    }
  
    HandleMoviePadStatus(m_system.GetMovie(), m_device_number, &pad_status);
++  // Evolution Racing Test in game: its menu presses on top of the player's pad
++  ERTest::FilterPad(m_device_number, &pad_status);
 +  // lit17s28: the in-game weather / time-of-day panel takes the pad while it has focus
 +  PC5090Menu::FilterPad(m_device_number, &pad_status);
  
    // Our GCAdapter code sets PAD_GET_ORIGIN when a new device has been connected.
    // Watch for this to calibrate real controllers on connection.
+--- a/Source/Core/DolphinQt/Main.cpp
++++ b/Source/Core/DolphinQt/Main.cpp
+@@ -28,6 +28,7 @@
+ #include "Core/Boot/Boot.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Core.h"
++#include "Core/ERTest.h"
+ #include "Core/DolphinAnalytics.h"
+ #include "Core/System.h"
+ 
+@@ -214,6 +215,16 @@
+     save_state_path = static_cast<const char*>(options.get("save_state"));
+   }
+ 
++  // Evolution Racing Test in game: evoracing://test/<id> (from the builder) or a .ertest package
++  ERTest::RegisterHandlers();
++  std::string er_test_arg;
++  if (!args.empty() && ERTest::IsLaunchArg(args.front()))
++  {
++    er_test_arg = args.front();
++    if (!ERTest::ClaimOrForward(er_test_arg))
++      return 0;  // a test Dolphin is already open: it takes this request
++  }
++
+   std::unique_ptr<BootParameters> boot;
+   bool game_specified = false;
+   if (options.is_set("exec"))
+@@ -239,7 +250,7 @@
+     }
+     game_specified = true;
+   }
+-  else if (!args.empty())
++  else if (!args.empty() && er_test_arg.empty())
+   {
+     boot = BootParameters::GenerateFromFile(
+         args.front(), BootSessionData(save_state_path, DeleteSavestateAfterBoot::No));
+@@ -277,6 +288,8 @@
+ 
+     MainWindow win{Core::System::GetInstance(), std::move(boot),
+                    static_cast<const char*>(options.get("movie"))};
++    if (!er_test_arg.empty())
++      win.StartERTest(er_test_arg);
+ 
+ #if defined(USE_ANALYTICS) && USE_ANALYTICS
+     if (!Config::Get(Config::MAIN_ANALYTICS_PERMISSION_ASKED))
+--- a/Source/Core/DolphinQt/MainWindow.cpp
++++ b/Source/Core/DolphinQt/MainWindow.cpp
+@@ -13,6 +13,8 @@
+ #include <QFileInfo>
+ #include <QIcon>
+ #include <QMimeData>
++#include <QStandardPaths>
++#include <QTimer>
+ #include <QStackedWidget>
+ #include <QStyleHints>
+ #include <QVBoxLayout>
+@@ -44,6 +46,7 @@
+ #include "Core/AchievementManager.h"
+ #include "Core/Boot/Boot.h"
+ #include "Core/BootManager.h"
++#include "Core/ERTest.h"
+ #include "Core/CommonTitles.h"
+ #include "Core/Config/AchievementSettings.h"
+ #include "Core/Config/MainSettings.h"
+@@ -1166,6 +1169,46 @@
+       paths, boot_session_data ? std::move(*boot_session_data) : BootSessionData()));
+ }
+ 
++void MainWindow::StartERTest(const std::string& arg)
++{
++  std::vector<std::string> dirs;
++  const QString dl = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
++  if (!dl.isEmpty())
++    dirs.push_back(dl.toStdString());
++  const std::string home_dl = QDir::homePath().toStdString() + "/Downloads";
++  if (dirs.empty() || dirs[0] != home_dl)
++    dirs.push_back(home_dl);
++  ERTest::SetDownloadDirs(std::move(dirs));
++  ERTest::Begin(arg);
++  auto* timer = new QTimer(this);
++  connect(timer, &QTimer::timeout, this, [this] {
++    std::string message;
++    auto boot = ERTest::Poll(&message);
++    if (!message.empty())
++    {
++      if (Core::IsRunning(m_system))
++        Core::DisplayMessage("Test in game: " + message, 8000);
++      else
++        setWindowTitle(QStringLiteral("Test in game: ") + QString::fromStdString(message));
++    }
++    if (!boot)
++      return;
++    raise();
++    activateWindow();
++    if (!Core::IsUninitialized(m_system) && ERTest::SwapInto(m_system, boot))
++      return;  // the running game took it (new disc + save state): no stop, no new renderer
++    if (!Core::IsUninitialized(m_system))
++    {
++      // the previous test closes, the new one boots when it is down (OnStopComplete)
++      m_pending_boot = std::move(boot);
++      ForceStop();
++      return;
++    }
++    StartGame(std::move(boot));
++  });
++  timer->start(250);
++}
++
+ void MainWindow::StartGame(std::unique_ptr<BootParameters>&& parameters)
+ {
+   if (parameters && std::holds_alternative<BootParameters::Disc>(parameters->parameters))
+--- a/Source/Core/DolphinQt/MainWindow.h
++++ b/Source/Core/DolphinQt/MainWindow.h
+@@ -84,6 +84,8 @@
+   Q_OBJECT
+ 
+ public:
++  // Evolution Racing Test in game (Core/ERTest.h): wait for the builder's packages and boot each one
++  void StartERTest(const std::string& arg);
+   explicit MainWindow(Core::System& system, std::unique_ptr<BootParameters> boot_parameters,
+                       const std::string& movie_path);
+   ~MainWindow() override;
 --- a/Source/Core/VideoBackends/Vulkan/CommandBufferManager.cpp
 +++ b/Source/Core/VideoBackends/Vulkan/CommandBufferManager.cpp
 @@ -2,6 +2,96 @@
