@@ -13656,18 +13656,19 @@ HcmV?d00001
    CPUThreadConfigCallback.cpp
 --- a/Source/Core/Core/Config/GraphicsSettings.cpp
 +++ b/Source/Core/Core/Config/GraphicsSettings.cpp
-@@ -19,6 +19,8 @@
+@@ -19,6 +19,9 @@
  // Graphics.Settings
  
  const Info<bool> GFX_WIDESCREEN_HACK{{System::GFX, "Settings", "wideScreenHack"}, false};
 +const Info<std::string> GFX_WIDESCREEN_HACK_GATE{{System::GFX, "Settings", "WideScreenHackGate"}, ""};
 +const Info<std::string> GFX_PC5090_WEATHER_QUALITY{{System::GFX, "PC5090", "WeatherQuality"}, "Ultra"};
++const Info<std::string> GFX_PC5090_MACHINE_METAL{{System::GFX, "PC5090", "MachineMetal"}, "On"};
  const Info<AspectMode> GFX_ASPECT_RATIO{{System::GFX, "Settings", "AspectRatio"}, AspectMode::Auto};
  const Info<int> GFX_CUSTOM_ASPECT_RATIO_WIDTH{{System::GFX, "Settings", "CustomAspectRatioWidth"},
                                                1};
 --- a/Source/Core/Core/Config/GraphicsSettings.h
 +++ b/Source/Core/Core/Config/GraphicsSettings.h
-@@ -31,6 +31,10 @@
+@@ -31,6 +31,12 @@
  // Graphics.Settings
  
  extern const Info<bool> GFX_WIDESCREEN_HACK;
@@ -13675,6 +13676,8 @@ HcmV?d00001
 +extern const Info<std::string> GFX_WIDESCREEN_HACK_GATE;
 +// Evolution Racing lit17s14: Evolution Racing weather quality, GFX.ini [PC5090] WeatherQuality = Ultra (default) | Low
 +extern const Info<std::string> GFX_PC5090_WEATHER_QUALITY;
++// Evolution Racing lit17s34m: machine metal reflections, GFX.ini [PC5090] MachineMetal = On (default) | Off
++extern const Info<std::string> GFX_PC5090_MACHINE_METAL;
  extern const Info<AspectMode> GFX_ASPECT_RATIO;
  extern const Info<int> GFX_CUSTOM_ASPECT_RATIO_WIDTH;
  extern const Info<int> GFX_CUSTOM_ASPECT_RATIO_HEIGHT;
@@ -15658,7 +15661,7 @@ HcmV?d00001
  #include "VideoCommon/Resources/CustomResourceManager.h"
  
  std::unique_ptr<CustomPipelineAction>
-@@ -19,6 +29,52 @@
+@@ -19,6 +29,80 @@
  CustomPipelineAction::Create(const picojson::value& json_data,
                               std::shared_ptr<VideoCommon::CustomAssetLibrary> library)
  {
@@ -15694,10 +15697,38 @@ HcmV?d00001
 +      if (const auto f = ReadStringFromJson(obj, "dusk_shader_file"))
 +        File::ReadFileToString(*f, action->m_dusk_shader);
 +    }
++    if (const auto d = ReadBoolFromJson(obj, "pad_board"); d && *d)
++      action->m_pad_board = true;  // lit17s33p
++    if (const auto it = obj.find("neon"); it != obj.end() && it->second.is<picojson::object>())
++    {
++      const auto& n = it->second.get<picojson::object>();
++      action->m_neon = true;
++      if (const auto p = n.find("probe"); p != n.end() && p->second.is<bool>())
++        action->m_neon_probe = p->second.get<bool>();
++      if (const auto p = n.find("color"); p != n.end() && p->second.is<picojson::array>())
++      {
++        const auto& a = p->second.get<picojson::array>();
++        for (size_t i = 0; i < 3 && i < a.size(); i++)
++          if (a[i].is<double>())
++            action->m_neon_rgb[i] = static_cast<float>(a[i].get<double>());
++      }
++      if (const auto p = n.find("chase"); p != n.end() && p->second.is<picojson::array>())
++      {
++        const auto& a = p->second.get<picojson::array>();
++        if (a.size() > 0 && a[0].is<double>())
++          action->m_neon_chase_base = static_cast<float>(a[0].get<double>());
++        if (a.size() > 1 && a[1].is<double>())
++          action->m_neon_chase_k = static_cast<float>(a[1].get<double>());
++      }
++      if (const auto p = n.find("intensity"); p != n.end() && p->second.is<double>())
++        action->m_neon_intensity = static_cast<float>(p->second.get<double>());
++    }
 +    if (const auto t = ReadStringFromJson(obj, "hull_texture_file"))
 +      action->m_hull_texture_file = *t;
 +    if (const auto t = ReadStringFromJson(obj, "surface_texture_file"))
 +      action->m_surface_texture_file = *t;
++    if (const auto it = obj.find("env_probe"); it != obj.end() && it->second.is<bool>())
++      action->m_env_probe = it->second.get<bool>();  // lit17s34m
 +    if (const auto it = obj.find("line_width_scale"); it != obj.end() && it->second.is<double>())
 +      action->m_line_width_scale = std::clamp(static_cast<float>(it->second.get<double>()), 0.1f, 16.0f);
 +    action->m_draw_shader_text = InternShaderText(action->m_draw_shader);
@@ -15711,7 +15742,7 @@ HcmV?d00001
    auto material_asset = ReadStringFromJson(json_data.get<picojson::object>(), "material_asset");
  
    if (!material_asset)
-@@ -36,15 +92,142 @@
+@@ -36,15 +120,170 @@
  {
  }
  
@@ -15818,6 +15849,34 @@ HcmV?d00001
 +  }
 +  if (draw_started->surface_texture && m_surface_texture)
 +    *draw_started->surface_texture = m_surface_texture.get();
++  if (m_env_probe)
++    PC5090Material::NoteProbeDraw();  // lit17s34m machine metal
++  if (m_pad_board)
++  {
++    // lit17s33p PADPLATE: the board draw gets the DamageFx block with pd_* = the plate under it
++    static const ShaderText s_pb_block = InternShaderText(DamageFx::UniformBlock());
++    shader.material_uniform_block = s_pb_block;
++    if (draw_started->damage)
++    {
++      *draw_started->damage = true;
++      DamageFx::PadBoardNote();
++    }
++    *draw_started->custom_pixel_shader = std::move(shader);
++    return;
++  }
++  if (m_neon)
++  {
++    // lit17s33n: a neon track draw - the same block, nn_* filled (DamageFx::FillDrawUniforms sees the note)
++    static const ShaderText s_neon_block = InternShaderText(DamageFx::UniformBlock());
++    shader.material_uniform_block = s_neon_block;
++    if (draw_started->damage)
++    {
++      *draw_started->damage = true;
++      DamageFx::NeonDrawNote(m_neon_rgb, m_neon_probe, m_neon_chase_base, m_neon_chase_k, m_neon_intensity);
++    }
++    *draw_started->custom_pixel_shader = std::move(shader);
++    return;
++  }
 +  if (m_damage || m_hull)
 +  {
 +    // Evolution Racing dolphin-lit17: the damage uniform block (filled per draw by the vertex manager)
@@ -15858,7 +15917,15 @@ HcmV?d00001
  void CustomPipelineAction::AfterEFB(GraphicsModActionData::PostEFB* post_efb)
 --- a/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/CustomPipelineAction.h
 +++ b/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/CustomPipelineAction.h
-@@ -10,7 +10,9 @@
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <memory>
+ #include <string>
+ #include <string_view>
+@@ -10,7 +11,9 @@
  #include <picojson.h>
  
  #include "VideoCommon/Assets/CustomAssetLibrary.h"
@@ -15868,7 +15935,7 @@ HcmV?d00001
  
  class CustomPipelineAction final : public GraphicsModAction
  {
-@@ -26,6 +28,33 @@
+@@ -26,6 +29,40 @@
                         std::string material_asset);
    void OnDrawStarted(GraphicsModActionData::DrawStarted*) override;
    void AfterEFB(GraphicsModActionData::PostEFB*) override;
@@ -15896,15 +15963,22 @@ HcmV?d00001
 +  bool m_hull_texture_failed = false;
 +  // Evolution Racing dolphin-lit17s: "surface_texture_file": a PNG (mipmapped) bound to pixel sampler 10 (sf_tex)
 +  std::string m_surface_texture_file;
++  bool m_env_probe = false;  // Evolution Racing lit17s34m: "env_probe": the machine metal scene probe at samplers 11 / 12
 +  std::unique_ptr<AbstractTexture> m_surface_texture;
 +  bool m_surface_texture_failed = false;
++  // Evolution Racing lit17s33n NEON: "neon": {"color": [r,g,b], "probe": bool, "chase": [base m/s, k x player speed],
++  // "intensity": f} -> the DamageFx block with nn_* filled on this (track) draw; probe draws are neon light sources
++  bool m_neon = false, m_neon_probe = false;
++  bool m_pad_board = false;  // lit17s33p: a dash plate board draw (pd_* = its plate)
++  std::array<float, 3> m_neon_rgb{1.0f, 1.0f, 1.0f};
++  float m_neon_chase_base = 70.0f, m_neon_chase_k = 0.12f, m_neon_intensity = 1.0f;
 +  ~CustomPipelineAction() override;
  
  private:
    std::shared_ptr<VideoCommon::CustomAssetLibrary> m_library;
 --- a/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.cpp
 +++ b/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.cpp
-@@ -0,0 +1,7106 @@
+@@ -0,0 +1,10086 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -16003,8 +16077,10 @@ HcmV?d00001
 +  std::array<float, 4> hx_up;    // the machine's up (unit; the racer's rotation, column 1, brought into model space)
 +  // lit17s24 racer frame from RAM (decomp): see the uniform block
 +  std::array<float, 4> rf_pos, rf_right, rf_up, rf_back, rf_vel;
++  // lit17s30 BOOST: see the uniform block (eq_boost / eq_boost2)
++  std::array<float, 4> boost, boost2;
 +};
-+static_assert(sizeof(EmitQuadsUniforms) == (32 + 1 + 128 + 1 + 64 + 5 + 5) * 16);
++static_assert(sizeof(EmitQuadsUniforms) == (32 + 1 + 128 + 1 + 64 + 5 + 5 + 2) * 16);
 +
 +// ---- mod-global anchor slots ----
 +struct AnchorCluster
@@ -16048,8 +16124,33 @@ HcmV?d00001
 +              std::array<float, 8>* ram);
 +bool FxSwitchOn(const std::string& name);
 +bool RefreshRacerSnapshot();
++float TubeOpenAir();  // lit17s29
++void TubePathFill(EmitQuadsUniforms& u);  // lit17s33pt: the tube volumes near the camera (weather pass)
 +void RacerFrameFill(int racer, std::array<float, 4>* pos, std::array<float, 4>* right, std::array<float, 4>* up,
 +                    std::array<float, 4>* back, std::array<float, 4>* vel);
++// Evolution Racing lit17s30 BOOST REWORK (defined after the game events): per-racer boost tracker (kicks, plate strength,
++// chain), the camera FOV kick, the dash plates read from the course's static collider (energy gates)
++int s_bst_refs = 0;  // actions with "boost_core" (the tracker runs every frame, FOV kick)
++int s_pad_refs = 0;  // actions with "pads"
++void BoostConfigure(const picojson::object& g);
++void BoostUpdate(u32 i, const u8* r, u32 fl, u32 prev, u32 now, bool have, bool jump,
++                 const std::array<float, 3>& pos);
++void BoostFill(int racer, EmitQuadsUniforms& u);
++bool BoostRacerMachine(int racer, float* machine);
++void BoostFrameEnd(u32 now);
++bool PadsReady();
++void PadsFill(EmitQuadsUniforms& u, float range, u32 max_pads);
++// lit17s31 METEOR IMPACTS (near-track meteor impacts, see the block after PadsFill)
++extern int s_mi_refs;
++void MiConfigure(const picojson::object& g);
++bool MiUpdate();
++void MiFill(EmitQuadsUniforms& u);
++// lit17s32 FIRE TORNADOES (weather type 13, see the block after METEOR IMPACTS)
++extern int s_ft_refs;
++void FtConfigure(const picojson::object& g);
++bool FtUpdate();
++void FtFill(EmitQuadsUniforms& u);
++bool FtOwnsWeather();
 +
 +// Evolution Racing dolphin-lit17s6 NIGHT MODE: the look of the current course (0 day = nothing, 1 dusk, 2 night), from
 +//  1. the disc's time-of-day table: magic "TOD1" + 64 bytes (course id 0..63 -> 0 stock, 1 day, 2 dusk, 3 night) in
@@ -16180,6 +16281,42 @@ HcmV?d00001
 +{
 +  const int look = NightLook();
 +  return (look > 0 && s_nt.pass_frame == s_global_frame) ? static_cast<float>(look) : 0.0f;
++}
++
++// Evolution Racing lit17s32 NIGHT LIGHT FADE: the machine lights' level (underglow, headlights, lamp units; player + CPUs) from
++// the night look: 0 day, "dusk" (default 0.65) at dusk, 1 night, eased over "ms" (host clock, so a Time change in the
++// pause menu fades behind the paused game instead of popping). Actions with "night_fade": {"dusk": d, "ms": t} get it
++// as params[15] = 1 + level (the shaders multiply their light by it; 0 = an older build: full), and their
++// "night_only" skip waits until the level has faded to 0.
++struct NightFade
++{
++  float dusk = 0.65f, ms = 900.0f;
++  u64 frame = ~0ull;
++  float level = 0.0f;
++  bool have = false;
++  std::chrono::steady_clock::time_point last{};
++};
++NightFade s_nf;
++float NightLightLevel()
++{
++  if (s_nf.frame == s_global_frame)
++    return s_nf.level;
++  s_nf.frame = s_global_frame;
++  const int look = NightLook();
++  const float target = look >= 2 ? 1.0f : (look == 1 ? s_nf.dusk : 0.0f);
++  const auto now = std::chrono::steady_clock::now();
++  const float dt = s_nf.have ? std::chrono::duration<float, std::milli>(now - s_nf.last).count() : 1e9f;
++  s_nf.last = now;
++  s_nf.have = true;
++  if (dt > 3000.0f || s_nf.ms <= 0.0f)
++    s_nf.level = target;  // first frame / after a long stall (a load): no fade
++  else
++  {
++    s_nf.level += (target - s_nf.level) * (1.0f - std::exp(-dt / s_nf.ms));
++    if (std::abs(target - s_nf.level) < 0.002f)
++      s_nf.level = target;
++  }
++  return s_nf.level;
 +}
 +
 +// Evolution Racing dolphin-lit17s13 WEATHER: the weather of the current course SLOT, from the disc's "WTH1" table (fzgx-custom
@@ -16432,6 +16569,7 @@ HcmV?d00001
 +#define EQ_LIT17C 1
 +#define EQ_LIT17S 1
 +#define EQ_LIT17S6 1
++#define EQ_LIT17S30 1
 +UBO_BINDING(std140, 1) uniform PSBlock
 +{
 +  float4 eq_projection[4];   // GX projection rows (view -> GX clip), incl. Dolphin's adjustments
@@ -16475,9 +16613,19 @@ HcmV?d00001
 +  // keep the old estimate). right / up / back = the machine's own axes as drawn (back = -forward).
 +  float4 eq_rf_pos;          // xyz = machine centre (racer position), w = 1 valid
 +  float4 eq_rf_right;        // xyz unit, w = 1 valid
-+  float4 eq_rf_up;
++  float4 eq_rf_up;           // lit17s29: w = on the ground (1) .. airborne (0)
 +  float4 eq_rf_back;
 +  float4 eq_rf_vel;          // xyz = travel direction (unit, view), w = speed km/h
++  // lit17s30 BOOST ("boost": true actions; per_racer: that racer, else the player). eq_boost: x = boost envelope 0..1
++  // (+0x0 bit 0x20, eased), y = ms since the last kick (a boost start or a dash plate hit, 1e6 = none), z = its
++  // strength (0 manual boost, 1 / 1.5 / 2 = the plate: boost timer +0x18A / (30 x duration +0x234)), w = chain level
++  // (kicks less than the chain window apart, eased, 0..6). eq_boost2: x = kicks in this chain, y = speed km/h,
++  // z = ms since the speed last crossed the sonic threshold (1e6 = none), w = 1 valid.
++  // "pads" actions: eq_surf_info = (pads, 2, range, 0); pad k: eq_surf_pos[2k] = centre (view) + w half length,
++  // eq_surf_pos[2k+1] = across axis (view) + w half width, eq_surf_normal[2k] = up (view) + w strength (1, 1.5, 2),
++  // eq_surf_normal[2k+1] = along axis (view) + w ms since a machine last hit the plate (1e6 = never)
++  float4 eq_boost;
++  float4 eq_boost2;
 +};
 +float eq_ram_value(int i) { return eq_ram[i >> 2][i & 3]; }
 +uint eq_time_ms() { return eq_info.x; }
@@ -16488,16 +16636,21 @@ HcmV?d00001
 +float eq_aspect() { return eq_viewport.x * eq_viewport.w; }
 +)";
 +
-+std::string GenerateVertexShader(const std::string& user_code)
++std::string GenerateVertexShader(const std::string& user_code, int near_fade = 0)
 +{
 +  ShaderCode code;
 +  code.Write("#define EQ_VERTEX 1\n");
++  if (near_fade)
++    code.Write("#define EQ_NEAR_FADE 1\n");  // lit17s29n
 +  code.Write("{}", UNIFORM_BLOCK);
 +  code.Write("{}", R"(
 +VARYING_LOCATION(0) out float2 eq_v_uv;
 +VARYING_LOCATION(1) out float4 eq_v_data0;
 +VARYING_LOCATION(2) out float4 eq_v_data1;
 +VARYING_LOCATION(3) flat out uint eq_v_instance;
++#ifdef EQ_NEAR_FADE
++VARYING_LOCATION(4) out float eq_v_fade;
++#endif
 +
 +struct EmitVertex
 +{
@@ -16561,7 +16714,54 @@ HcmV?d00001
 +  v.uv = corner;
 +  v.data0 = float4(0.0, 0.0, 0.0, 0.0);
 +  v.data1 = float4(0.0, 0.0, 0.0, 0.0);
++#ifdef EQ_NEAR_FADE
++  EmitVertex v0 = v;
++#endif
 +  emit_vertex(instance, corner, v);
++#ifdef EQ_NEAR_FADE
++  // lit17s29n "near_fade": a quad is drawn whole or not at all (a corner the user code culled, or one at / behind the
++  // camera, culls all four - before, the other corners still drew a long triangle to EQ_CULLED), and it dissolves
++  // over the last ramp of view depth before its nearest corner reaches the camera (no pop when a puff passes it)
++  float eq_fade = 1.0;
++  if (all(equal(v.clip, EQ_CULLED)))
++    eq_fade = 0.0;
++  else
++  {
++    float wmin = 1e30;
++    float2 lo = float2(1e30, 1e30), hi = float2(-1e30, -1e30);
++    bool cull = false;
++    for (uint i = 0u; i < 4u; i++)
++    {
++      float2 c2 = float2(float(i & 1u), float(i >> 1u));
++      EmitVertex o = v0;
++      o.uv = c2;
++      emit_vertex(instance, c2, o);
++      if (all(equal(o.clip, EQ_CULLED)) || o.clip.w <= 1e-4)
++      {
++        cull = true;
++        break;
++      }
++      wmin = min(wmin, o.clip.w);
++      float2 nd = o.clip.xy / o.clip.w;
++      lo = min(lo, nd);
++      hi = max(hi, nd);
++    }
++    if (cull)
++    {
++      v.clip = EQ_CULLED;
++      eq_fade = 0.0;
++    }
++    else
++    {
++      // the quad's view-space size (its NDC extent at the nearest corner's depth); ramp 1.5 .. 3 view units
++      float ext = max((hi.x - lo.x) / max(abs(eq_projection[0].x), 1e-3), (hi.y - lo.y) / max(abs(eq_projection[1].y), 1e-3)) * wmin;
++      eq_fade = smoothstep(0.8, 0.8 + clamp(ext, 1.5, 3.0), wmin);
++      if (eq_fade <= 0.0)
++        v.clip = EQ_CULLED;
++    }
++  }
++  eq_v_fade = eq_fade;
++#endif
 +  eq_v_uv = v.uv;
 +  eq_v_data0 = v.data0;
 +  eq_v_data1 = v.data1;
@@ -16572,10 +16772,12 @@ HcmV?d00001
 +  return code.GetBuffer();
 +}
 +
-+std::string GeneratePixelShader(const std::string& user_code)
++std::string GeneratePixelShader(const std::string& user_code, int near_fade = 0)
 +{
 +  ShaderCode code;
 +  code.Write("#define EQ_PIXEL 1\n");
++  if (near_fade)
++    code.Write("#define EQ_NEAR_FADE {}\n", near_fade);  // lit17s29n: 1 alpha x fade, 2 rgba x fade
 +  code.Write("{}", UNIFORM_BLOCK);
 +  code.Write("{}", R"(
 +SAMPLER_BINDING(0) uniform sampler2DArray samp0;
@@ -16585,6 +16787,9 @@ HcmV?d00001
 +VARYING_LOCATION(1) in float4 eq_v_data0;
 +VARYING_LOCATION(2) in float4 eq_v_data1;
 +VARYING_LOCATION(3) flat in uint eq_v_instance;
++#ifdef EQ_NEAR_FADE
++VARYING_LOCATION(4) in float eq_v_fade;
++#endif
 +FRAGMENT_OUTPUT_LOCATION(0) out float4 ocol0;
 +
 +// The action's texture ("texture_file"), or the target draw's own texture.
@@ -16628,6 +16833,11 @@ HcmV?d00001
 +void main()
 +{
 +  ocol0 = emit_pixel(eq_v_instance, eq_v_uv, eq_v_data0, eq_v_data1);
++#if defined(EQ_NEAR_FADE) && EQ_NEAR_FADE == 1
++  ocol0.a *= eq_v_fade;
++#elif defined(EQ_NEAR_FADE)
++  ocol0 *= eq_v_fade;
++#endif
 +}
 +)");
 +  return code.GetBuffer();
@@ -18343,12 +18553,23 @@ HcmV?d00001
 +    action->m_player_only = *b;
 +  if (const auto b = ReadBoolFromJson(obj, "scene_copy"))
 +    action->m_scene_copy = *b;
++  if (const auto b = ReadBoolFromJson(obj, "near_fade"))  // lit17s29n
++    action->m_near_fade = *b;
 +  if (const auto b = ReadBoolFromJson(obj, "depth_copy"))
 +    action->m_depth_copy = *b;
 +  if (const auto n = ReadNumericFromJson<double>(obj, "half_res"))  // lit17s19
 +    action->m_half_res = std::clamp(static_cast<int>(*n), 1, 2);
 +  if (const auto b = ReadBoolFromJson(obj, "night_only"))
 +    action->m_night_only = *b;
++  if (const auto it = obj.find("night_fade"); it != obj.end() && it->second.is<picojson::object>())  // lit17s32
++  {
++    const auto& nf = it->second.get<picojson::object>();
++    action->m_night_fade = true;
++    if (const auto n = ReadNumericFromJson<double>(nf, "dusk"))
++      s_nf.dusk = static_cast<float>(std::clamp(*n, 0.0, 1.0));
++    if (const auto n = ReadNumericFromJson<double>(nf, "ms"))
++      s_nf.ms = static_cast<float>(std::clamp(*n, 0.0, 10000.0));
++  }
 +  if (const auto b = ReadBoolFromJson(obj, "emit_before"))
 +    action->m_emit_before = *b;
 +  if (const auto b = ReadBoolFromJson(obj, "scene_before_night"))
@@ -18520,6 +18741,47 @@ HcmV?d00001
 +    action->m_skip_within_ms = static_cast<float>(*n);
 +  if (const auto n = ReadNumericFromJson<double>(obj, "trace"))
 +    action->m_trace = static_cast<u32>(std::max(*n, 0.0));
++  // Evolution Racing lit17s30 BOOST REWORK
++  if (const auto b = obj.find("boost"); b != obj.end() && b->second.is<bool>())
++    action->m_boost_fx = b->second.get<bool>();
++  if (const auto it = obj.find("boost_core"); it != obj.end() && it->second.is<picojson::object>())
++  {
++    BoostConfigure(it->second.get<picojson::object>());
++    action->m_boost_core = true;
++    s_bst_refs++;
++  }
++  if (const auto it = obj.find("pads"); it != obj.end() && it->second.is<picojson::object>())
++  {
++    const auto& g = it->second.get<picojson::object>();
++    if (const auto n = ReadNumericFromJson<double>(g, "range"))
++      action->m_pads_range = static_cast<float>(*n);
++    if (const auto n = ReadNumericFromJson<double>(g, "max"))
++      action->m_pads_max = static_cast<u32>(std::clamp(*n, 1.0, 32.0));
++    action->m_pads = true;
++    // lit17s33p: an explicit max_emits_per_frame is kept (the dash plate decal emits after EVERY board draw)
++    if (!ReadNumericFromJson<double>(obj, "max_emits_per_frame"))
++      action->m_max_emits_per_frame = 1;
++    s_pad_refs++;
++    s_sc_refs++;  // the exact GX view of the frame's world draws (as scenery / weather)
++  }
++  // Evolution Racing lit17s32 FIRE TORNADOES
++  if (const auto it = obj.find("fire_tornado"); it != obj.end() && it->second.is<picojson::object>())
++  {
++    FtConfigure(it->second.get<picojson::object>());
++    action->m_fire_tornado = true;
++    action->m_max_emits_per_frame = 1;
++    s_ft_refs++;
++    s_sc_refs++;  // the exact GX view of the frame's world draws
++  }
++  // Evolution Racing lit17s31 METEOR IMPACTS
++  if (const auto it = obj.find("meteor_impact"); it != obj.end() && it->second.is<picojson::object>())
++  {
++    MiConfigure(it->second.get<picojson::object>());
++    action->m_meteor_impact = true;
++    action->m_max_emits_per_frame = 1;
++    s_mi_refs++;
++    s_sc_refs++;  // the exact GX view of the frame's world draws
++  }
 +  // Evolution Racing dolphin-lit17s9 / s10 scenery (see EmitQuadsAction.h, SCENERY-LIT17S10.md)
 +  if (const auto it = obj.find("scenery"); it != obj.end() && it->second.is<picojson::object>())
 +  {
@@ -18611,6 +18873,23 @@ HcmV?d00001
 +  }
 +  if (m_scenery)
 +    s_sc_refs = std::max(s_sc_refs - 1, 0);
++  if (m_pads)  // lit17s30
++  {
++    s_sc_refs = std::max(s_sc_refs - 1, 0);
++    s_pad_refs = std::max(s_pad_refs - 1, 0);
++  }
++  if (m_boost_core)
++    s_bst_refs = std::max(s_bst_refs - 1, 0);
++  if (m_fire_tornado)  // lit17s32
++  {
++    s_sc_refs = std::max(s_sc_refs - 1, 0);
++    s_ft_refs = std::max(s_ft_refs - 1, 0);
++  }
++  if (m_meteor_impact)  // lit17s31
++  {
++    s_sc_refs = std::max(s_sc_refs - 1, 0);
++    s_mi_refs = std::max(s_mi_refs - 1, 0);
++  }
 +  if (m_sc && m_sc->pending.valid())
 +    m_sc->pending.wait();
 +  m_sc.reset();
@@ -18680,6 +18959,8 @@ HcmV?d00001
 +  }
 +  if (s_dm_refs > 0)
 +    DmFrameEnd();  // lit17: before the slots roll (cur = this frame's complete machines)
++  if (s_bst_refs > 0 || s_pad_refs > 0)
++    BoostFrameEnd(s_now_ms);  // lit17s30: boost tracker every frame + the FOV kick
 +  for (auto& [name, slot] : s_slots)
 +  {
 +    slot.prev = std::move(slot.cur);
@@ -18730,9 +19011,9 @@ HcmV?d00001
 +    if (PC5090Prof::Enabled() && !m_warmed)
 +      std::fprintf(stderr, "EQCOMPILE %s: shaders compiled at an emit (not warmed up)\n", m_name.c_str());
 +    m_vertex_shader = g_gfx->CreateShaderFromSource(
-+        ShaderStage::Vertex, GenerateVertexShader(m_vs_source), nullptr, "emit_quads vertex");
++        ShaderStage::Vertex, GenerateVertexShader(m_vs_source, m_near_fade ? 1 : 0), nullptr, "emit_quads vertex");
 +    m_pixel_shader = g_gfx->CreateShaderFromSource(
-+        ShaderStage::Pixel, GeneratePixelShader(m_ps_source), nullptr, "emit_quads pixel");
++        ShaderStage::Pixel, GeneratePixelShader(m_ps_source, !m_near_fade ? 0 : (m_blend == BlendMode::Additive || m_blend == BlendMode::Premultiplied) ? 2 : 1), nullptr, "emit_quads pixel");
 +    if (!m_vertex_shader || !m_pixel_shader)
 +    {
 +      ERROR_LOG_FMT(VIDEO, "emit_quads: shader compile failed, action disabled (see the log above)");
@@ -19156,14 +19437,29 @@ HcmV?d00001
 +    EmitScenery(target);  // lit17s9
 +    return;
 +  }
-+  if (m_night_only && NightLook() == 0)
-+    return;  // lit17s8: day course / menus / no night pass installed
++  if (m_night_only && (m_night_fade ? NightLightLevel() <= 0.0f : NightLook() == 0))
++    return;  // lit17s8: day course / menus / no night pass installed (lit17s32: once faded out)
 +  // lit17s6: the night pass costs nothing on a day course / in the menus (no copies, no draw), and runs once a frame
 +  if (m_night && (NightLook() == 0 || s_nt.strength <= 0.0f || s_nt.pass_frame == s_global_frame))
 +    return;
 +  // lit17s13: the weather pass costs nothing without weather (no copies, no draw)
 +  if (m_weather && WeatherNow()[0] < 0.5f)
 +    return;
++  // lit17s32: fire-tornado weather draws only the fire-tornado action (no rain / Ultra / lens passes)
++  if ((m_weather || m_screen_water) && FtOwnsWeather())
++  {
++    if (m_screen_water)
++      m_sw_reset = true;
++    return;
++  }
++  // lit17s29: inside a tube the lens dries off (no copies, no draw). lit17s33pt: the weather passes keep drawing (the
++  // weather goes on outside the glass / openings); the shaders leave out what is INSIDE the tube volumes (TubePathFill)
++  if (m_screen_water && WeatherNow()[0] >= 0.5f && TubeOpenAir() <= 0.0f)
++  {
++    if (m_screen_water)
++      m_sw_reset = true;
++    return;
++  }
 +  // lit17s14: only the pass of the chosen quality draws
 +  if (m_weather && WeatherUltra() != m_weather_ultra)
 +    return;
@@ -19176,6 +19472,15 @@ HcmV?d00001
 +  }
 +  if (!m_switch.empty() && !FxSwitchOn(m_switch))
 +    return;  // lit17s24: GFX.ini [PC5090] <switch> = Off
++  if (m_pads && !PadsReady())
++    return;  // lit17s30: no race / no plates in reach (no copies, no draw)
++  // lit17s31: nothing between impacts (no copies, no draw); none start inside a tube (MiUpdate). lit17s33pt: one that
++  // is already falling / burning keeps drawing when the player enters a tube (it is outside, seen through the glass)
++  if (m_meteor_impact && !MiUpdate())
++    return;
++  // lit17s32: only on fire-tornado weather in a live race (no copies, no draw otherwise)
++  if (m_fire_tornado && !FtUpdate())
++    return;
 +  if (m_pr && !m_pr_override)
 +  {
 +    EmitPerRacer(target);
@@ -19359,6 +19664,35 @@ HcmV?d00001
 +  if (!m_ram_values.empty())
 +    have_ev = false;  // the action's own ram_values keep eq_ram (the event is in eq_gate)
 +  EmitQuadsAnchor anchor = target;
++  // lit17s30: "anchor_pick": "all" on the classic path = one emit on EVERY cluster of anchor_from (e.g. fired by a
++  // late / HUD trigger once a frame, after the world: player_only then keeps the player's own)
++  if (m_pick_all && !m_anchor_from.empty())
++  {
++    const auto it = s_slots.find(m_anchor_from);
++    if (it == s_slots.end())
++      return;
++    const auto& list = (!m_anchor_prev_frame && !it->second.cur.empty()) ? it->second.cur : it->second.prev;
++    for (const AnchorCluster& c : list)
++    {
++      if (m_emits_this_frame >= m_max_emits_per_frame)
++        break;
++      EmitQuadsAnchor a = target;
++      a.centroid_view = c.a.centroid_view;
++      a.radius_view = c.a.radius_view;
++      a.min_view = c.a.min_view;
++      a.max_view = c.a.max_view;
++      a.screen_box = c.a.screen_box;
++      a.screen_centre = c.a.screen_centre;
++      a.position_matrix = c.a.position_matrix;
++      a.model_min = c.a.model_min;
++      a.model_max = c.a.model_max;
++      a.model_valid = c.a.model_valid;
++      a.sampled_vertices = c.a.sampled_vertices;
++      a.surf = c.a.surf;
++      DrawEmit(target, a, gate, have_ev ? &ev_ram : nullptr, nullptr);
++    }
++    return;
++  }
 +  if (!m_anchor_from.empty())
 +  {
 +    const AnchorCluster* pick = nullptr;
@@ -19522,7 +19856,7 @@ HcmV?d00001
 +  u.hx_ctr = {s_wx.vel[0], s_wx.vel[1], s_wx.vel[2], static_cast<float>(NightLook())};
 +  u.hx_aux = {static_cast<float>(s_now_ms % 1000000u) / 1000.0f,
 +              static_cast<float>(static_cast<s32>(s_now_ms - s_wx.since_ms)) / 1000.0f,
-+              static_cast<float>(s_global_frame % 100000u), 1.0f};
++              static_cast<float>(s_global_frame % 100000u), TubeOpenAir()};   // lit17s29: w = open air (0 in a tube)
 +  u.hx_up = {};
 +  if (s_wx.trace > 0 && (s_global_frame % 60) == 0)
 +  {
@@ -19625,7 +19959,8 @@ HcmV?d00001
 +  EmitQuadsUniforms u{};
 +  u.projection = anchor.projection_rows;
 +  u.pixel_center = anchor.pixel_center;
-+  if ((m_night || m_weather || m_screen_water) && anchor.projection_rows[3][3] != 0.0f && s_have_persp)
++  if ((m_night || m_weather || m_screen_water || m_pads || m_meteor_impact || m_fire_tornado || !m_anchor_from.empty()) && anchor.projection_rows[3][3] != 0.0f &&
++      s_have_persp)
 +  {
 +    // lit17s6: the night pass fired by a HUD draw: the world's perspective for the depth copy
 +    u.projection = s_persp_rows;
@@ -19648,6 +19983,8 @@ HcmV?d00001
 +  u.viewport = {vw, vh, 1.0f / vw, 1.0f / vh};
 +  u.info = {anchor.time_ms, m_quads, m_emits_this_frame, m_frame_counter};
 +  u.params = m_params;
++  if (m_night_fade)
++    u.params[15] = 1.0f + NightLightLevel();  // lit17s32
 +  u.model_min = {anchor.model_min[0], anchor.model_min[1], anchor.model_min[2],
 +                 anchor.model_valid ? 1.0f : 0.0f};
 +  u.model_max = {anchor.model_max[0], anchor.model_max[1], anchor.model_max[2], 0.0f};
@@ -19759,7 +20096,19 @@ HcmV?d00001
 +    if (fr < 0 && RefreshRacerSnapshot())
 +      fr = EventPlayerRacer();
 +    RacerFrameFill(fr, &u.rf_pos, &u.rf_right, &u.rf_up, &u.rf_back, &u.rf_vel);
++    // lit17s30: the boost state of the emitted machine; the classic path also gets eq_racer (the player's racer +
++    // machine id) so per-machine tables resolve by id as on the per_racer path
++    u.boost = u.boost2 = {};
++    if (m_boost_fx && fr >= 0)
++    {
++      BoostFill(fr, u);
++      float mid = 0.0f;
++      if (!racer_override && BoostRacerMachine(fr, &mid))
++        u.racer = {static_cast<float>(fr), mid, 1.0f, 0.0f};
++    }
 +  }
++  if (m_pads)
++    PadsFill(u, m_pads_range, m_pads_max);  // lit17s30 (replaces the hull samples: a pads action has no machine)
 +  // lit17s24 diagnostic (user-dir file pc5090rfdiff): per frame, the angle between the shaders' old GUESSED "back"
 +  // axis (the anchor matrix axis nearest the camera -> machine line, flipped towards the camera) and the RAM back axis
 +  {
@@ -19796,8 +20145,14 @@ HcmV?d00001
 +                   yaw);
 +    }
 +  }
-+  if (m_weather || m_screen_water)
-+    WeatherFill(u);  // lit17s13 (lit17s15: the screen water pass too)
++  if (m_weather || m_screen_water || m_meteor_impact || m_fire_tornado)
++    WeatherFill(u);  // lit17s13 (lit17s15: the screen water pass too; lit17s31: meteor impacts)
++  if (m_weather)
++    TubePathFill(u);  // lit17s33pt: eq_surf_normal[32..63]
++  if (m_meteor_impact)
++    MiFill(u);
++  if (m_fire_tornado)
++    FtFill(u);  // lit17s32  // lit17s31 (after WeatherFill: it leaves eq_surf_* alone)
 +  if (m_weather_ultra)
 +  {
 +    // lit17s14: x = 1 Ultra (the Low pass keeps 0); lit17s15: y = 1 the screen water pass draws the lens (the Ultra
@@ -19883,7 +20238,7 @@ HcmV?d00001
 +  if (m_depth_write)
 +    PC5090Prof::BumpDepth();
 +  g_gfx->Draw(0, m_quads * 6);
-+  if (m_night || m_weather || m_screen_water)
++  if (m_night || m_weather || m_screen_water || m_meteor_impact || m_fire_tornado)
 +    PC5090Prof::BumpStage();  // lit17s14m: a full-screen pass ends the copy stage
 +  if (PC5090Prof::Enabled())
 +    PC5090Prof::Add(PC5090Prof::EmitDraws, 1);
@@ -20753,6 +21108,7 @@ HcmV?d00001
 +      if (e.retired)
 +        EvFire(static_cast<int>(i), 4, now, 1.0f, pos, up, 0.0f);
 +    }
++    BoostUpdate(i, r, fl, e.flags, now, e.have, e.have && Dist2(pos, e.pos) > 60.0f * 60.0f, pos);  // lit17s30
 +    e.have = true;
 +    e.flags = fl;
 +    e.pos = pos;
@@ -20829,6 +21185,65 @@ HcmV?d00001
 +  return s_rs.view_ok;
 +}
 +
++// lit17s29 TUBES: is the player driving inside a closed tube? The progress record P = *(racer +0x49C) holds a copy of
++// the track-frame record of the segment tree walk at the racer (car.c:15831-15840, built by stcoli.c:3942-4036):
++// P+0x7C = OR of (node flags & 0x07E00C01) along the path - 0x02000000 road, 0x00200000 modulated road, 0x01000000
++// closed pipe / cylinder leaf, 0x00800000 open pipe, bit 0 = cylinder (driving on the OUTSIDE); P+0x6C = the open
++// pipe's open fraction (1 = closed). Same decode order as the game (car.c:17124-17137) and the camera, which switches
++// to its pipe mode on bit 0x01000000 (camera.c:3181). Returns the open-air factor for the weather: 1 = open sky,
++// 0 = inside a tube; eased over time (in ~0.25 s, out ~0.45 s) so the precipitation fades in / out at the portals.
++struct TubeState
++{
++  u64 frame = ~0ull;
++  float open = 1.0f;
++  u32 last_ms = 0;
++  int last_cls = -1;
++  u32 flags = 0;
++};
++TubeState s_tube;
++float TubeOpenAir()
++{
++  if (s_tube.frame == s_global_frame)
++    return s_tube.open;
++  s_tube.frame = s_global_frame;
++  int cls = 0;  // 0 open air, 1 closed pipe (inside), 2 open pipe closed enough (inside)
++  u32 f = 0;
++  if (RefreshRacerSnapshot())
++  {
++    const int r = EventPlayerRacer();
++    auto& memory = Core::System::GetInstance().GetMemory();
++    const u8* rp = r >= 0 ? memory.GetPointerForRange(s_rs.arr + static_cast<u32>(r) * 0x620u + 0x49C, 4) : nullptr;
++    const u32 pp = rp ? EvU32(rp) : 0;
++    const u8* q = (pp >= 0x80000000u && pp < 0x817FFF00u) ? memory.GetPointerForRange(pp, 0x80) : nullptr;
++    if (q)
++    {
++      f = EvU32(q + 0x7C);
++      const float open_frac = EvF32(q + 0x6C);
++      if (!(f & 0x02200000u) && !(f & 1u))
++      {
++        if (f & 0x01000000u)
++          cls = 1;
++        else if ((f & 0x00800000u) && std::isfinite(open_frac) && open_frac >= 0.85f)
++          cls = 2;
++      }
++    }
++  }
++  const s32 dt = static_cast<s32>(s_now_ms - s_tube.last_ms);
++  s_tube.last_ms = s_now_ms;
++  const float target = cls ? 0.0f : 1.0f;
++  const float tau = cls ? 0.25f : 0.45f;
++  const float k = (dt > 0 && dt < 500) ? 1.0f - std::exp(-static_cast<float>(dt) / 1000.0f / tau) : 1.0f;
++  s_tube.open += (target - s_tube.open) * k;
++  if (std::abs(s_tube.open - target) < 0.002f)
++    s_tube.open = target;
++  if (cls != s_tube.last_cls || ((f ^ s_tube.flags) & 0x03E00001u))
++    std::fprintf(stderr, "TUBE f=%llu class %d (P+0x7C %08x) open %.2f\n",
++                 static_cast<unsigned long long>(s_global_frame), cls, f, s_tube.open);
++  s_tube.last_cls = cls;
++  s_tube.flags = f;
++  return s_tube.open;
++}
++
 +// lit17s24 racer frame: the machine as the game draws it = basis +0xEC (3x3) x lean +0x5E0 (3x3, the suspension pitch
 +// / steering lean, fn_1_29A0C), at +0x7C; brought into view space by the snapshot's camera
 +void RacerFrameFill(int racer, std::array<float, 4>* pos, std::array<float, 4>* right, std::array<float, 4>* up,
@@ -20881,7 +21296,9 @@ HcmV?d00001
 +  const float vl = std::sqrt(vv[0] * vv[0] + vv[1] * vv[1] + vv[2] * vv[2]);
 +  *pos = {pv[0], pv[1], pv[2], 1.0f};
 +  *right = {ax[0][0], ax[0][1], ax[0][2], 1.0f};
-+  *up = {ax[1][0], ax[1][1], ax[1][2], 1.0f};
++  // lit17s29: up.w = on the ground 1 .. airborne 0 (+0x483 u8 = frames airborne, decomp; 1 on lit17s24-28 builds)
++  const float air = static_cast<float>(r[0x483]);
++  *up = {ax[1][0], ax[1][1], ax[1][2], 1.0f - std::clamp((air - 2.0f) / 8.0f, 0.0f, 1.0f)};
 +  *back = {ax[2][0], ax[2][1], ax[2][2], 1.0f};  // the machine's forward is -z (velocity . column 2 < 0, live)
 +  if (vl > 1e-3f)
 +    *vel = {vv[0] / vl, vv[1] / vl, vv[2] / vl, EvF32(r + 0x17C)};
@@ -20912,6 +21329,2140 @@ HcmV?d00001
 +    s.on = v;
 +  }
 +  return s.on;
++}
++}  // namespace
++
++// ---- Evolution Racing lit17s30 BOOST REWORK ----
++// Boost tracker (every frame while a "boost_core" / "pads" action exists, from RefreshRacerEvents): per racer a KICK =
++// a boost start (+0x0 bit 0x20 rising) or a dash plate hit during a boost (bit 0x00400000 rising, or the boost timer
++// +0x18A jumping up); its strength = manual (0) or the plate's: the boost code sets the timer to 0.5 x 60 x the
++// boost duration +0x234 for a stock plate, 57 x for a 1.5x plate and 90 x for a 2x plate (the dash plate strength
++// patch, docs fzgx-custom game-code.md), so timer / (30 x duration) = 1 / 1.9 / 3. CHAIN: kicks less than the chain
++// window apart (or while still boosting) count up; the level eases towards the count and falls back after the chain.
++// FOV KICK (player, GFX.ini [PC5090] BoostFov): the race camera's fov (camera 0 = [REL + 0x1BAFAC], +0x08, camera.c
++// fn_1_90E0) gets a short widening + settle on each kick, scaled by the kick strength and the chain. The game eases
++// its own fov every frame (fov += r x (target - fov)); we add our offset K(t) on top and give back what the game's
++// step took from our offset (r from the same branch as the game: boosting 0.1 then 0.2, else 0.01..0.05), so the
++// game's own boost widening (to 1.35 x, camera.c) runs unchanged underneath. Paused (frame counter 0x801A66A0 still)
++// = held. Only the normal chase camera (+0xA8 == 0) of the player's racer, mode 2 / sub-mode 41 (race).
++// PADS: the dash plates from the course's static collider (lbl_1_bss_3BE0 = REL .bss + 0x3BE0 -> Stcoli: +0x18 cells,
++// +0x1C cell array (0x4B0 each); a cell: +0x24 triangles (0x58), +0x28 per-layer triangle lists [11], +0x60 grid
++// x0 z0 sx sz nx nz, +0x78 quads (0x70), +0x7C per-layer quad lists; layer 3 = dash, 0 = driveable, 2 = wall (the
++// 1.5x / 2x markers under a plate); stcoli.c fn_1_163BC), read once per course: polygons joined by shared corners
++// into plates (centre, up, along / across axes from the corner spread, half sizes), strength from the markers.
++namespace
++{
++struct BoostRacer
++{
++  bool kick_ever = false;
++  u32 kick_ms = 0;
++  float strength = 1.0f;  // 0 manual, 1 / 1.5 / 2 plate
++  int count = 0;
++  float level = 0.0f;
++  float env = 0.0f;
++  u32 last_ms = 0;
++  int cap_frames = 0;
++  u32 cap_timer = 0;
++  bool cap_plate = false;
++  u32 prev_timer = 0;
++  bool plate_ever = false;
++  u32 plate_ms = 0;
++  float speed = 0.0f;
++  bool sonic_above = false, sonic_ever = false;
++  u32 sonic_ms = 0;
++};
++std::array<BoostRacer, 64> s_bst;
++struct BoostCfg
++{
++  float chain_ms = 1800.0f;
++  float fov_deg = 5.0f, fov_max = 12.0f, fov_attack = 85.0f, fov_hold = 70.0f, fov_settle = 560.0f;
++  float fov_chain = 0.22f;  // + per extra kick in the chain
++  float sonic_kmh = 1500.0f;
++  bool fov = true;
++};
++BoostCfg s_bcfg;
++u32 s_bst_arr = 0;
++u32 s_bst_trace = 0;  // user-dir file pc5090boosttrace: BOOST lines on stderr
++
++struct Pad
++{
++  std::array<float, 3> c{}, up{}, along{}, across{};
++  float hl = 0.0f, hw = 0.0f, strength = 1.0f;
++  bool hit_ever = false;
++  u32 hit_ms = 0;
++  bool dir_known = false;  // lit17s33p: along = the course's forward (checkpoint direction)
++};
++struct PadScan
++{
++  u32 key_rel = 0, key_st = 0, key_cells = 0, key_slot = 0xFFFFFFFFu, key_arr = 0;
++  std::vector<Pad> pads;
++  bool scanned = false;
++  u64 tried_frame = ~0ull;
++};
++PadScan s_pads;
++std::array<float, 12> s_pad_view{};  // lit17s33p
++u64 s_pad_view_frame = ~0ull;
++
++float PlateStrength(float k) { return k < 1.45f ? 1.0f : (k < 2.45f ? 1.5f : 2.0f); }
++
++void PadNoteHit(const std::array<float, 3>& pos, u32 now)
++{
++  float best = 1e30f;
++  Pad* bp = nullptr;
++  for (Pad& p : s_pads.pads)
++  {
++    const float lim = std::max(p.hl, p.hw) + 12.0f;
++    const float d = Dist2(pos, p.c);
++    if (d < lim * lim && d < best)
++    {
++      best = d;
++      bp = &p;
++    }
++  }
++  if (bp)
++  {
++    bp->hit_ever = true;
++    bp->hit_ms = now;
++  }
++}
++
++void BoostConfigure(const picojson::object& g)
++{
++  const auto num = [&](const char* k, float def) {
++    const auto n = ReadNumericFromJson<double>(g, k);
++    return n ? static_cast<float>(*n) : def;
++  };
++  s_bcfg.chain_ms = num("chain_ms", 1800.0f);
++  s_bcfg.fov_deg = num("fov_deg", 5.0f);
++  s_bcfg.fov_max = num("fov_max", 12.0f);
++  s_bcfg.fov_attack = std::max(num("fov_attack_ms", 85.0f), 1.0f);
++  s_bcfg.fov_hold = std::max(num("fov_hold_ms", 70.0f), 0.0f);
++  s_bcfg.fov_settle = std::max(num("fov_settle_ms", 560.0f), 1.0f);
++  s_bcfg.fov_chain = num("fov_chain", 0.22f);
++  s_bcfg.sonic_kmh = num("sonic_kmh", 1500.0f);
++  s_bcfg.fov = num("fov", 1.0f) > 0.5f;
++  s_bst_trace = File::Exists(File::GetUserPath(D_USER_IDX) + "pc5090boosttrace") ? 1 : 0;
++  std::fprintf(stderr, "BOOSTFX core: chain %.0f ms, fov %s %.1f deg (max %.1f), sonic %.0f km/h%s\n", s_bcfg.chain_ms,
++               s_bcfg.fov ? "on" : "off", s_bcfg.fov_deg, s_bcfg.fov_max, s_bcfg.sonic_kmh, s_bst_trace ? " (trace)" : "");
++}
++
++void BoostUpdate(u32 i, const u8* r, u32 fl, u32 prev, u32 now, bool have, bool jump, const std::array<float, 3>& pos)
++{
++  if (i >= s_bst.size())
++    return;
++  if (s_rs.arr != s_bst_arr)
++  {
++    s_bst = {};  // a new race
++    s_bst_arr = s_rs.arr;
++  }
++  BoostRacer& b = s_bst[i];
++  const s32 dts = static_cast<s32>(now - b.last_ms);
++  const float dt = (b.last_ms != 0 && dts > 0 && dts < 250) ? static_cast<float>(dts) / 1000.0f : 0.0f;
++  b.last_ms = now;
++  const float spd = EvF32(r + 0x17C);
++  b.speed = std::isfinite(spd) ? spd : 0.0f;
++  const bool boosting = (fl & 0x20u) != 0;
++  {
++    const float tgt = boosting ? 1.0f : 0.0f;
++    const float tau = tgt > b.env ? 0.045f : 0.30f;
++    b.env = dt > 0.0f ? b.env + (tgt - b.env) * (1.0f - std::exp(-dt / tau)) : tgt;
++  }
++  const u32 timer = r[0x18A];
++  if (have && !jump)
++  {
++    const u32 rise = fl & ~prev;
++    bool kick = false, plate = false;
++    if (rise & 0x20u)
++    {
++      kick = true;
++      plate = (fl & 0x00200000u) != 0;
++    }
++    else if (boosting && (prev & 0x20u))
++    {
++      // a plate during a boost: the touch edge (a one-frame bit, can be missed from this thread) or the timer reset
++      const bool touch = (rise & 0x00400000u) != 0;
++      const bool reset = timer > b.prev_timer + 3;
++      if ((touch || reset) && (!b.plate_ever || static_cast<s32>(now - b.plate_ms) > 220))
++      {
++        kick = true;
++        plate = true;
++      }
++    }
++    if (plate || (rise & 0x00400000u))
++    {
++      b.plate_ever = true;
++      b.plate_ms = now;
++    }
++    if (kick)
++    {
++      const s32 since = static_cast<s32>(now - b.kick_ms);
++      const bool alive = b.kick_ever && since >= 0 && (static_cast<float>(since) < s_bcfg.chain_ms || (prev & 0x20u));
++      b.count = alive ? std::min(b.count + 1, 6) : 1;
++      b.kick_ever = true;
++      b.kick_ms = now;
++      b.cap_frames = 4;
++      b.cap_timer = 0;
++      b.cap_plate = plate;
++      b.strength = plate ? 1.0f : 0.0f;
++      if (plate)
++        PadNoteHit(pos, now);
++    }
++    if (b.cap_frames > 0)
++    {
++      b.cap_frames--;
++      b.cap_timer = std::max(b.cap_timer, timer);
++      const float dur = EvF32(r + 0x234);
++      if (b.cap_plate && dur > 0.05f && dur < 20.0f)
++        b.strength = PlateStrength(static_cast<float>(b.cap_timer) / (30.0f * dur));
++      if (b.cap_frames == 0 && s_bst_trace)
++        std::fprintf(stderr, "BOOST f=%llu t=%u racer=%u kick %s timer=%u dur=%.3f k=%.2f strength=%.1f chain=%d spd=%.0f\n",
++                     static_cast<unsigned long long>(s_global_frame), now, i, b.cap_plate ? "plate" : "manual",
++                     b.cap_timer, dur, dur > 0.0f ? static_cast<float>(b.cap_timer) / (30.0f * dur) : 0.0f, b.strength,
++                     b.count, b.speed);
++    }
++    // sonic threshold crossing (hysteresis 60 km/h)
++    if (!b.sonic_above && b.speed > s_bcfg.sonic_kmh)
++    {
++      b.sonic_above = true;
++      b.sonic_ever = true;
++      b.sonic_ms = now;
++    }
++    else if (b.sonic_above && b.speed < s_bcfg.sonic_kmh - 60.0f)
++      b.sonic_above = false;
++  }
++  b.prev_timer = timer;
++  // chain level: towards the kick count while the chain lives (boosting, or within the window of the last kick)
++  const s32 since = static_cast<s32>(now - b.kick_ms);
++  const bool alive = b.kick_ever && since >= 0 && (boosting || static_cast<float>(since) < s_bcfg.chain_ms);
++  const float tgt = alive ? static_cast<float>(b.count) : 0.0f;
++  const float tau = tgt > b.level ? 0.08f : 0.6f;
++  b.level = dt > 0.0f ? b.level + (tgt - b.level) * (1.0f - std::exp(-dt / tau)) : tgt;
++  if (!alive && b.level < 0.02f)
++    b.count = 0;
++}
++
++bool BoostRacerMachine(int racer, float* machine)
++{
++  if (racer < 0 || !s_rs.ok || static_cast<u32>(racer) >= s_rs.count)
++    return false;
++  *machine = static_cast<float>(s_rs.machine[racer]);
++  return true;
++}
++
++void BoostFill(int racer, EmitQuadsUniforms& u)
++{
++  if (racer < 0 || racer >= static_cast<int>(s_bst.size()) || s_rs.arr != s_bst_arr || !RefreshRacerEvents(s_now_ms))
++    return;
++  const BoostRacer& b = s_bst[racer];
++  const bool chain = FxSwitchOn("BoostChain");
++  const bool looks = FxSwitchOn("BoostPadLooks");
++  const s32 since = static_cast<s32>(s_now_ms - b.kick_ms);
++  const s32 ss = static_cast<s32>(s_now_ms - b.sonic_ms);
++  float strength = b.strength;
++  if (!looks && strength > 1.0f)
++    strength = 1.0f;
++  u.boost = {b.env, (b.kick_ever && since >= 0) ? static_cast<float>(since) : 1e6f, strength,
++             chain ? b.level : std::min(b.level, 1.0f)};
++  u.boost2 = {chain ? static_cast<float>(b.count) : std::min(static_cast<float>(b.count), 1.0f), b.speed,
++              (b.sonic_ever && ss >= 0) ? static_cast<float>(ss) : 1e6f, 1.0f};
++}
++
++// ---- the FOV kick ----
++struct FovKick
++{
++  bool have_kick = false;
++  u32 kick_ms = 0;   // the tracker's kick time we follow
++  float t = 1e9f;    // ms into the kick (advanced only while the game runs)
++  float amp = 0.0f;
++  float applied = 0.0f;  // the offset in the fov after our last write
++  float written = 0.0f;
++  bool have_written = false;
++  u32 cam = 0;
++  u32 last_frames = 0;
++  u32 last_ms = 0;
++  float last_speed = 0.0f;
++  bool logged = false;
++};
++FovKick s_fov;
++
++float FovShape(float t)
++{
++  const float a = s_bcfg.fov_attack, h = s_bcfg.fov_hold, st = s_bcfg.fov_settle;
++  if (t < 0.0f)
++    return 0.0f;
++  if (t < a)
++  {
++    const float x = t / a;
++    return x * x * (3.0f - 2.0f * x);
++  }
++  if (t < a + h)
++    return 1.0f;
++  const float x = (t - a - h) / st;
++  if (x >= 1.0f)
++    return 0.0f;
++  // settle: eased fall with a slight undershoot-free tail (cosine ease)
++  return 0.5f + 0.5f * std::cos(3.14159265f * x);
++}
++
++void FovRelease(Memory::MemoryManager& memory)
++{
++  // put the game's own value back when we stop in the middle of a kick
++  if (s_fov.have_written && s_fov.applied != 0.0f && s_fov.cam)
++  {
++    if (u8* p = memory.GetPointerForRange(s_fov.cam + 8, 4))
++    {
++      u32 v;
++      std::memcpy(&v, p, 4);
++      v = Common::swap32(v);
++      float cur;
++      std::memcpy(&cur, &v, 4);
++      if (std::isfinite(cur))
++      {
++        cur -= s_fov.applied;
++        std::memcpy(&v, &cur, 4);
++        v = Common::swap32(v);
++        std::memcpy(p, &v, 4);
++      }
++    }
++  }
++  s_fov.applied = 0.0f;
++  s_fov.have_written = false;
++  s_fov.t = 1e9f;
++}
++
++void BoostFov(u32 now)
++{
++  auto& memory = Core::System::GetInstance().GetMemory();
++  if (!s_bcfg.fov || !FxSwitchOn("BoostFov") || !s_rs.ok)
++  {
++    FovRelease(memory);
++    return;
++  }
++  const auto rd32 = [&](u32 a, u32* o) {
++    const u8* p = memory.GetPointerForRange(a, 4);
++    if (!p)
++      return false;
++    u32 v;
++    std::memcpy(&v, p, 4);
++    *o = Common::swap32(v);
++    return true;
++  };
++  const u32 base = s_rs.base;
++  u32 ms = 0, cams = 0, frames = 0;
++  // mode 2 = GAME (the race sub-mode seen live is 0x24, not the KB's 41) + the race gate (venue < 256, no demo)
++  u32 gv = 0, gs = 0;
++  bool gdemo = false;
++  const bool race = rd32(base + 0x1BA9A0u, &ms) && (ms >> 16) == 2 && ReadGate(&gv, &gs, &gdemo) && gv < 256 && !gdemo;
++  if (!race || !rd32(base + 0x1BAFACu, &cams) || cams < 0x80000000u || cams >= 0x817FFE00u ||
++      !rd32(0x801A66A0u, &frames))
++  {
++    if (s_bst_trace && (s_global_frame % 120) == 0)
++      std::fprintf(stderr, "BOOSTFOV off: mode %08x cams %08x\n", ms, cams);
++    FovRelease(memory);
++    return;
++  }
++  const int pr = EventPlayerRacer();
++  u32 w2 = 0, wa8 = 0, w88 = 0;
++  if (pr < 0 || !rd32(cams, &w2) || static_cast<s16>(w2 & 0xFFFFu) != pr || !rd32(cams + 0xA8, &wa8) ||
++      static_cast<s16>(wa8 >> 16) != 0 || !rd32(cams + 0x88, &w88))
++  {
++    if (s_bst_trace && (s_global_frame % 120) == 0)
++      std::fprintf(stderr, "BOOSTFOV off: player %d cam+0 %08x cam+a8 %08x\n", pr, w2, wa8);
++    FovRelease(memory);
++    return;
++  }
++  if (s_fov.cam != cams)
++  {
++    s_fov = {};
++    s_fov.cam = cams;
++  }
++  const BoostRacer& b = s_bst[pr];
++  const s32 dms = static_cast<s32>(now - s_fov.last_ms);
++  s_fov.last_ms = now;
++  const bool running = frames != s_fov.last_frames;  // the game's unpaused frame counter moved
++  s_fov.last_frames = frames;
++  if (b.kick_ever && (!s_fov.have_kick || b.kick_ms != s_fov.kick_ms))
++  {
++    s_fov.have_kick = true;
++    s_fov.kick_ms = b.kick_ms;
++    const float sf = b.strength <= 0.0f ? 1.0f : (b.strength < 1.25f ? 0.85f : (b.strength < 1.75f ? 1.3f : 1.7f));
++    const float ch = 1.0f + s_bcfg.fov_chain * static_cast<float>(std::max(b.count - 1, 0));
++    // a kick inside a running one starts from the current offset's level
++    const float cur_level = s_fov.amp * FovShape(s_fov.t);
++    s_fov.amp = std::min(s_bcfg.fov_deg * sf * ch, s_bcfg.fov_max);
++    s_fov.t = (cur_level > 0.0f && s_fov.amp > 0.0f) ?
++                  s_bcfg.fov_attack * std::clamp(cur_level / s_fov.amp, 0.0f, 0.9f) * 0.5f :
++                  0.0f;
++  }
++  if (running && dms > 0 && dms < 250)
++    s_fov.t += static_cast<float>(dms);
++  u8* p = memory.GetPointerForRange(cams + 8, 4);
++  if (!p)
++    return;
++  u32 v;
++  std::memcpy(&v, p, 4);
++  v = Common::swap32(v);
++  float cur;
++  std::memcpy(&cur, &v, 4);
++  if (!std::isfinite(cur) || cur < 10.0f || cur > 170.0f)
++    return;
++  const float K = s_fov.amp * FovShape(s_fov.t);
++  if (K == 0.0f && s_fov.applied == 0.0f)
++  {
++    s_fov.have_written = false;
++    return;
++  }
++  // the game's own value: our last offset minus what its easing step took of it (no step if the value is ours)
++  float r = 0.0f;
++  if (!(s_fov.have_written && cur == s_fov.written))
++  {
++    const s32 c88 = static_cast<s32>(w88);
++    const bool boosting = b.env > 0.5f;
++    const bool accel = b.speed > s_fov.last_speed;
++    if (c88 > 10)
++      r = accel ? 0.2f : 0.01f;
++    else if (boosting)
++      r = 0.1f;
++    else
++      r = std::clamp(0.05f - 4e-5f * b.speed, 0.01f, 0.05f);
++  }
++  s_fov.last_speed = b.speed;
++  const float game = cur - s_fov.applied * (1.0f - r);
++  float out = std::min(game + K, 150.0f);
++  std::memcpy(&v, &out, 4);
++  v = Common::swap32(v);
++  std::memcpy(p, &v, 4);
++  if (s_bst_trace && (K != 0.0f || s_fov.applied != 0.0f))
++    std::fprintf(stderr, "BOOSTFOV f=%llu t=%u kick_t=%.0f amp=%.2f K=%.2f game=%.2f cur=%.2f out=%.2f r=%.2f\n",
++                 static_cast<unsigned long long>(s_global_frame), now, s_fov.t, s_fov.amp, K, game, cur, out, r);
++  s_fov.applied = out - game;
++  s_fov.written = out;
++  s_fov.have_written = true;
++}
++
++// ---- the dash plates ----
++bool PadRead32(Memory::MemoryManager& m, u32 a, u32* o)
++{
++  const u8* p = m.GetPointerForRange(a, 4);
++  if (!p)
++    return false;
++  *o = EvU32(p);
++  return true;
++}
++bool PadInRam(u32 a) { return a >= 0x80000000u && a < 0x81800000u; }
++
++struct RawPoly
++{
++  std::array<std::array<float, 3>, 4> v{};
++  int nv = 0;
++  std::array<float, 3> n{};
++  std::array<float, 3> c{};
++};
++
++void PadCollect(Memory::MemoryManager& m, u32 cell, int layer, std::vector<RawPoly>* out)
++{
++  float g[4];
++  u32 nx = 0, nz = 0;
++  for (int k = 0; k < 4; k++)
++  {
++    const u8* p = m.GetPointerForRange(cell + 0x60 + 4 * k, 4);
++    g[k] = p ? EvF32(p) : 0.0f;
++  }
++  if (!PadRead32(m, cell + 0x70, &nx) || !PadRead32(m, cell + 0x74, &nz) || nx == 0 || nz == 0 || nx > 4096 ||
++      nz > 4096 || nx * nz > 1u << 20)
++    return;
++  for (int type = 0; type < 2; type++)
++  {
++    const u32 polys_at = cell + (type == 0 ? 0x24u : 0x78u);
++    const u32 lists_at = cell + (type == 0 ? 0x28u : 0x7Cu);
++    const u32 stride = type == 0 ? 0x58u : 0x70u;
++    const int nv = type == 0 ? 3 : 4;
++    u32 polys = 0, arr = 0;
++    if (!PadRead32(m, polys_at, &polys) || !PadInRam(polys) || !PadRead32(m, lists_at + 4u * layer, &arr) ||
++        !PadInRam(arr))
++      continue;
++    const u8* ap = m.GetPointerForRange(arr, nx * nz * 4u);
++    if (!ap)
++      continue;
++    std::vector<u16> seen;
++    for (u32 idx = 0; idx < nx * nz; idx++)
++    {
++      const u32 lp = EvU32(ap + 4 * idx);
++      if (!PadInRam(lp))
++        continue;
++      for (u32 k = 0; k < 4096; k++)
++      {
++        const u8* q = m.GetPointerForRange(lp + 2 * k, 2);
++        if (!q)
++          break;
++        const s16 pi = static_cast<s16>((q[0] << 8) | q[1]);
++        if (pi < 0)
++          break;
++        seen.push_back(static_cast<u16>(pi));
++      }
++    }
++    std::sort(seen.begin(), seen.end());
++    seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
++    for (u16 pi : seen)
++    {
++      const u8* q = m.GetPointerForRange(polys + pi * stride, stride);
++      if (!q)
++        continue;
++      RawPoly rp;
++      rp.nv = nv;
++      bool ok = true;
++      for (int k = 0; k < 3; k++)
++        rp.n[k] = EvF32(q + 4 + 4 * k);
++      for (int j = 0; j < nv; j++)
++        for (int k = 0; k < 3; k++)
++        {
++          rp.v[j][k] = EvF32(q + 0x10 + 12 * j + 4 * k);
++          ok = ok && std::abs(rp.v[j][k]) < 1e6f;
++          rp.c[k] += rp.v[j][k] / static_cast<float>(nv);
++        }
++      if (ok)
++        out->push_back(rp);
++    }
++  }
++  (void)g;
++}
++
++// lit17s33p PADPLATE: each plate's forward = the course direction at it. The course header (st = REL bss 0x3BE0,
++// ColiHeader) +0x08 track node count, +0x0C nodes (12 bytes: checkpoint count, checkpoint pointer, root segment);
++// a checkpoint is 0x50 bytes: planeStart origin +0x18, planeEnd origin +0x34 (world). The nearest checkpoint segment
++// to the plate centre gives the direction; along / across are flipped to point forward (across keeps the handedness).
++float PadF32(const u8* p) { return EvF32(p); }
++void PadDirections(Memory::MemoryManager& m, u32 st)
++{
++  u32 nn = 0, nodes = 0;
++  if (!PadRead32(m, st + 0x08, &nn) || !PadRead32(m, st + 0x0C, &nodes) || nn == 0 || nn > 8192 || !PadInRam(nodes))
++    return;
++  struct Seg { std::array<float, 3> a, b; };
++  std::vector<Seg> segs;
++  segs.reserve(nn);
++  for (u32 i = 0; i < nn; i++)
++  {
++    u32 cnt = 0, cps = 0;
++    if (!PadRead32(m, nodes + i * 12, &cnt) || !PadRead32(m, nodes + i * 12 + 4, &cps) || cnt == 0 || cnt > 4 ||
++        !PadInRam(cps))
++      continue;
++    for (u32 k = 0; k < cnt; k++)
++    {
++      const u8* q = m.GetPointerForRange(cps + k * 0x50, 0x50);
++      if (!q)
++        continue;
++      Seg g;
++      for (int j = 0; j < 3; j++)
++      {
++        g.a[j] = PadF32(q + 0x18 + 4 * j);
++        g.b[j] = PadF32(q + 0x34 + 4 * j);
++      }
++      if (!(std::isfinite(g.a[0]) && std::isfinite(g.b[0])) || Dist2(g.a, g.b) < 1e-4f || Dist2(g.a, g.b) > 4e6f)
++        continue;
++      segs.push_back(g);
++    }
++  }
++  if (segs.empty())
++    return;
++  int known = 0, flipped = 0;
++  for (Pad& p : s_pads.pads)
++  {
++    float best = 1e30f;
++    const Seg* bs = nullptr;
++    for (const Seg& g : segs)
++    {
++      const std::array<float, 3> ab = {g.b[0] - g.a[0], g.b[1] - g.a[1], g.b[2] - g.a[2]};
++      const float l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
++      float t = ((p.c[0] - g.a[0]) * ab[0] + (p.c[1] - g.a[1]) * ab[1] + (p.c[2] - g.a[2]) * ab[2]) / l2;
++      t = std::clamp(t, 0.0f, 1.0f);
++      const std::array<float, 3> q = {g.a[0] + ab[0] * t, g.a[1] + ab[1] * t, g.a[2] + ab[2] * t};
++      const float d = Dist2(q, p.c);
++      if (d < best)
++      {
++        best = d;
++        bs = &g;
++      }
++    }
++    if (!bs || best > 150.0f * 150.0f)
++      continue;
++    const std::array<float, 3> f = {bs->b[0] - bs->a[0], bs->b[1] - bs->a[1], bs->b[2] - bs->a[2]};
++    const float dt = f[0] * p.along[0] + f[1] * p.along[1] + f[2] * p.along[2];
++    if (dt < 0.0f)
++    {
++      for (int j = 0; j < 3; j++)
++      {
++        p.along[j] = -p.along[j];
++        p.across[j] = -p.across[j];
++      }
++      flipped++;
++    }
++    p.dir_known = true;
++    known++;
++  }
++  std::fprintf(stderr, "BOOSTPADS directions: %d of %zu plates from %zu checkpoints (%d flipped)\n", known,
++               s_pads.pads.size(), segs.size(), flipped);
++}
++
++void PadScanNow(Memory::MemoryManager& m, u32 st)
++{
++  s_pads.pads.clear();
++  u32 ncells = 0, cells = 0;
++  if (!PadRead32(m, st + 0x18, &ncells) || !PadRead32(m, st + 0x1C, &cells) || ncells == 0 || ncells > 64 ||
++      !PadInRam(cells))
++    return;
++  std::vector<RawPoly> dash, drive, wall;
++  // cell 0 is in world space (the others carry a transform for moving parts: left out)
++  PadCollect(m, cells, 3, &dash);
++  if (dash.empty())
++    return;
++  PadCollect(m, cells, 0, &drive);
++  PadCollect(m, cells, 2, &wall);
++  // join polygons that share a corner (0.4 m) into plates
++  const size_t n = std::min<size_t>(dash.size(), 4096);
++  std::vector<int> par(n);
++  for (size_t i = 0; i < n; i++)
++    par[i] = static_cast<int>(i);
++  const auto find = [&](int x) {
++    while (par[x] != x)
++      x = par[x] = par[par[x]];
++    return x;
++  };
++  for (size_t i = 0; i < n; i++)
++    for (size_t j = i + 1; j < n; j++)
++    {
++      if (Dist2(dash[i].c, dash[j].c) > 80.0f * 80.0f)
++        continue;
++      bool share = false;
++      for (int a = 0; a < dash[i].nv && !share; a++)
++        for (int b = 0; b < dash[j].nv && !share; b++)
++          share = Dist2(dash[i].v[a], dash[j].v[b]) < 0.16f;
++      if (share)
++        par[find(static_cast<int>(i))] = find(static_cast<int>(j));
++    }
++  std::map<int, std::vector<size_t>> groups;
++  for (size_t i = 0; i < n; i++)
++    groups[find(static_cast<int>(i))].push_back(i);
++  for (const auto& [root, idx] : groups)
++  {
++    Pad pd;
++    std::vector<std::array<float, 3>> pts;
++    std::array<float, 3> nsum{};
++    for (size_t i : idx)
++    {
++      for (int a = 0; a < dash[i].nv; a++)
++        pts.push_back(dash[i].v[a]);
++      for (int k = 0; k < 3; k++)
++        nsum[k] += dash[i].n[k];
++    }
++    std::array<float, 3> c{};
++    for (const auto& q : pts)
++      for (int k = 0; k < 3; k++)
++        c[k] += q[k] / static_cast<float>(pts.size());
++    float nl = std::sqrt(nsum[0] * nsum[0] + nsum[1] * nsum[1] + nsum[2] * nsum[2]);
++    if (!(nl > 1e-6f))
++      continue;
++    std::array<float, 3> up = {nsum[0] / nl, nsum[1] / nl, nsum[2] / nl};
++    // in-plane basis, then the 2D spread of the corners: its main axis = along the plate
++    std::array<float, 3> t0 = std::abs(up[1]) < 0.9f ? std::array<float, 3>{0.0f, 1.0f, 0.0f} :
++                                                        std::array<float, 3>{1.0f, 0.0f, 0.0f};
++    std::array<float, 3> e1 = {up[1] * t0[2] - up[2] * t0[1], up[2] * t0[0] - up[0] * t0[2],
++                               up[0] * t0[1] - up[1] * t0[0]};
++    const float l1 = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
++    for (auto& x : e1)
++      x /= l1;
++    const std::array<float, 3> e2 = {up[1] * e1[2] - up[2] * e1[1], up[2] * e1[0] - up[0] * e1[2],
++                                     up[0] * e1[1] - up[1] * e1[0]};
++    float sxx = 0, sxy = 0, syy = 0;
++    for (const auto& q : pts)
++    {
++      const float dx = (q[0] - c[0]) * e1[0] + (q[1] - c[1]) * e1[1] + (q[2] - c[2]) * e1[2];
++      const float dy = (q[0] - c[0]) * e2[0] + (q[1] - c[1]) * e2[1] + (q[2] - c[2]) * e2[2];
++      sxx += dx * dx;
++      sxy += dx * dy;
++      syy += dy * dy;
++    }
++    const float ang = 0.5f * std::atan2(2.0f * sxy, sxx - syy);
++    std::array<float, 3> al, ac;
++    for (int k = 0; k < 3; k++)
++    {
++      al[k] = std::cos(ang) * e1[k] + std::sin(ang) * e2[k];
++      ac[k] = -std::sin(ang) * e1[k] + std::cos(ang) * e2[k];
++    }
++    float hl = 0.0f, hw = 0.0f;
++    for (const auto& q : pts)
++    {
++      const std::array<float, 3> d = {q[0] - c[0], q[1] - c[1], q[2] - c[2]};
++      hl = std::max(hl, std::abs(d[0] * al[0] + d[1] * al[1] + d[2] * al[2]));
++      hw = std::max(hw, std::abs(d[0] * ac[0] + d[1] * ac[1] + d[2] * ac[2]));
++    }
++    if (hl < hw)  // along = the longer side (plates are longer than wide)
++    {
++      std::swap(hl, hw);
++      std::swap(al, ac);
++    }
++    if (hw < 0.5f || hl > 200.0f)
++      continue;
++    // strength markers under the plate (the dash plate strength patch): driveable -> 1.5x, + wall -> 2x
++    const auto under = [&](const std::vector<RawPoly>& L) {
++      for (const RawPoly& q : L)
++      {
++        const std::array<float, 3> d = {q.c[0] - c[0], q.c[1] - c[1], q.c[2] - c[2]};
++        const float a = std::abs(d[0] * al[0] + d[1] * al[1] + d[2] * al[2]);
++        const float w = std::abs(d[0] * ac[0] + d[1] * ac[1] + d[2] * ac[2]);
++        const float h = std::abs(d[0] * up[0] + d[1] * up[1] + d[2] * up[2]);
++        if (a < hl + 2.0f && w < hw + 2.0f && h < 4.0f)
++          return true;
++      }
++      return false;
++    };
++    const bool dv = under(drive), wl = under(wall);
++    pd.strength = dv ? (wl ? 2.0f : 1.5f) : 1.0f;
++    pd.c = c;
++    pd.up = up;
++    pd.along = al;
++    pd.across = ac;
++    pd.hl = hl;
++    pd.hw = hw;
++    s_pads.pads.push_back(pd);
++    if (s_pads.pads.size() >= 512)
++      break;
++  }
++  PadDirections(m, st);  // lit17s33p
++}
++
++void BoostFrameEnd(u32 now)
++{
++  if (!RefreshRacerEvents(now))
++    return;
++  if (s_bst_refs > 0)
++    BoostFov(now);
++  if (s_pad_refs > 0)
++  {
++    auto& m = Core::System::GetInstance().GetMemory();
++    u32 venue = 0, slot = 0, st = 0, cells = 0;
++    bool demo = false;
++    if (!ReadGate(&venue, &slot, &demo) || venue >= 256 || !PadRead32(m, s_rs.base + 0x1BA040u + 0x3BE0u, &st) ||
++        !PadInRam(st) || !PadRead32(m, st + 0x1C, &cells))
++      return;
++    if (st != s_pads.key_st || cells != s_pads.key_cells || slot != s_pads.key_slot || s_rs.base != s_pads.key_rel ||
++        s_rs.arr != s_pads.key_arr || (!s_pads.scanned && s_global_frame - s_pads.tried_frame > 60))
++    {
++      s_pads.key_st = st;
++      s_pads.key_cells = cells;
++      s_pads.key_slot = slot;
++      s_pads.key_rel = s_rs.base;
++      s_pads.key_arr = s_rs.arr;
++      s_pads.tried_frame = s_global_frame;
++      const u64 t0 = PC5090Prof::NowNs();
++      PadScanNow(m, st);
++      s_pads.scanned = !s_pads.pads.empty();
++      int n15 = 0, n20 = 0;
++      for (const Pad& p : s_pads.pads)
++      {
++        n15 += p.strength == 1.5f;
++        n20 += p.strength == 2.0f;
++      }
++      std::fprintf(stderr, "BOOSTPADS slot %u venue %u: %zu plates (1.5x %d, 2x %d) in %.2f ms\n", slot, venue,
++                   s_pads.pads.size(), n15, n20, (PC5090Prof::NowNs() - t0) * 1e-6);
++      if (s_bst_trace)
++        for (const Pad& p : s_pads.pads)
++          std::fprintf(stderr, "BOOSTPAD c=(%.1f %.1f %.1f) up=(%.2f %.2f %.2f) along=(%.2f %.2f %.2f) %.1f x %.1f s=%.1f\n",
++                       p.c[0], p.c[1], p.c[2], p.up[0], p.up[1], p.up[2], p.along[0], p.along[1], p.along[2],
++                       2 * p.hl, 2 * p.hw, p.strength);
++    }
++  }
++}
++
++bool PadsReady()
++{
++  if (s_pads.pads.empty() || !s_rs.ok)
++    return false;
++  u32 venue = 0, slot = 0;
++  bool demo = false;
++  return ReadGate(&venue, &slot, &demo) && venue < 256 && slot == s_pads.key_slot;
++}
++
++void PadsFill(EmitQuadsUniforms& u, float range, u32 max_pads)
++{
++  u.surf_info = {};
++  float V[12];
++  const ScView::Cand* best = nullptr;
++  if (s_scv.frame == s_global_frame)
++    for (const auto& c : s_scv.cands)
++      if (!best || c.n > best->n)
++        best = &c;
++  if (best)
++    std::copy(best->m.begin(), best->m.end(), V);
++  else if (!ReadRamView(V))
++    return;
++  struct Cand
++  {
++    float d;
++    size_t i;
++    std::array<float, 3> v;
++  };
++  std::vector<Cand> cs;
++  for (size_t i = 0; i < s_pads.pads.size(); i++)
++  {
++    const Pad& p = s_pads.pads[i];
++    std::array<float, 3> v;
++    for (int r = 0; r < 3; r++)
++      v[r] = V[r * 4] * p.c[0] + V[r * 4 + 1] * p.c[1] + V[r * 4 + 2] * p.c[2] + V[r * 4 + 3];
++    const float d = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
++    const float rad = std::max(p.hl, p.hw) + 8.0f;
++    if (d > range + rad || v[2] > rad)  // out of reach / behind the camera
++      continue;
++    cs.push_back({d, i, v});
++  }
++  const size_t k = std::min<size_t>(cs.size(), max_pads);
++  std::partial_sort(cs.begin(), cs.begin() + k, cs.end(), [](const Cand& a, const Cand& b) { return a.d < b.d; });
++  const auto rot = [&](const std::array<float, 3>& a) {
++    std::array<float, 3> o;
++    for (int r = 0; r < 3; r++)
++      o[r] = V[r * 4] * a[0] + V[r * 4 + 1] * a[1] + V[r * 4 + 2] * a[2];
++    const float l = std::sqrt(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]);
++    if (l > 1e-6f)
++      for (auto& x : o)
++        x /= l;
++    return o;
++  };
++  const bool looks = FxSwitchOn("BoostPadLooks");
++  for (size_t j = 0; j < k; j++)
++  {
++    const Pad& p = s_pads.pads[cs[j].i];
++    const auto up = rot(p.up), al = rot(p.along), ac = rot(p.across);
++    const s32 since = static_cast<s32>(s_now_ms - p.hit_ms);
++    u.surf_pos[2 * j] = {cs[j].v[0], cs[j].v[1], cs[j].v[2], p.hl};
++    u.surf_pos[2 * j + 1] = {ac[0], ac[1], ac[2], p.hw};
++    u.surf_normal[2 * j] = {up[0], up[1], up[2], looks ? p.strength : 1.0f};
++    u.surf_normal[2 * j + 1] = {al[0], al[1], al[2], (p.hit_ever && since >= 0) ? static_cast<float>(since) : 1e6f};
++  }
++  bool all_dir = k > 0;
++  for (size_t j = 0; j < k; j++)
++    all_dir = all_dir && s_pads.pads[cs[j].i].dir_known;
++  u.surf_info = {static_cast<float>(k), 2.0f, range, all_dir ? 1.0f : 0.0f};  // lit17s33p: w = 1 along = forward
++  // lit17s33p: the frame's world -> view for the plates' hull light (FillDrawUniforms, machine body draws)
++  std::copy(V, V + 12, s_pad_view.begin());
++  s_pad_view_frame = s_global_frame;
++}
++}  // namespace
++
++// ---- Evolution Racing lit17s31 METEOR IMPACTS ----
++// A "meteor_impact" action (one emit a frame, the weather trigger) draws a meteor that comes down and lands BESIDE
++// the track, just off the edge, ahead of the player and in view. Only on the configured weather types (default 8 =
++// meteor shower), only in a live race, cosmetic (nothing is written to the game). Rate: GFX.ini [PC5090]
++// MeteorImpactEvery = s (default 75: each next impact 0.8-1.2 x that after the last; the first of a race after
++// 0.3-0.55 x), on / off: the action's "switch" (MeteorImpacts). The spot: the course's checkpoints (header 0x08 nodes
++// -> 0x50-byte checkpoints: start / end plane origin = road centre, normals = road forward, start / end distance,
++// width) give the road centre + forward at the lead distance; the static collider's driveable polygons (layer 0,
++// as the pads) give the up and the real road edge (march out from the centre until off the road) and keep the spot
++// clear of every road (a ring around it and nothing above it). Then it has to be in view (camera frustum).
++// Between impacts the action costs nothing (no copies, no draw). Uniforms (WORLD space; eq_matrix = world -> view as
++// the weather pass): eq_surf_info = (1, game s mod 1000, impacts so far, 0); eq_surf_pos[0] = impact point, w = age s
++// (negative while it falls); [1] = ground up, w = seed 0..1; [2] = outward (away from the road), w = scale;
++// [3] = the direction it comes FROM (unit, up-ish), w = fall time s; [4] = road forward, w = camera shake 0..1;
++// [5] = road edge point, w = player distance to the impact m. Trace: user-dir file pc5090mitrace (METEORIMPACT lines).
++namespace
++{
++struct MiCp
++{
++  std::array<float, 3> a{}, b{}, na{}, nb{};
++  float d0 = 0.0f, d1 = 0.0f, w = 0.0f;
++};
++constexpr float MI_BUCKET = 6.0f;
++struct MiFrame
++{
++  std::array<float, 3> c{}, rt{}, up{}, fw{};
++  float hw = 0.0f, d = 0.0f;
++  u32 flags = 0;
++  bool valid = false;
++};
++struct MiCourse
++{
++  std::vector<MiFrame> frames;
++  u32 key_hdr = 0, key_slot = 0xFFFFFFFFu, key_rel = 0;
++  std::vector<MiCp> cps;
++  std::vector<RawPoly> drive;
++  float lap = 0.0f;
++  bool ok = false;
++  u64 tried_frame = ~0ull;
++};
++MiCourse s_mic;
++struct MiState
++{
++  u64 frame = ~0ull;
++  bool active = false;
++  bool live = false;
++  double gt = 0.0;  // game seconds (the unpaused frame counter 0x801A66A0 / 60)
++  u32 last_frames = 0;
++  bool have_frames = false;
++  double t0 = 0.0, next_t = -1.0;
++  std::array<float, 3> pos{}, up{}, out{}, along{}, from{}, edge{};
++  float seed = 0.0f, scale = 1.0f, shake = 0.0f, pdist = 1e9f;
++  u32 rng = 0x9E3779B9u;
++  int count = 0;
++  u32 off_frames = 0;
++  u32 slot = 0xFFFFFFFFu;
++  int trace = -1;
++};
++MiState s_mi;
++struct MiCfg
++{
++  float every = 75.0f, test_every = 0.0f, test_first = 3.0f, fall = 1.4f, life = 11.0f;
++  float lead_min = 1.3f, lead_max = 1.8f, margin_min = 3.0f, margin_max = 8.0f;
++  std::vector<int> types{8};
++};
++MiCfg s_micfg;
++int s_mi_refs = 0;
++u64 s_mi_every_frame = ~0ull;
++float s_mi_every = 75.0f;
++
++float MiRand()
++{
++  u32& x = s_mi.rng;
++  x ^= x << 13;
++  x ^= x >> 17;
++  x ^= x << 5;
++  return static_cast<float>(x & 0xFFFFFFu) / 16777216.0f;
++}
++using V3 = std::array<float, 3>;
++V3 MiAdd(const V3& a, const V3& b) { return {a[0] + b[0], a[1] + b[1], a[2] + b[2]}; }
++V3 MiSub(const V3& a, const V3& b) { return {a[0] - b[0], a[1] - b[1], a[2] - b[2]}; }
++V3 MiMul(const V3& a, float s) { return {a[0] * s, a[1] * s, a[2] * s}; }
++float MiDot(const V3& a, const V3& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
++V3 MiCross(const V3& a, const V3& b)
++{
++  return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
++}
++V3 MiNorm(const V3& a)
++{
++  const float l = std::sqrt(MiDot(a, a));
++  return l > 1e-9f ? MiMul(a, 1.0f / l) : V3{0.0f, 1.0f, 0.0f};
++}
++
++void MiConfigure(const picojson::object& g)
++{
++  s_micfg = MiCfg{};
++  if (const auto n = ReadNumericFromJson<double>(g, "every"))
++    s_micfg.every = static_cast<float>(std::clamp(*n, 5.0, 3600.0));
++  if (const auto n = ReadNumericFromJson<double>(g, "test_every"))
++    s_micfg.test_every = static_cast<float>(std::max(*n, 0.0));
++  if (const auto n = ReadNumericFromJson<double>(g, "test_first"))
++    s_micfg.test_first = static_cast<float>(std::max(*n, 0.5));
++  if (const auto n = ReadNumericFromJson<double>(g, "fall"))
++    s_micfg.fall = static_cast<float>(std::clamp(*n, 0.3, 4.0));
++  if (const auto n = ReadNumericFromJson<double>(g, "life"))
++    s_micfg.life = static_cast<float>(std::clamp(*n, 3.0, 30.0));
++  if (const auto it = g.find("types"); it != g.end() && it->second.is<picojson::array>())
++  {
++    s_micfg.types.clear();
++    for (const auto& v : it->second.get<picojson::array>())
++      if (v.is<double>())
++        s_micfg.types.push_back(static_cast<int>(v.get<double>()));
++  }
++  s_mi = MiState{};
++  s_mi.rng ^= static_cast<u32>(std::chrono::steady_clock::now().time_since_epoch().count());
++  if (s_mi.rng == 0)
++    s_mi.rng = 0x1234567u;
++  s_mi_every_frame = ~0ull;
++}
++
++// GFX.ini [PC5090] MeteorImpactEvery = s (re-read every 30 frames)
++float MiEvery()
++{
++  if (s_mi_every_frame == ~0ull || s_global_frame - s_mi_every_frame >= 30 || s_global_frame < s_mi_every_frame)
++  {
++    s_mi_every_frame = s_global_frame;
++    const Config::Info<std::string> info{{Config::System::GFX, "PC5090", "MeteorImpactEvery"}, ""};
++    const std::string q = Config::Get(info);
++    float v = s_micfg.every;
++    if (!q.empty())
++    {
++      char* end = nullptr;
++      const double d = std::strtod(q.c_str(), &end);
++      if (end != q.c_str() && std::isfinite(d) && d >= 5.0)
++        v = static_cast<float>(std::min(d, 3600.0));
++    }
++    if (v != s_mi_every)
++      std::fprintf(stderr, "METEORIMPACT every %.0f s (GFX.ini [PC5090] MeteorImpactEvery)\n", v);
++    s_mi_every = v;
++  }
++  return s_micfg.test_every > 0.0f ? s_micfg.test_every : s_mi_every;
++}
++
++// the course: lap length (header 0x90 -> the track length record) + the checkpoints (for the log / sanity)
++bool MiLoadCourse(Memory::MemoryManager& m, u32 hdr)
++{
++  s_mic.cps.clear();
++  s_mic.drive.clear();
++  s_mic.frames.clear();
++  u32 nn = 0, nodes = 0, lapw = 0;
++  if (!PadRead32(m, hdr + 0x08, &nn) || !PadRead32(m, hdr + 0x0C, &nodes) || nn == 0 || nn > 8192 ||
++      !PadInRam(nodes) || !PadRead32(m, hdr + 0x90, &lapw) || !PadInRam(lapw) || !PadRead32(m, lapw, &lapw))
++    return false;
++  std::memcpy(&s_mic.lap, &lapw, 4);  // header 0x90 -> the track length record (f32 metres first)
++  if (!(s_mic.lap > 100.0f && s_mic.lap < 1e6f))
++    return false;
++  s_mic.frames.assign(static_cast<size_t>(s_mic.lap / MI_BUCKET) + 1, MiFrame{});
++  return true;
++}
++
++// TRACK FRAMES: every racer's progress record P = *(racer + 0x49C) starts with a copy of the segment-tree walk's
++// record at the racer (car.c:15838 memcpy 0x80 from the frame's record, built by stcoli.c fn_1_18784): P+0x00 = the
++// road's 3x4 matrix there (column 0 = across, 1 = up, 2 = along (backwards), 3 = the centre; unit axes), P+0x30 = its
++// scale (x = road width, LIVE: 64 on Mute City's start straight),
++// P+0x7C = the node flags on the path (0x02000000 road, 0x01000000 closed pipe / cylinder, 0x00800000 open pipe,
++// bit 0 = outside of a cylinder); P+0x100 = distance along the lap. Every frame each racer's frame goes into a
++// bucket of the lap (MI_BUCKET m): after a few seconds of a race the road ahead of the player is known from the
++// machines ahead (and from every earlier lap).
++void MiSample(Memory::MemoryManager& m)
++{
++  if (s_mic.frames.empty() || !s_rs.ok)
++    return;
++  for (u32 r = 0; r < s_rs.count && r < 64; r++)
++  {
++    if (!s_rs.valid[r])
++      continue;
++    u32 pp = 0;
++    if (!PadRead32(m, s_rs.arr + r * 0x620u + 0x49C, &pp) || pp < 0x80000000u || pp >= 0x817FFE00u)
++      continue;
++    const u8* q = m.GetPointerForRange(pp, 0x104);
++    if (!q)
++      continue;
++    float M[12];
++    for (int i = 0; i < 12; i++)
++      M[i] = EvF32(q + 4 * i);
++    const u32 fl = EvU32(q + 0x7C);
++    const float d = EvF32(q + 0x100);
++    if (!std::isfinite(d))
++      continue;
++    const V3 x = {M[0], M[4], M[8]}, y = {M[1], M[5], M[9]}, z = {M[2], M[6], M[10]}, t = {M[3], M[7], M[11]};
++    const float w = EvF32(q + 0x30);  // the leaf's scale x = road width (the matrix is a pure rotation + centre)
++    if (!(w > 4.0f && w < 2000.0f) || !(std::abs(t[0]) < 1e6f && std::abs(t[1]) < 1e6f && std::abs(t[2]) < 1e6f))
++      continue;
++    // the racer must be on this frame (not a stale record): within the road's reach
++    const V3 rel = MiSub(s_rs.world[r], t);
++    if (MiDot(rel, rel) > (w + 60.0f) * (w + 60.0f))
++      continue;
++    float dl = std::fmod(d, s_mic.lap);
++    if (dl < 0.0f)
++      dl += s_mic.lap;
++    const size_t b = std::min(static_cast<size_t>(dl / MI_BUCKET), s_mic.frames.size() - 1);
++    MiFrame& f = s_mic.frames[b];
++    f.c = t;
++    f.rt = MiNorm(x);
++    f.up = MiNorm(y);
++    f.fw = MiNorm(z);
++    f.hw = 0.5f * w;
++    f.flags = fl;
++    f.d = dl;
++    f.valid = true;
++  }
++}
++const MiFrame* MiFrameAt(float d)
++{
++  if (s_mic.frames.empty())
++    return nullptr;
++  const int n = static_cast<int>(s_mic.frames.size());
++  d = std::fmod(d, s_mic.lap);
++  if (d < 0.0f)
++    d += s_mic.lap;
++  const int b = static_cast<int>(d / MI_BUCKET);
++  for (int k = 0; k <= 3; k++)
++    for (int sgn : {1, -1})
++    {
++      const int i = ((b + sgn * k) % n + n) % n;
++      if (s_mic.frames[i].valid)
++        return &s_mic.frames[i];
++    }
++  return nullptr;
++}
++// lit17s33pt TUBE WEATHER: the closed tubes near the player as axis polylines, so the weather passes can leave out
++// what lies INSIDE a tube (no rain / snow in the tube with you, no wet road / snow cover on its floor) while the
++// weather outside keeps going (seen through glass tubes and the openings; opaque tube walls hide it by depth).
++// Every racer's progress record P = *(racer +0x49C) (see TRACK FRAMES above): for a closed pipe leaf the matrix centre
++// is ON the tube axis and the scale x is the diameter (file-formats.md "IsPipeOrCylinder: SX = SY = diameter, path
++// through the tube centre"). Each frame each racer's frame goes into a 6 m bucket of the lap (like MiSample, but for
++// any weather, own buckets); the player's stretch from 36 m behind to ~900 m ahead becomes up to 31 axis points.
++// Uniforms (weather actions): eq_surf_normal[32] = (points, 1 = data present, player inside 0/1, 0);
++// eq_surf_normal[33 + k] (k < 31) = axis point (world), w = radius m (0 = a break between two tubes).
++struct TpFrame
++{
++  V3 c{}, fw{};
++  float r = 0.0f;
++  bool inside = false, valid = false;
++};
++struct TpCp
++{
++  V3 a{}, b{}, ta{}, tb{};  // start / end origin, tangents (scaled by the chord length)
++  float d0 = 0.0f, d1 = 0.0f;
++};
++struct TubePath
++{
++  std::vector<TpFrame> frames;
++  std::vector<TpCp> cps;  // the course's checkpoints: the path (= the tube axis in a pipe) for buckets nobody drove yet
++  float lap = 0.0f;
++  u32 key_hdr = 0, key_slot = 0xFFFFFFFFu, key_rel = 0;
++  bool ok = false;
++  u64 tried_frame = 0, frame = ~0ull;
++  int n = 0;
++  bool player_inside = false;
++  std::array<std::array<float, 4>, 31> pts{};
++  int trace = -1;
++  u64 last_trace = 0;
++  u64 course_key = 0;
++  // what was learned on each course this session (so a later race on it knows every tube from the start, even when the
++  // player leads): key = slot, venue, lap length
++  std::map<u64, std::vector<TpFrame>> learned;
++};
++TubePath s_tp;
++bool TpInsideFlags(u32 f, float open_frac)
++{
++  if ((f & 0x02200000u) || (f & 1u))
++    return false;
++  return (f & 0x01000000u) || ((f & 0x00800000u) && std::isfinite(open_frac) && open_frac >= 0.85f);
++}
++// the path at lap distance d from the checkpoints (Hermite between a checkpoint's start and end planes); of parallel
++// branches the one nearest `near`. False if no checkpoint covers d.
++bool TpSpineAt(float d, const V3& near, V3* c, V3* fw)
++{
++  float best = 1e30f;
++  for (const TpCp& k : s_tp.cps)
++  {
++    if (d < k.d0 || d > k.d1)
++      continue;
++    const float t = (d - k.d0) / (k.d1 - k.d0), t2 = t * t, t3 = t2 * t;
++    const float h00 = 2 * t3 - 3 * t2 + 1, h10 = t3 - 2 * t2 + t, h01 = -2 * t3 + 3 * t2, h11 = t3 - t2;
++    const V3 p = MiAdd(MiAdd(MiMul(k.a, h00), MiMul(k.ta, h10)), MiAdd(MiMul(k.b, h01), MiMul(k.tb, h11)));
++    const V3 r = MiSub(p, near);
++    const float e = MiDot(r, r);
++    if (e < best)
++    {
++      best = e;
++      *c = p;
++      const float g00 = 6 * t2 - 6 * t, g10 = 3 * t2 - 4 * t + 1, g01 = -6 * t2 + 6 * t, g11 = 3 * t2 - 2 * t;
++      *fw = MiNorm(MiAdd(MiAdd(MiMul(k.a, g00), MiMul(k.ta, g10)), MiAdd(MiMul(k.b, g01), MiMul(k.tb, g11))));
++    }
++  }
++  return best < 120.0f * 120.0f;  // a branch far from where the run was is not this tube
++}
++void TubePathUpdate()
++{
++  if (s_tp.frame == s_global_frame)
++    return;
++  s_tp.frame = s_global_frame;
++  s_tp.n = 0;
++  s_tp.player_inside = false;
++  if (s_tp.trace < 0)
++    s_tp.trace = File::Exists(File::GetUserPath(D_USER_IDX) + "pc5090tubetrace") ? 1 : 0;
++  auto& m = Core::System::GetInstance().GetMemory();
++  u32 ms = 0, venue = 0, slot = 0, hdr = 0;
++  bool demo = false;
++  if (!(RefreshRacerSnapshot() && s_rs.ok && PadRead32(m, s_rs.base + 0x1BA9A0u, &ms) && (ms >> 16) == 2 &&
++        ReadGate(&venue, &slot, &demo) && venue < 256 && PadRead32(m, s_rs.base + 0x1BA040u + 0x3BE0u, &hdr) &&
++        PadInRam(hdr)))
++    return;
++  if (hdr != s_tp.key_hdr || slot != s_tp.key_slot || s_rs.base != s_tp.key_rel ||
++      (!s_tp.ok && s_global_frame - s_tp.tried_frame > 120))
++  {
++    s_tp.key_hdr = hdr;
++    s_tp.key_slot = slot;
++    s_tp.key_rel = s_rs.base;
++    s_tp.tried_frame = s_global_frame;
++    s_tp.ok = false;
++    if (s_tp.course_key != 0 && !s_tp.frames.empty())
++      s_tp.learned[s_tp.course_key] = s_tp.frames;
++    s_tp.frames.clear();
++    s_tp.course_key = 0;
++    u32 lapw = 0;
++    if (PadRead32(m, hdr + 0x90, &lapw) && PadInRam(lapw) && PadRead32(m, lapw, &lapw))
++    {
++      std::memcpy(&s_tp.lap, &lapw, 4);
++      if (s_tp.lap > 100.0f && s_tp.lap < 1e6f)
++      {
++        const size_t nbk = static_cast<size_t>(s_tp.lap / MI_BUCKET) + 1;
++        s_tp.course_key = (static_cast<u64>(slot & 0xFFFFu) << 48) | (static_cast<u64>(venue & 0xFFu) << 40) | lapw;
++        const auto it = s_tp.learned.find(s_tp.course_key);
++        if (it != s_tp.learned.end() && it->second.size() == nbk)
++          s_tp.frames = it->second;
++        else
++          s_tp.frames.assign(nbk, TpFrame{});
++        s_tp.ok = true;
++      }
++    }
++    // checkpoints (stage header 0x08 / 0x0C: track nodes {count, checkpoints, root segment}; checkpoint 0x50 bytes:
++    // planeStart normal 0x0C origin 0x18, planeEnd normal 0x28 origin 0x34, start / end distance 0x40 / 0x44, width 0x48)
++    s_tp.cps.clear();
++    u32 nn = 0, nodes = 0;
++    if (s_tp.ok && PadRead32(m, hdr + 0x08, &nn) && PadRead32(m, hdr + 0x0C, &nodes) && nn > 0 && nn <= 8192 &&
++        PadInRam(nodes))
++    {
++      for (u32 i = 0; i < nn; i++)
++      {
++        u32 cnt = 0, cp = 0;
++        if (!PadRead32(m, nodes + i * 12, &cnt) || !PadRead32(m, nodes + i * 12 + 4, &cp) || cnt == 0 || cnt > 16 ||
++            !PadInRam(cp))
++          continue;
++        for (u32 j = 0; j < cnt; j++)
++        {
++          const u8* q = m.GetPointerForRange(cp + j * 0x50, 0x50);
++          if (!q)
++            continue;
++          TpCp c;
++          const V3 na = {EvF32(q + 0x0C), EvF32(q + 0x10), EvF32(q + 0x14)};
++          c.a = {EvF32(q + 0x18), EvF32(q + 0x1C), EvF32(q + 0x20)};
++          const V3 nb = {EvF32(q + 0x28), EvF32(q + 0x2C), EvF32(q + 0x30)};
++          c.b = {EvF32(q + 0x34), EvF32(q + 0x38), EvF32(q + 0x3C)};
++          c.d0 = EvF32(q + 0x40);
++          c.d1 = EvF32(q + 0x44);
++          const float w = EvF32(q + 0x48);
++          const V3 ab = MiSub(c.b, c.a);
++          const float L = std::sqrt(MiDot(ab, ab));
++          if (!(w > 2.0f) || !(c.d1 > c.d0) || !(L > 0.5f && L < 5000.0f) || !std::isfinite(MiDot(na, nb)))
++            continue;
++          c.ta = MiMul(MiNorm(na), MiDot(na, ab) < 0.0f ? -L : L);
++          c.tb = MiMul(MiNorm(nb), MiDot(nb, ab) < 0.0f ? -L : L);
++          s_tp.cps.push_back(c);
++        }
++      }
++    }
++    std::fprintf(stderr, "TUBEPATH course slot %u venue %u: lap %.0f m, %zu buckets, %zu checkpoints%s\n", slot, venue,
++                 s_tp.lap, s_tp.frames.size(), s_tp.cps.size(), s_tp.ok ? "" : " - no tube data on this course");
++  }
++  if (!s_tp.ok)
++    return;
++  const int pr = EventPlayerRacer();
++  float pd = -1.0f;
++  for (u32 r = 0; r < s_rs.count && r < 64; r++)
++  {
++    if (!s_rs.valid[r])
++      continue;
++    u32 pp = 0;
++    if (!PadRead32(m, s_rs.arr + r * 0x620u + 0x49C, &pp) || pp < 0x80000000u || pp >= 0x817FFE00u)
++      continue;
++    const u8* q = m.GetPointerForRange(pp, 0x104);
++    if (!q)
++      continue;
++    const u32 fl = EvU32(q + 0x7C);
++    const float d = EvF32(q + 0x100), w = EvF32(q + 0x30), of = EvF32(q + 0x6C);
++    const V3 c = {EvF32(q + 0x0C), EvF32(q + 0x1C), EvF32(q + 0x2C)};
++    const V3 z = {EvF32(q + 0x08), EvF32(q + 0x18), EvF32(q + 0x28)};
++    if (!std::isfinite(d) || !(w > 4.0f && w < 2000.0f) ||
++        !(std::abs(c[0]) < 1e6f && std::abs(c[1]) < 1e6f && std::abs(c[2]) < 1e6f))
++      continue;
++    const V3 rel = MiSub(s_rs.world[r], c);
++    if (MiDot(rel, rel) > (w + 60.0f) * (w + 60.0f))
++      continue;  // a stale record
++    float dl = std::fmod(d, s_tp.lap);
++    if (dl < 0.0f)
++      dl += s_tp.lap;
++    TpFrame& f = s_tp.frames[std::min(static_cast<size_t>(dl / MI_BUCKET), s_tp.frames.size() - 1)];
++    f.c = c;
++    f.fw = MiNorm(z);
++    f.r = 0.5f * w;
++    f.inside = TpInsideFlags(fl, of);
++    f.valid = true;
++    if (static_cast<int>(r) == pr)
++    {
++      pd = dl;
++      s_tp.player_inside = f.inside;
++      if (s_tp.trace > 0 && f.inside && s_global_frame - s_tp.last_trace >= 30)
++      {
++        s_tp.last_trace = s_global_frame;
++        V3 sc{}, sf{};
++        const bool sp = TpSpineAt(dl, c, &sc, &sf);
++        std::fprintf(stderr, "TUBEPATH f=%llu player d %.0f: %.1f m from the axis, radius %.1f (P+0x7C %08x), "
++                     "checkpoint path %.1f m off\n", static_cast<unsigned long long>(s_global_frame), dl,
++                     std::sqrt(MiDot(rel, rel)), f.r, fl, sp ? std::sqrt(MiDot(MiSub(sc, c), MiSub(sc, c))) : -1.0f);
++      }
++    }
++  }
++  if (pd < 0.0f)
++    return;
++  // the polyline: from 36 m behind the player to ~900 m ahead; a point where a tube starts / ends, where the axis turns
++  // by > 10 deg from the last point (chord error < 1 m on R 230), or every 18 m (near) .. 90 m (far); unknown buckets inside a run continue it
++  // along the course's checkpoint path (nobody has driven there yet this race; else up to 150 m along the last bend)
++  const int nb = static_cast<int>(s_tp.frames.size());
++  const int b0 = static_cast<int>(pd / MI_BUCKET);
++  bool inrun = false;
++  TpFrame last{}, prev{};
++  V3 prevdir{}, pdir{};
++  bool have_dir = false, have_pdir = false;
++  float last_k = 0.0f;
++  int unknown = 0;
++  bool have_prev = false;
++  const auto put = [&](const TpFrame& f) {
++    if (s_tp.n > 0 && s_tp.pts[s_tp.n - 1][3] > 0.0f && s_tp.pts[s_tp.n - 1][0] == f.c[0] &&
++        s_tp.pts[s_tp.n - 1][1] == f.c[1] && s_tp.pts[s_tp.n - 1][2] == f.c[2])
++      return;  // the same point again (a run of one bucket / just emitted)
++    if (s_tp.n < 31)
++      s_tp.pts[s_tp.n++] = {f.c[0], f.c[1], f.c[2], f.r};
++  };
++  const auto brk = [&]() {
++    if (s_tp.n > 0 && s_tp.n < 31 && s_tp.pts[s_tp.n - 1][3] > 0.0f)
++      s_tp.pts[s_tp.n++] = {0.0f, 0.0f, 0.0f, 0.0f};
++  };
++  for (int k = -6; k <= 150 && s_tp.n < 31; k++)
++  {
++    const TpFrame& raw = s_tp.frames[((b0 + k) % nb + nb) % nb];
++    TpFrame f = raw;
++    if (!raw.valid)
++    {
++      V3 sc{}, sf{};
++      float sd = std::fmod((static_cast<float>(b0 + k) + 0.5f) * MI_BUCKET, s_tp.lap);
++      if (sd < 0.0f)
++        sd += s_tp.lap;
++      if (inrun && have_prev && ++unknown <= 150 && TpSpineAt(sd, prev.c, &sc, &sf))
++      {
++        f = prev;  // nobody drove there yet: the run goes on along the course's path
++        f.c = sc;
++        f.fw = sf;
++        f.valid = true;
++      }
++      else if (inrun && have_prev && have_dir && unknown <= 25)
++      {
++        // keep the last bend (constant curvature, at most 3 deg a bucket = R >= 115 m)
++        V3 nd = prevdir;
++        if (have_pdir)
++        {
++          const V3 dd = MiSub(prevdir, pdir);
++          const float l = std::sqrt(MiDot(dd, dd));
++          nd = MiNorm(MiAdd(prevdir, MiMul(dd, l > 0.052f ? 0.052f / l : 1.0f)));
++        }
++        f = prev;
++        f.c = MiAdd(prev.c, MiMul(nd, MI_BUCKET));
++        f.valid = true;
++      }
++      else
++      {
++        if (inrun)
++          put(prev), brk();
++        inrun = false;
++        have_prev = have_dir = have_pdir = false;
++        continue;
++      }
++    }
++    else
++      unknown = 0;
++    const float kd = static_cast<float>(k) * MI_BUCKET;
++    if (f.inside)
++    {
++      if (!inrun)
++      {
++        put(f);
++        last = f;
++        last_k = kd;
++        inrun = true;
++      }
++      else
++      {
++        const float step = std::clamp(18.0f + std::max(kd, 0.0f) * 0.2f, 18.0f, 90.0f);
++        const float turn = std::abs(MiDot(f.fw, last.fw));
++        if (kd - last_k >= step || turn < 0.9848f || std::abs(f.r - last.r) > 0.08f * last.r)
++        {
++          put(f);
++          last = f;
++          last_k = kd;
++        }
++      }
++      if (have_prev)
++      {
++        const V3 dd = MiSub(f.c, prev.c);
++        if (MiDot(dd, dd) > 1.0f)
++        {
++          pdir = prevdir;
++          have_pdir = have_dir;
++          prevdir = MiNorm(dd);
++          have_dir = true;
++        }
++      }
++      prev = f;
++      have_prev = true;
++    }
++    else
++    {
++      if (inrun)
++      {
++        if (last_k != static_cast<float>(k - 1) * MI_BUCKET)
++          put(prev);
++        brk();
++      }
++      inrun = false;
++      have_prev = have_dir = have_pdir = false;
++    }
++  }
++  if (inrun && s_tp.n < 31 && s_tp.pts[s_tp.n - 1][3] > 0.0f &&
++      (s_tp.pts[s_tp.n - 1][0] != prev.c[0] || s_tp.pts[s_tp.n - 1][2] != prev.c[2]))
++    put(prev);
++  if (s_tp.trace > 0 && s_global_frame % 10 == 0)
++  {
++    std::fprintf(stderr, "TUBEPATH f=%llu cam [%.0f %.0f %.0f] player d %.0f k0 %d %d points:",
++                 static_cast<unsigned long long>(s_global_frame), s_wx.cam[0], s_wx.cam[1], s_wx.cam[2], pd, b0, s_tp.n);
++    for (int i = 0; i < s_tp.n; i++)
++      std::fprintf(stderr, " [%.0f %.0f %.0f r%.0f]", s_tp.pts[i][0], s_tp.pts[i][1], s_tp.pts[i][2], s_tp.pts[i][3]);
++    std::fprintf(stderr, "\n");
++  }
++}
++void TubePathFill(EmitQuadsUniforms& u)
++{
++  TubePathUpdate();
++  u.surf_normal[32] = {static_cast<float>(s_tp.n), 1.0f, s_tp.player_inside ? 1.0f : 0.0f, 0.0f};
++  for (int i = 0; i < 31; i++)
++    u.surf_normal[33 + i] = i < s_tp.n ? s_tp.pts[i] : std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f};
++}
++
++bool MiFrameOk(const MiFrame& f)
++{
++  // open road only (no pipe / cylinder / open tube), not banked hard
++  return (f.flags & 0x02000000u) && !(f.flags & 0x01800001u) && f.up[1] > 0.86f;
++}
++// is world point p on (or just over / under) any known stretch of road? tol_w = extra lateral m, tol_h = height m
++bool MiNearRoad(const V3& p, float tol_w, float tol_h, bool* above)
++{
++  *above = false;
++  for (const MiFrame& f : s_mic.frames)
++  {
++    if (!f.valid)
++      continue;
++    const V3 r = MiSub(p, f.c);
++    if (MiDot(r, r) > (f.hw + 700.0f) * (f.hw + 700.0f))
++      continue;
++    const float al = MiDot(r, f.fw), lt = MiDot(r, f.rt), vt = MiDot(r, f.up);
++    if (std::abs(al) > MI_BUCKET * 0.8f || std::abs(lt) > f.hw + tol_w)
++      continue;
++    if (std::abs(vt) < tol_h)
++      return true;
++    if (vt < -3.0f && vt > -600.0f)
++      *above = true;  // this road passes over the spot
++  }
++  return false;
++}
++
++bool MiView(float* V)
++{
++  const ScView::Cand* best = nullptr;
++  if (s_scv.frame == s_global_frame)
++    for (const auto& c : s_scv.cands)
++      if (!best || c.n > best->n)
++        best = &c;
++  if (best)
++  {
++    std::copy(best->m.begin(), best->m.end(), V);
++    return true;
++  }
++  return ReadRamView(V);
++}
++V3 MiToView(const float* V, const V3& p)
++{
++  V3 o;
++  for (int r = 0; r < 3; r++)
++    o[r] = V[r * 4] * p[0] + V[r * 4 + 1] * p[1] + V[r * 4 + 2] * p[2] + V[r * 4 + 3];
++  return o;
++}
++
++// one placement try: lead L m ahead of the player along the lap, side +-1. Returns false (and why) if no good spot.
++bool MiPlace(float dp, const V3& F, float L, float side, float cam_d, const char** why)
++{
++  const MiFrame* fr = MiFrameAt(dp + L);
++  if (!fr)
++  {
++    *why = "road there not seen yet (no machine has been there)";
++    return false;
++  }
++  if (!MiFrameOk(*fr))
++  {
++    *why = "not open flat road there (pipe / cylinder / tube / bank)";
++    return false;
++  }
++  const V3 Up = fr->up;
++  V3 Fw = fr->fw;
++  if (MiDot(Fw, F) < 0.0f)
++    Fw = MiMul(Fw, -1.0f);
++  const V3 Rt = MiMul(fr->rt, side);  // outward
++  const V3 E = MiAdd(fr->c, MiMul(Rt, fr->hw));
++  const float margin = s_micfg.margin_min + (s_micfg.margin_max - s_micfg.margin_min) * MiRand();
++  const V3 S = MiAdd(MiAdd(E, MiMul(Rt, margin)), MiAdd(MiMul(Fw, (MiRand() - 0.5f) * 24.0f), MiMul(Up, -0.6f)));
++  // just outside the rail (Mute City's buildings stand a few metres further out and would hide it). Clear of every
++  // known road: the spot and a ring round it not over / on a road, no road above it
++  const float ring = std::min(6.0f, margin * 0.6f);
++  for (int k = 0; k <= 8; k++)
++  {
++    const float a = static_cast<float>(k) * 0.7854f;
++    const V3 q = k == 8 ? S : MiAdd(S, MiAdd(MiMul(Fw, ring * std::cos(a)), MiMul(Rt, ring * std::sin(a))));
++    bool above = false;
++    if (MiNearRoad(q, 0.5f, 14.0f, &above))
++    {
++      *why = "spot too close to a road";
++      return false;
++    }
++    if (above && k == 8)
++    {
++      *why = "road above the spot";
++      return false;
++    }
++  }
++  // in view when it lands: the camera then is about where the player will be (the road frame there), looking along
++  // the road (catches bends: a spot that is in view now can be behind a wall / beside the camera by then)
++  if (const MiFrame* cf = MiFrameAt(dp + cam_d))
++  {
++    V3 cfw = cf->fw;
++    if (MiDot(cfw, Fw) < 0.0f)
++      cfw = MiMul(cfw, -1.0f);
++    const V3 cam = MiAdd(MiSub(cf->c, MiMul(cfw, 14.0f)), MiMul(cf->up, 5.0f));
++    const V3 d = MiSub(S, cam);
++    const float dl = std::sqrt(MiDot(d, d));
++    if (dl < 70.0f || MiDot(d, cfw) < dl * 0.87f)
++    {
++      *why = "not in view when it lands";
++      return false;
++    }
++  }
++  // in view now (the fall)
++  float V[12];
++  if (!MiView(V))
++  {
++    *why = "no view";
++    return false;
++  }
++  const V3 v = MiToView(V, S);
++  if (!(-v[2] > 60.0f) || std::abs(v[0]) > -v[2] * 0.6f || v[1] > -v[2] * 0.30f || v[1] < v[2] * 0.40f)
++  {
++    static char buf[96];
++    std::snprintf(buf, sizeof(buf), "not in view (view %.0f %.0f %.0f)", v[0], v[1], v[2]);
++    *why = buf;
++    return false;
++  }
++  s_mi.pos = S;
++  s_mi.edge = E;
++  s_mi.up = Up;
++  s_mi.out = Rt;
++  s_mi.along = Fw;
++  // it comes from far ahead, high in the sky over the road (the whole fall is in view above the track, not behind the
++  // buildings beside it) and lands off the edge
++  const float el = (28.0f + 12.0f * MiRand()) * 0.0174533f;
++  const float az = (-12.0f + 22.0f * MiRand()) * 0.0174533f;   // from far down the road, high: seen above the track
++  const V3 H = MiNorm(MiAdd(MiMul(Fw, std::cos(az)), MiMul(Rt, std::sin(az))));
++  s_mi.from = MiNorm(MiAdd(MiMul(Up, std::sin(el)), MiMul(H, std::cos(el))));
++  s_mi.seed = MiRand();
++  s_mi.scale = 0.85f + 0.4f * MiRand();
++  return true;
++}
++
++// once a frame: game clock, schedule, placement. True while an impact is falling / burning (draw it).
++bool MiUpdate()
++{
++  if (s_mi.frame == s_global_frame)
++    return s_mi.active;
++  s_mi.frame = s_global_frame;
++  if (s_mi.trace < 0)
++    s_mi.trace = File::Exists(File::GetUserPath(D_USER_IDX) + "pc5090mitrace") ? 1 : 0;
++  auto& m = Core::System::GetInstance().GetMemory();
++  const int type = static_cast<int>(WeatherNow()[0] + 0.5f);
++  bool live = std::find(s_micfg.types.begin(), s_micfg.types.end(), type) != s_micfg.types.end();
++  u32 frames = 0, ms = 0, venue = 0, slot = 0, hdr = 0;
++  bool demo = false;
++  live = live && RefreshRacerSnapshot() && s_rs.ok && PadRead32(m, s_rs.base + 0x1BA9A0u, &ms) && (ms >> 16) == 2 &&
++         ReadGate(&venue, &slot, &demo) && venue < 256 && !demo && PadRead32(m, 0x801A66A0u, &frames) &&
++         PadRead32(m, s_rs.base + 0x1BA040u + 0x3BE0u, &hdr) && PadInRam(hdr);
++  if (!live)
++  {
++    s_mi.live = false;
++    if (++s_mi.off_frames > 90)
++    {
++      s_mi.next_t = -1.0;  // a new race schedules from its start
++      s_mi.active = false;
++      s_mi.have_frames = false;
++    }
++    return false;
++  }
++  s_mi.off_frames = 0;
++  // the course
++  if (hdr != s_mic.key_hdr || slot != s_mic.key_slot || s_rs.base != s_mic.key_rel ||
++      (!s_mic.ok && s_global_frame - s_mic.tried_frame > 120))
++  {
++    s_mic.key_hdr = hdr;
++    s_mic.key_slot = slot;
++    s_mic.key_rel = s_rs.base;
++    s_mic.tried_frame = s_global_frame;
++    const u64 t0 = PC5090Prof::NowNs();
++    s_mic.ok = MiLoadCourse(m, hdr);
++    std::fprintf(stderr, "METEORIMPACT course slot %u venue %u: lap %.0f m, %zu road buckets (%.2f ms)%s\n",
++                 slot, venue, s_mic.lap, s_mic.frames.size(), (PC5090Prof::NowNs() - t0) * 1e-6,
++                 s_mic.ok ? "" : " - NO impacts on this course");
++    s_mi.next_t = -1.0;
++    s_mi.active = false;
++  }
++  MiSample(m);
++  // game clock (stops while paused)
++  if (s_mi.have_frames)
++  {
++    const s32 df = static_cast<s32>(frames - s_mi.last_frames);
++    if (df > 0 && df < 30)
++      s_mi.gt += df / 60.0;
++  }
++  s_mi.last_frames = frames;
++  s_mi.have_frames = true;
++  s_mi.live = true;
++  const float every = MiEvery();
++  if (s_mi.next_t < 0.0)
++  {
++    s_mi.next_t = s_mi.gt + (s_micfg.test_every > 0.0f ? s_micfg.test_first : every * (0.3f + 0.25f * MiRand()));
++    if (s_mi.trace)
++      std::fprintf(stderr, "METEORIMPACT first in %.1f s\n", s_mi.next_t - s_mi.gt);
++  }
++  const int pr = EventPlayerRacer();
++  V3 P{}, F{0.0f, 0.0f, -1.0f};
++  float kmh = 0.0f, dp = 0.0f;
++  bool have_p = false;
++  if (pr >= 0 && static_cast<u32>(pr) < s_rs.count && s_rs.valid[pr])
++  {
++    P = s_rs.world[pr];
++    if (const u8* r = m.GetPointerForRange(s_rs.arr + static_cast<u32>(pr) * 0x620u, 0x620u))
++    {
++      V3 v = {EvF32(r + 0x94), EvF32(r + 0x98), EvF32(r + 0x9C)};
++      if (MiDot(v, v) > 1e-4f)
++        F = MiNorm(v);
++      kmh = EvF32(r + 0x17C);
++      u32 pp = 0;
++      const u8* q = (PadRead32(m, s_rs.arr + static_cast<u32>(pr) * 0x620u + 0x49C, &pp) && PadInRam(pp)) ?
++                        m.GetPointerForRange(pp, 0x104) : nullptr;
++      dp = q ? EvF32(q + 0x100) : 0.0f;
++      have_p = q && std::isfinite(kmh) && std::isfinite(dp);
++    }
++  }
++  if (s_mi.trace && (s_global_frame % 120) == 0)
++  {
++    size_t nv = 0;
++    for (const MiFrame& f : s_mic.frames)
++      nv += f.valid;
++    const MiFrame* f = have_p ? MiFrameAt(dp) : nullptr;
++    std::fprintf(stderr, "METEORIMPACT buckets %zu/%zu, player d=%.0f at (%.1f %.1f %.1f)%s", nv, s_mic.frames.size(), dp,
++                 P[0], P[1], P[2], f ? "" : "\n");
++    if (f)
++      std::fprintf(stderr, " frame c=(%.1f %.1f %.1f) hw=%.1f up=(%.2f %.2f %.2f) fw=(%.2f %.2f %.2f) flags %08x\n", f->c[0],
++                   f->c[1], f->c[2], f->hw, f->up[0], f->up[1], f->up[2], f->fw[0], f->fw[1], f->fw[2], f->flags);
++  }
++  if (s_mi.active)
++  {
++    const float age = static_cast<float>(s_mi.gt - s_mi.t0);
++    const V3 d = MiSub(P, s_mi.pos);
++    s_mi.pdist = have_p ? std::sqrt(MiDot(d, d)) : 1e9f;
++    // camera shake: only very close (the blast at impact, then a rumble as the player passes the burning crater)
++    float sh = 0.0f;
++    if (age >= 0.0f && age < 4.0f)
++    {
++      const float near = std::clamp((110.0f - s_mi.pdist) / 75.0f, 0.0f, 1.0f);
++      const float blast = age < 0.6f ? std::clamp((220.0f - s_mi.pdist) / 160.0f, 0.0f, 1.0f) * (1.0f - age / 0.6f) : 0.0f;
++      sh = std::min(1.0f, near * near * std::exp(-age / 1.6f) + 0.5f * blast);
++    }
++    s_mi.shake = sh;
++    if (age > s_micfg.life || (age > 4.0f && s_mi.pdist > 2500.0f))
++    {
++      s_mi.active = false;
++      if (s_mi.trace)
++        std::fprintf(stderr, "METEORIMPACT end (age %.1f s, player %.0f m)\n", age, s_mi.pdist);
++    }
++    return s_mi.active;
++  }
++  if (!s_mic.ok || s_mi.gt < s_mi.next_t || !have_p || TubeOpenAir() < 0.99f)
++    return false;
++  const float mps = std::max(kmh * 1.1f, 600.0f) / 3.6f;  // it is usually still speeding up
++  const char* why = "";
++  bool ok = false;
++  const float lead = s_micfg.lead_min + (s_micfg.lead_max - s_micfg.lead_min) * MiRand();
++  float side0 = MiRand() < 0.5f ? -1.0f : 1.0f;
++  // the outside of a bend first (the camera looks across to it; the inside is often behind the wall / buildings)
++  {
++    const MiFrame* a0 = MiFrameAt(dp);
++    const MiFrame* a1 = MiFrameAt(dp + std::min(mps * (lead + s_micfg.fall), 600.0f));
++    if (a0 && a1)
++    {
++      V3 f0 = a0->fw, f1 = a1->fw;
++      if (MiDot(f0, F) < 0.0f) f0 = MiMul(f0, -1.0f);
++      if (MiDot(f1, f0) < 0.0f) f1 = MiMul(f1, -1.0f);
++      const float turn = MiDot(MiCross(f0, f1), a1->up);  // sign: the bend's direction about up
++      if (std::abs(turn) > 0.08f)
++      {
++        // outward = side x rt; the outside is the side whose rt points away from the turn
++        const V3 rt = a1->rt;
++        const float rt_turn = MiDot(MiCross(f1, rt), a1->up);  // the turn sign rt itself would have
++        side0 = (turn * rt_turn > 0.0f) ? -1.0f : 1.0f;
++      }
++    }
++  }
++  int tries = 0;
++  for (float lk : {1.0f, 0.75f, 1.3f, 0.55f})
++    for (float sd : {side0, -side0})
++    {
++      if (ok)
++        break;
++      tries++;
++      // where the player will be ~lead s short of it when it lands (180-520 m), plus the fall
++      const float L = std::min(std::clamp(mps * lead * lk, 180.0f, 520.0f) + mps * s_micfg.fall, 950.0f);
++      ok = MiPlace(dp, F, L, sd, mps * s_micfg.fall, &why);
++      if (s_mi.trace && !ok)
++        std::fprintf(stderr, "METEORIMPACT try L=%.0f side %+.0f: %s\n", L, sd, why);
++    }
++  if (!ok)
++  {
++    s_mi.next_t = s_mi.gt + 0.5;  // try again a little further on
++    return false;
++  }
++  s_mi.active = true;
++  s_mi.t0 = s_mi.gt + s_micfg.fall;
++  s_mi.count++;
++  s_mi.next_t = s_mi.t0 + every * (0.8f + 0.4f * MiRand());
++  const V3 d = MiSub(P, s_mi.pos);
++  s_mi.pdist = std::sqrt(MiDot(d, d));
++  s_mi.shake = 0.0f;
++  std::fprintf(stderr, "METEORIMPACT #%d at (%.1f %.1f %.1f), %.0f m from the player (%.0f km/h), edge +%.1f m, "
++                       "try %d; next in %.0f s\n",
++               s_mi.count, s_mi.pos[0], s_mi.pos[1], s_mi.pos[2], s_mi.pdist, kmh,
++               std::sqrt(MiDot(MiSub(s_mi.pos, s_mi.edge), MiSub(s_mi.pos, s_mi.edge))), tries,
++               s_mi.next_t - s_mi.gt);
++  return true;
++}
++
++void MiFill(EmitQuadsUniforms& u)
++{
++  const float age = static_cast<float>(s_mi.gt - s_mi.t0);
++  u.surf_info = {1.0f, static_cast<float>(std::fmod(s_mi.gt, 1000.0)), static_cast<float>(s_mi.count), 0.0f};
++  const auto put = [&](int i, const V3& v, float w) { u.surf_pos[i] = {v[0], v[1], v[2], w}; };
++  put(0, s_mi.pos, age);
++  put(1, s_mi.up, s_mi.seed);
++  put(2, s_mi.out, s_mi.scale);
++  put(3, s_mi.from, s_micfg.fall);
++  put(4, s_mi.along, s_mi.shake);
++  put(5, s_mi.edge, s_mi.pdist);
++}
++}  // namespace
++
++// ---- Evolution Racing lit17s32 FIRE TORNADOES ----
++// Weather type 13 (WTH1 / the pause menu's "Fire tornadoes"): 2-4 towering fire whirls in the landscape around the
++// course. A "fire_tornado" action (one emit a frame, the weather trigger) draws them; this block places them and says
++// how near the player is to each. Placement once per course, from the course's CHECKPOINTS (header 0x08 = node count,
++// 0x0C -> 12-byte nodes {checkpoint count, -> 0x50-byte checkpoints, root segment}; a checkpoint's start / end plane
++// origin (+0x18 / +0x34) = the road centre, +0x48 = road width): the whole lap is known at the start of the race (the
++// racers' road frames of lit17s31 only cover where a machine has been). Each tornado stands off the road at a
++// distance band (the first 170-260 m from the nearest road, so the racing line passes near one; the others 420-700 /
++// 800-1250 m), spread round the lap (thirds of the checkpoint list), at least 400 m apart, and its slow drift
++// (a wandering orbit of "wander" m round its home, ~2 m/s) never brings it nearer to any road (any height: a column)
++// than "min_clear" m. Game clock = the unpaused frame counter (pause freezes the drift).
++// Uniforms (WORLD; eq_matrix = world -> view as the weather pass): eq_surf_info = (count, game s mod 1000, nearest
++// "near" 0..1, 1); eq_surf_pos[k] (k < 4) = base point (x, base y, z), w = near 0..1 (1 within "near_d" m of the player,
++// 0 beyond "far_d", smoothstep); eq_surf_pos[4 + k] = (height m, size, seed 0..1, clearance m); eq_surf_pos[8] = the
++// player (world), w = km/h; eq_surf_pos[9] = the inflow at the player (unit, toward the nearest tornado, horizontal),
++// w = its strength 0..1; eq_surf_pos[10] = (1 Ultra / 0 Low, road y min, road y max, 0).
++namespace
++{
++struct FtSeg
++{
++  V3 a{}, b{};
++  float hw = 0.0f;
++};
++struct FtTw
++{
++  V3 home{}, pos{};
++  float clear = 0.0f, seed = 0.0f, ph = 0.0f, ph2 = 0.0f, size = 1.0f, height = 1000.0f, near = 0.0f, dist = 1e9f;
++};
++struct FtCfg
++{
++  std::vector<int> types{13};
++  int count = 3;
++  float near_d = 140.0f, far_d = 1400.0f, min_clear = 110.0f, wander = 45.0f;
++  float test_ahead = 0.0f, test_side = 0.0f;  // TESTS: tornado #0 moved test_ahead m down the lap from the player
++  float band[4][2] = {{170.0f, 260.0f}, {420.0f, 700.0f}, {800.0f, 1250.0f}, {1100.0f, 1600.0f}};
++};
++FtCfg s_ftcfg;
++struct FtState
++{
++  u64 frame = ~0ull;
++  bool active = false;
++  u32 key_hdr = 0, key_slot = 0xFFFFFFFFu, key_rel = 0;
++  bool placed = false;
++  bool test_done = false;
++  u64 tried_frame = ~0ull;
++  std::vector<FtSeg> segs;
++  float ymin = 0.0f, ymax = 0.0f;
++  std::array<FtTw, 4> tw{};
++  int n = 0;
++  double gt = 0.0;
++  u32 last_frames = 0;
++  bool have_frames = false;
++  u32 off_frames = 0;
++  V3 player{};
++  float kmh = 0.0f, nearest = 0.0f;
++  V3 inflow{};
++  float inflow_k = 0.0f;
++  u32 rng = 0x2545F491u;
++  int trace = -1;
++};
++FtState s_ft;
++int s_ft_refs = 0;
++
++float FtRand()
++{
++  u32& x = s_ft.rng;
++  x ^= x << 13;
++  x ^= x >> 17;
++  x ^= x << 5;
++  return static_cast<float>(x & 0xFFFFFFu) / 16777216.0f;
++}
++float FtLerp(float a, float b, float t) { return a + (b - a) * t; }
++
++void FtConfigure(const picojson::object& g)
++{
++  s_ftcfg = FtCfg{};
++  if (const auto n = ReadNumericFromJson<double>(g, "count"))
++    s_ftcfg.count = std::clamp(static_cast<int>(*n), 1, 4);
++  if (const auto n = ReadNumericFromJson<double>(g, "near_d"))
++    s_ftcfg.near_d = static_cast<float>(std::clamp(*n, 20.0, 2000.0));
++  if (const auto n = ReadNumericFromJson<double>(g, "far_d"))
++    s_ftcfg.far_d = static_cast<float>(std::clamp(*n, 100.0, 10000.0));
++  if (const auto n = ReadNumericFromJson<double>(g, "min_clear"))
++    s_ftcfg.min_clear = static_cast<float>(std::clamp(*n, 30.0, 2000.0));
++  if (const auto n = ReadNumericFromJson<double>(g, "wander"))
++    s_ftcfg.wander = static_cast<float>(std::clamp(*n, 0.0, 400.0));
++  if (const auto it = g.find("test_near"); it != g.end() && it->second.is<picojson::array>() &&
++                                            it->second.get<picojson::array>().size() == 2)
++  {
++    const auto& t = it->second.get<picojson::array>();
++    if (t[0].is<double>() && t[1].is<double>())
++    {
++      s_ftcfg.test_ahead = static_cast<float>(t[0].get<double>());
++      s_ftcfg.test_side = static_cast<float>(t[1].get<double>());
++    }
++  }
++  if (const auto it = g.find("bands"); it != g.end() && it->second.is<picojson::array>())
++  {
++    const auto& arr = it->second.get<picojson::array>();
++    for (size_t i = 0; i < arr.size() && i < 4; i++)
++      if (arr[i].is<picojson::array>() && arr[i].get<picojson::array>().size() == 2 &&
++          arr[i].get<picojson::array>()[0].is<double>() && arr[i].get<picojson::array>()[1].is<double>())
++      {
++        s_ftcfg.band[i][0] = static_cast<float>(arr[i].get<picojson::array>()[0].get<double>());
++        s_ftcfg.band[i][1] = static_cast<float>(arr[i].get<picojson::array>()[1].get<double>());
++      }
++  }
++  if (const auto it = g.find("types"); it != g.end() && it->second.is<picojson::array>())
++  {
++    s_ftcfg.types.clear();
++    for (const auto& v : it->second.get<picojson::array>())
++      if (v.is<double>())
++        s_ftcfg.types.push_back(static_cast<int>(v.get<double>()));
++  }
++  s_ft = FtState{};
++  s_ft.rng ^= static_cast<u32>(std::chrono::steady_clock::now().time_since_epoch().count());
++  if (s_ft.rng == 0)
++    s_ft.rng = 0x1234567u;
++}
++
++// the current weather is a fire-tornado type (and the action is installed): the other weather passes stand down
++bool FtOwnsWeather()
++{
++  if (s_ft_refs <= 0)
++    return false;
++  const int type = static_cast<int>(WeatherNow()[0] + 0.5f);
++  return std::find(s_ftcfg.types.begin(), s_ftcfg.types.end(), type) != s_ftcfg.types.end();
++}
++
++// horizontal (xz) distance from p to the segment, minus its half width
++float FtSegClear(const V3& p, const FtSeg& s)
++{
++  const float ax = s.b[0] - s.a[0], az = s.b[2] - s.a[2];
++  const float px = p[0] - s.a[0], pz = p[2] - s.a[2];
++  const float l2 = ax * ax + az * az;
++  const float t = l2 > 1e-6f ? std::clamp((px * ax + pz * az) / l2, 0.0f, 1.0f) : 0.0f;
++  const float dx = px - ax * t, dz = pz - az * t;
++  return std::sqrt(dx * dx + dz * dz) - s.hw;
++}
++float FtClear(const V3& p)
++{
++  float c = 1e9f;
++  for (const FtSeg& s : s_ft.segs)
++    c = std::min(c, FtSegClear(p, s));
++  return c;
++}
++
++bool FtLoadRoad(Memory::MemoryManager& m, u32 hdr)
++{
++  s_ft.segs.clear();
++  u32 nn = 0, nodes = 0;
++  if (!PadRead32(m, hdr + 0x08, &nn) || !PadRead32(m, hdr + 0x0C, &nodes) || nn == 0 || nn > 8192 || !PadInRam(nodes))
++    return false;
++  s_ft.ymin = 1e9f;
++  s_ft.ymax = -1e9f;
++  for (u32 i = 0; i < nn; i++)
++  {
++    u32 cnt = 0, cps = 0;
++    if (!PadRead32(m, nodes + i * 12u, &cnt) || !PadRead32(m, nodes + i * 12u + 4u, &cps) || cnt == 0 || cnt > 8 ||
++        !PadInRam(cps))
++      continue;
++    for (u32 j = 0; j < cnt; j++)
++    {
++      const u8* q = m.GetPointerForRange(cps + j * 0x50u, 0x50);
++      if (!q)
++        continue;
++      FtSeg s;
++      s.a = {EvF32(q + 0x18), EvF32(q + 0x1C), EvF32(q + 0x20)};
++      s.b = {EvF32(q + 0x34), EvF32(q + 0x38), EvF32(q + 0x3C)};
++      const float w = EvF32(q + 0x48);
++      bool ok = std::isfinite(w) && w > 0.5f && w < 3000.0f;
++      for (int k = 0; k < 3 && ok; k++)
++        ok = std::isfinite(s.a[k]) && std::isfinite(s.b[k]) && std::abs(s.a[k]) < 1e6f && std::abs(s.b[k]) < 1e6f;
++      if (!ok)
++        continue;
++      s.hw = 0.5f * w;
++      s_ft.ymin = std::min({s_ft.ymin, s.a[1], s.b[1]});
++      s_ft.ymax = std::max({s_ft.ymax, s.a[1], s.b[1]});
++      s_ft.segs.push_back(s);
++    }
++  }
++  return s_ft.segs.size() >= 8;
++}
++
++// the tornadoes' homes: off the road in their distance bands, spread round the lap, apart from each other
++void FtPlace()
++{
++  s_ft.n = 0;
++  const int n = static_cast<int>(s_ft.segs.size());
++  const int want = s_ftcfg.count;
++  // which third of the lap each one comes from (shuffled: the near one is not always on the first third)
++  int order[4] = {0, 1, 2, 3};
++  for (int i = want - 1; i > 0; i--)
++    std::swap(order[i], order[static_cast<int>(FtRand() * (i + 1)) % (i + 1)]);
++  for (int k = 0; k < want; k++)
++  {
++    bool ok = false;
++    for (int tryi = 0; tryi < 400 && !ok; tryi++)
++    {
++      const float widen = 1.0f + 0.004f * tryi;  // later tries: a wider band, any part of the lap
++      const int part = order[k];
++      const int i0 = tryi < 200 ? part * n / want : 0, i1 = tryi < 200 ? (part + 1) * n / want : n;
++      const int si = std::clamp(i0 + static_cast<int>(FtRand() * std::max(i1 - i0, 1)), 0, n - 1);
++      const FtSeg& s = s_ft.segs[si];
++      V3 f = MiSub(s.b, s.a);
++      f[1] = 0.0f;
++      if (MiDot(f, f) < 1e-4f)
++        continue;
++      f = MiNorm(f);
++      const V3 rt = {f[2], 0.0f, -f[0]};
++      const float side = FtRand() < 0.5f ? -1.0f : 1.0f;
++      const float D = FtLerp(s_ftcfg.band[k][0], s_ftcfg.band[k][1], FtRand()) * widen;
++      const V3 mid = MiMul(MiAdd(s.a, s.b), 0.5f);
++      const V3 P = MiAdd(mid, MiMul(rt, side * (s.hw + D)));
++      const float c = FtClear(P);
++      // clear of EVERY road (the drift included), and not much nearer than its band says
++      if (c < s_ftcfg.min_clear + s_ftcfg.wander || c < s_ftcfg.band[k][0] * 0.8f)
++        continue;
++      bool apart = true;
++      for (int j = 0; j < s_ft.n && apart; j++)
++      {
++        const float dx = P[0] - s_ft.tw[j].home[0], dz = P[2] - s_ft.tw[j].home[2];
++        apart = dx * dx + dz * dz > 400.0f * 400.0f;
++      }
++      if (!apart)
++        continue;
++      FtTw& t = s_ft.tw[s_ft.n];
++      t.home = P;
++      // the base well below the lowest road near it (the column's foot fades into ground smoke / the void)
++      float ylo = 1e9f;
++      for (const FtSeg& q : s_ft.segs)
++      {
++        const float dx = q.a[0] - P[0], dz = q.a[2] - P[2];
++        if (dx * dx + dz * dz < 1500.0f * 1500.0f)
++          ylo = std::min(ylo, q.a[1]);
++      }
++      if (ylo > 1e8f)
++        ylo = s_ft.ymin;
++      t.home[1] = ylo - 140.0f;
++      t.pos = t.home;
++      t.clear = c;
++      t.seed = FtRand();
++      t.ph = FtRand() * 6.2832f;
++      t.ph2 = FtRand() * 6.2832f;
++      t.size = 0.85f + 0.35f * FtRand();
++      t.height = (s_ft.ymax - t.home[1]) + 900.0f + 300.0f * FtRand();
++      s_ft.n++;
++      ok = true;
++    }
++  }
++  std::fprintf(stderr, "FIRETORNADO placed %d of %d (road: %zu checkpoints, y %.0f..%.0f)\n", s_ft.n, want,
++               s_ft.segs.size(), s_ft.ymin, s_ft.ymax);
++  for (int k = 0; k < s_ft.n; k++)
++    std::fprintf(stderr, "FIRETORNADO #%d home (%.0f %.0f %.0f) clear %.0f m from the nearest road, size %.2f, height %.0f\n",
++                 k, s_ft.tw[k].home[0], s_ft.tw[k].home[1], s_ft.tw[k].home[2], s_ft.tw[k].clear, s_ft.tw[k].size,
++                 s_ft.tw[k].height);
++}
++
++// once a frame: course, placement, drift, proximity. True while fire-tornado weather is on in a live race.
++bool FtUpdate()
++{
++  if (s_ft.frame == s_global_frame)
++    return s_ft.active;
++  s_ft.frame = s_global_frame;
++  if (s_ft.trace < 0)
++    s_ft.trace = File::Exists(File::GetUserPath(D_USER_IDX) + "pc5090mitrace") ? 1 : 0;
++  auto& m = Core::System::GetInstance().GetMemory();
++  bool live = FtOwnsWeather();
++  u32 frames = 0, ms = 0, venue = 0, slot = 0, hdr = 0;
++  bool demo = false;
++  live = live && RefreshRacerSnapshot() && s_rs.ok && PadRead32(m, s_rs.base + 0x1BA9A0u, &ms) && (ms >> 16) == 2 &&
++         ReadGate(&venue, &slot, &demo) && venue < 256 && !demo && PadRead32(m, 0x801A66A0u, &frames) &&
++         PadRead32(m, s_rs.base + 0x1BA040u + 0x3BE0u, &hdr) && PadInRam(hdr);
++  if (!live)
++  {
++    if (++s_ft.off_frames > 90)
++    {
++      s_ft.active = false;
++      s_ft.have_frames = false;
++    }
++    return false;
++  }
++  s_ft.off_frames = 0;
++  if (hdr != s_ft.key_hdr || slot != s_ft.key_slot || s_rs.base != s_ft.key_rel ||
++      (!s_ft.placed && s_global_frame - s_ft.tried_frame > 120))
++  {
++    s_ft.key_hdr = hdr;
++    s_ft.key_slot = slot;
++    s_ft.key_rel = s_rs.base;
++    s_ft.tried_frame = s_global_frame;
++    const u64 t0 = PC5090Prof::NowNs();
++    s_ft.placed = FtLoadRoad(m, hdr);
++    if (s_ft.placed)
++      FtPlace();
++    s_ft.placed = s_ft.placed && s_ft.n > 0;
++    std::fprintf(stderr, "FIRETORNADO course slot %u venue %u: %s (%.2f ms)\n", slot, venue,
++                 s_ft.placed ? "placed" : "NO road data - no tornadoes", (PC5090Prof::NowNs() - t0) * 1e-6);
++  }
++  if (!s_ft.placed)
++  {
++    s_ft.active = false;
++    return false;
++  }
++  if (s_ft.have_frames)
++  {
++    const s32 df = static_cast<s32>(frames - s_ft.last_frames);
++    if (df > 0 && df < 30)
++      s_ft.gt += df / 60.0;
++  }
++  s_ft.last_frames = frames;
++  s_ft.have_frames = true;
++  // the player
++  const int pr = EventPlayerRacer();
++  if (pr >= 0 && static_cast<u32>(pr) < s_rs.count && s_rs.valid[pr])
++  {
++    s_ft.player = s_rs.world[pr];
++    if (const u8* r = m.GetPointerForRange(s_rs.arr + static_cast<u32>(pr) * 0x620u, 0x620u))
++    {
++      const float k = EvF32(r + 0x17C);
++      s_ft.kmh = std::isfinite(k) ? k : 0.0f;
++    }
++  }
++  // TESTS ("test_near": [ahead m, side m]): tornado #0 goes test_ahead m down the lap from the player, side m off the
++  // road centre (the side: +x of the road frame), once per course, as soon as the player is known
++  if (s_ftcfg.test_ahead > 0.0f && !s_ft.test_done && pr >= 0 && s_ft.n > 0)
++  {
++    s_ft.test_done = true;
++    const int ns = static_cast<int>(s_ft.segs.size());
++    int best_i = 0;
++    float bd = 1e18f;
++    for (int i = 0; i < ns; i++)
++    {
++      const V3 d = MiSub(s_ft.segs[i].a, s_ft.player);
++      const float dd = MiDot(d, d);
++      if (dd < bd)
++      {
++        bd = dd;
++        best_i = i;
++      }
++    }
++    // which way is "ahead": the player's velocity against the segment direction
++    V3 vel{};
++    if (const u8* r = m.GetPointerForRange(s_rs.arr + static_cast<u32>(pr) * 0x620u, 0x620u))
++      vel = {EvF32(r + 0x94), EvF32(r + 0x98), EvF32(r + 0x9C)};
++    const int dir = MiDot(MiSub(s_ft.segs[best_i].b, s_ft.segs[best_i].a), vel) >= 0.0f ? 1 : -1;
++    float acc = 0.0f;
++    int i = best_i;
++    for (int guard = 0; guard < ns && acc < s_ftcfg.test_ahead; guard++)
++    {
++      const FtSeg& q = s_ft.segs[i];
++      acc += std::sqrt(MiDot(MiSub(q.b, q.a), MiSub(q.b, q.a)));
++      i = ((i + dir) % ns + ns) % ns;
++    }
++    const FtSeg& q = s_ft.segs[i];
++    V3 f = MiSub(q.b, q.a);
++    f[1] = 0.0f;
++    f = MiNorm(f);
++    const V3 rt = {f[2], 0.0f, -f[0]};
++    const V3 mid = MiMul(MiAdd(q.a, q.b), 0.5f);
++    s_ft.tw[0].home = MiAdd(mid, MiMul(rt, s_ftcfg.test_side));
++    s_ft.tw[0].home[1] = s_ft.ymin - 140.0f;
++    s_ft.tw[0].clear = FtClear(s_ft.tw[0].home);
++    std::fprintf(stderr, "FIRETORNADO TEST #0 moved %.0f m ahead (segment %d), side %.0f -> (%.0f %.0f %.0f), clear %.0f m\n",
++                 acc, i, s_ftcfg.test_side, s_ft.tw[0].home[0], s_ft.tw[0].home[1], s_ft.tw[0].home[2], s_ft.tw[0].clear);
++  }
++  // drift (a slow wandering orbit round home) + nearness
++  const float t = static_cast<float>(s_ft.gt);
++  s_ft.nearest = 0.0f;
++  int best = -1;
++  float bestd = 1e9f;
++  for (int k = 0; k < s_ft.n; k++)
++  {
++    FtTw& w = s_ft.tw[k];
++    const float a = w.ph + t * 0.045f * (w.seed < 0.5f ? 1.0f : -1.0f);
++    const float rr = s_ftcfg.wander * (0.6f + 0.4f * std::sin(t * 0.07f + w.ph2));
++    w.pos = {w.home[0] + rr * std::cos(a), w.home[1], w.home[2] + rr * std::sin(a)};
++    const float dx = w.pos[0] - s_ft.player[0], dz = w.pos[2] - s_ft.player[2];
++    w.dist = std::sqrt(dx * dx + dz * dz);
++    float x = std::clamp((s_ftcfg.far_d - w.dist) / std::max(s_ftcfg.far_d - s_ftcfg.near_d, 1.0f), 0.0f, 1.0f);
++    w.near = x * x * (3.0f - 2.0f * x);
++    s_ft.nearest = std::max(s_ft.nearest, w.near);
++    if (w.dist < bestd)
++    {
++      bestd = w.dist;
++      best = k;
++    }
++  }
++  if (best >= 0)
++  {
++    const FtTw& w = s_ft.tw[best];
++    V3 d = {w.pos[0] - s_ft.player[0], 0.0f, w.pos[2] - s_ft.player[2]};
++    s_ft.inflow = MiNorm(d);
++    s_ft.inflow_k = w.near;
++  }
++  if (s_ft.trace && (s_global_frame % 60) == 0)
++  {
++    std::fprintf(stderr, "FIRETORNADO t=%.1f player (%.0f %.0f %.0f) %.0f km/h:", t, s_ft.player[0], s_ft.player[1],
++                 s_ft.player[2], s_ft.kmh);
++    for (int k = 0; k < s_ft.n; k++)
++      std::fprintf(stderr, " #%d %.0f m near %.2f", k, s_ft.tw[k].dist, s_ft.tw[k].near);
++    std::fprintf(stderr, "\n");
++  }
++  s_ft.active = true;
++  return true;
++}
++
++void FtFill(EmitQuadsUniforms& u)
++{
++  u.surf_info = {static_cast<float>(s_ft.n), static_cast<float>(std::fmod(s_ft.gt, 1000.0)), s_ft.nearest, 1.0f};
++  for (int k = 0; k < 4; k++)
++  {
++    const FtTw& w = s_ft.tw[k];
++    if (k < s_ft.n)
++    {
++      u.surf_pos[k] = {w.pos[0], w.pos[1], w.pos[2], w.near};
++      u.surf_pos[4 + k] = {w.height, w.size, w.seed, w.clear};
++    }
++    else
++    {
++      u.surf_pos[k] = {0.0f, 0.0f, 0.0f, 0.0f};
++      u.surf_pos[4 + k] = {0.0f, 0.0f, 0.0f, 0.0f};
++    }
++  }
++  u.surf_pos[8] = {s_ft.player[0], s_ft.player[1], s_ft.player[2], s_ft.kmh};
++  u.surf_pos[9] = {s_ft.inflow[0], s_ft.inflow[1], s_ft.inflow[2], s_ft.inflow_k};
++  u.surf_pos[10] = {WeatherUltra() ? 1.0f : 0.0f, s_ft.ymin, s_ft.ymax, 0.0f};
 +}
 +}  // namespace
 +
@@ -22429,6 +24980,124 @@ HcmV?d00001
 +  u.hx_up = {d.hx_up[0], d.hx_up[1], d.hx_up[2], 0.0f};
 +}
 +
++// ---- lit17s33n NEON state (DamageFx::Neon* below) ----
++bool s_nn_blend_now = false;
++struct NnSeg
++{
++  V3 a, b, c;
++  float k;
++};
++struct NnState
++{
++  bool pending = false, probe = false;
++  V3 rgb{1.0f, 1.0f, 1.0f};
++  float inten = 1.0f;
++  float chase_base = 70.0f, chase_k = 0.12f;
++  double S = 0.0;
++  float speed = 0.0f;
++  V3 fwd{0.0f, 0.0f, 1.0f};
++  bool have_fwd = false;
++  u64 seg_frame = ~0ull;
++  std::vector<NnSeg> cur, prev;
++  M34 view{};
++  u64 view_frame = ~0ull;
++  u64 sel_frame = ~0ull;
++  int nl = 0;
++  std::array<NnSeg, 12> sel{};
++  std::array<float, 12> sel_d{};
++  std::array<float, 12> sel_side{};
++  int trace = -1;
++};
++NnState s_nn;
++
++static void NnFlip()
++{
++  if (s_nn.seg_frame == s_global_frame)
++    return;
++  s_nn.prev.swap(s_nn.cur);
++  s_nn.cur.clear();
++  s_nn.seg_frame = s_global_frame;
++}
++static V3 NnClosest(const NnSeg& g, const V3& p)
++{
++  const V3 ab = {g.b[0] - g.a[0], g.b[1] - g.a[1], g.b[2] - g.a[2]};
++  const float l2 = Dot3(ab, ab);
++  float t = l2 > 1e-8f ? (Dot3({p[0] - g.a[0], p[1] - g.a[1], p[2] - g.a[2]}, ab) / l2) : 0.0f;
++  t = std::clamp(t, 0.0f, 1.0f);
++  return {g.a[0] + ab[0] * t, g.a[1] + ab[1] * t, g.a[2] + ab[2] * t};
++}
++static void NnSelect()
++{
++  if (s_nn.sel_frame == s_global_frame)
++    return;
++  s_nn.sel_frame = s_global_frame;
++  s_nn.nl = 0;
++  const DmRacer& d = s_dm[0];
++  const std::vector<NnSeg>& L = s_nn.seg_frame == s_global_frame ? s_nn.prev : s_nn.cur;
++  if (!d.have_prev || L.empty() || s_global_frame - s_nn.seg_frame > 2)
++    return;
++  const V3 P = d.pos;
++  std::vector<std::pair<float, size_t>> cand;
++  cand.reserve(L.size());
++  for (size_t i = 0; i < L.size(); i++)
++  {
++    const V3 c = NnClosest(L[i], P);
++    const float dd = Len3({c[0] - P[0], c[1] - P[1], c[2] - P[2]});
++    if (dd < 140.0f)
++      cand.push_back({dd, i});
++  }
++  std::sort(cand.begin(), cand.end());
++  std::array<V3, 12> cp{};
++  int per_side[2] = {0, 0};
++  // the camera's right in world space (row 0 of world -> view): left / right of the player (rails / lips on both sides)
++  const V3 rt = Norm3({s_nn.view[0], s_nn.view[1], s_nn.view[2]}, {1.0f, 0.0f, 0.0f});
++  for (const auto& [dd, i] : cand)
++  {
++    if (s_nn.nl >= 12)
++      break;
++    const NnSeg& g = L[i];
++    const V3 c = NnClosest(g, P);
++    const int side = Dot3({c[0] - P[0], c[1] - P[1], c[2] - P[2]}, rt) >= 0.0f ? 1 : 0;
++    if (per_side[side] >= 6)
++      continue;
++    const V3 dir = Norm3({g.b[0] - g.a[0], g.b[1] - g.a[1], g.b[2] - g.a[2]}, {0.0f, 0.0f, 1.0f});
++    bool dup = false;
++    for (int k = 0; k < s_nn.nl; k++)
++    {
++      const NnSeg& h = s_nn.sel[k];
++      const V3 hd = Norm3({h.b[0] - h.a[0], h.b[1] - h.a[1], h.b[2] - h.a[2]}, {0.0f, 0.0f, 1.0f});
++      if (Len3({c[0] - cp[k][0], c[1] - cp[k][1], c[2] - cp[k][2]}) < 2.6f && std::abs(Dot3(dir, hd)) > 0.9f)
++        dup = true;
++    }
++    if (dup)
++      continue;
++    cp[s_nn.nl] = c;
++    s_nn.sel[s_nn.nl] = g;
++    s_nn.sel_d[s_nn.nl] = dd;
++    s_nn.sel_side[s_nn.nl] = side ? 1.0f : -1.0f;
++    per_side[side]++;
++    s_nn.nl++;
++  }
++}
++// once per game frame (DmFrameEnd, the player's world motion this frame)
++static void NnAdvance(const V3& vel)
++{
++  const float l = Len3(vel);
++  s_nn.speed = s_nn.speed * 0.8f + l * 60.0f * 0.2f;
++  if (l > 0.02f)
++  {
++    const V3 f = {vel[0] / l, vel[1] / l, vel[2] / l};
++    if (!s_nn.have_fwd)
++      s_nn.fwd = f;
++    else
++      s_nn.fwd = Norm3({s_nn.fwd[0] * 0.75f + f[0] * 0.25f, s_nn.fwd[1] * 0.75f + f[1] * 0.25f,
++                        s_nn.fwd[2] * 0.75f + f[2] * 0.25f}, f);
++    s_nn.have_fwd = true;
++  }
++  const double step = static_cast<double>(l) + (s_nn.chase_base + s_nn.chase_k * s_nn.speed) / 60.0;
++  s_nn.S = std::fmod(s_nn.S + step, 4800.0);
++}
++
 +void DmFrameEnd()
 +{
 +  HxFrameGate();  // lit17c
@@ -22711,6 +25380,8 @@ HcmV?d00001
 +      continue;
 +    }
 +    V3 vel = {pos[0] - d.pos[0], pos[1] - d.pos[1], pos[2] - d.pos[2]};
++    if (r == 0 && Len3(vel) <= 30.0f)
++      NnAdvance(vel);  // lit17s33n neon: odometer + backward chase
 +    if (Len3(vel) > 30.0f)  // respawn / teleport
 +    {
 +      d.pos = pos;
@@ -22833,8 +25504,14 @@ HcmV?d00001
 +  std::array<std::array<float, 4>, 2> sf_ram;    // configured racer RAM values 0..7
 +  std::array<float, 4> sf_clock;                 // the emit clock: ms % 1e6, ms / 1e6 (the body shaders' time_ms is not
 +                                                 // re-uploaded per draw: it stays stale between pixel constant uploads)
++  // lit17s33n neon (see UniformBlock)
++  std::array<float, 4> nn_info, nn_fwd, nn_ctr, nn_col;
++  std::array<std::array<float, 4>, 12> nn_la, nn_lb, nn_lc;
++  // lit17s33p PADPLATE hull light (see UniformBlock)
++  std::array<float, 4> pd_info;
++  std::array<std::array<float, 4>, 4> pd_a, pd_b, pd_c;
 +};
-+static_assert(sizeof(DrawUniforms) == (1 + 6 * 16 + 7 + 5) * 16);
++static_assert(sizeof(DrawUniforms) == (1 + 6 * 16 + 7 + 5 + 4 + 36 + 13) * 16);
 +}  // namespace
 +
 +std::string_view UniformBlock()
@@ -22855,6 +25532,19 @@ HcmV?d00001
 +  float4 sf_pit;       // lit17s: x = ms since arriving on the pit strip, y = ms since leaving it (0 while on it), z = 1 on it, w = energy
 +  float4 sf_ram[2];    // lit17s: the surface_layer config's racer RAM values 0..7 (sf_ram[i >> 2][i & 3])
 +  float4 sf_clock;     // lit17s: x = ms % 1000000, y = ms / 1000000 (use this, not time_ms: that one is stale per draw); lit17s6: z = night look for this body draw (0 none, 1 dusk, 2 night), w = night strength
++  float4 nn_info;      // lit17s33n neon: x = 1 valid, y = 1 blended draw (halo) / 0 opaque, z = player speed (m/s), w = lights (0..6)
++  float4 nn_fwd;       // lit17s33n: player travel direction (view, unit), w = S: s(p) = dot(p - nn_ctr.xyz, nn_fwd.xyz) + S is a
++                       //   world-fixed distance along the travel; S also runs the backward chase (wraps every 4800 m)
++  float4 nn_ctr;       // lit17s33n: player centre (view), w = this neon draw's intensity (json neon.intensity, 1)
++  float4 nn_col;       // lit17s33n: this neon draw's colour (json neon.color), w = clock s (ms % 1e6 / 1000)
++  float4 nn_la[12];    // lit17s33n: the nearest neon light segments (up to 6 left + 6 right of the player, nearest first
++                       //   on each side): end A (view), w = distance from the player (m)
++  float4 nn_lb[12];    //   end B (view), w = side (-1 left, +1 right)
++  float4 nn_lc[12];    //   colour (rgb), w = intensity
++  float4 pd_info;      // lit17s33p dash plates (their light on the hulls): x = plates (0..4), y = clock s, z = 1 valid
++  float4 pd_a[4];      //   plate centre (view), w = half length
++  float4 pd_b[4];      //   forward axis (view, unit; the course direction when known), w = half width
++  float4 pd_c[4];      //   colour (strength look), w = hit surge 0..1 (a machine just hit it)
 +)";
 +}
 +
@@ -22878,8 +25568,224 @@ HcmV?d00001
 +                 blend ? 1 : 0, additive ? 1 : 0, names.size());
 +}
 +
++// ---- lit17s33n NEON -------------------------------------------------------------------------------------------
++bool s_pb_pending = false;
++std::array<float, 3> s_pb_ctr{};
++void NeonDrawBegin()
++{
++  s_nn.pending = false;
++  s_pb_pending = false;
++}
++void PadBoardNote() { s_pb_pending = true; s_pb_ctr = {0.0f, 0.0f, 0.0f}; }
++bool PadBoardPending() { return s_pb_pending; }
++void PadBoardCentroid(const std::array<float, 3>& c) { s_pb_ctr = c; }
++void NeonDrawNote(const std::array<float, 3>& rgb, bool probe, float chase_base, float chase_k, float intensity)
++{
++  s_nn.pending = true;
++  s_nn.probe = probe;
++  s_nn.rgb = {rgb[0], rgb[1], rgb[2]};
++  s_nn.inten = intensity;
++  s_nn.chase_base = chase_base;
++  s_nn.chase_k = chase_k;
++}
++bool NeonPending()
++{
++  return s_nn.pending;
++}
++void NeonSetBlend(bool blend)
++{
++  s_nn_blend_now = blend;
++}
++bool NeonProbePending()
++{
++  return s_nn.pending && s_nn.probe;
++}
++void NeonAddRows(const std::array<float, 12>& M, const std::vector<std::array<float, 3>>& pts, bool blend)
++{
++  (void)M;
++  (void)blend;
++  NnFlip();
++  // rows of 2 (one strip row each): the row midpoints, joined row to row; a join that is not along the line (its
++  // direction against the row's across vector) or far too long is the gap between two strips: skipped
++  const size_t rows = pts.size() / 2;
++  V3 pm{};
++  V3 pa{};
++  bool have = false;
++  for (size_t r = 0; r < rows && s_nn.cur.size() < 4096; r++)
++  {
++    const auto& q0 = pts[2 * r];
++    const auto& q1 = pts[2 * r + 1];
++    const V3 m = {(q0[0] + q1[0]) * 0.5f, (q0[1] + q1[1]) * 0.5f, (q0[2] + q1[2]) * 0.5f};
++    const V3 ac = {q1[0] - q0[0], q1[1] - q0[1], q1[2] - q0[2]};
++    if (have)
++    {
++      const V3 d = {m[0] - pm[0], m[1] - pm[1], m[2] - pm[2]};
++      const float l = Len3(d), la = Len3(ac), lp = Len3(pa);
++      const bool ok = l > 0.05f && l < 600.0f && la > 0.05f && la < 6.0f && std::abs(la - lp) < 0.5f &&
++                      std::abs(Dot3(d, ac)) < 0.35f * l * la;
++      if (ok)
++        s_nn.cur.push_back({pm, m, s_nn.rgb, s_nn.inten});
++    }
++    pm = m;
++    pa = ac;
++    have = true;
++  }
++}
++static void NnFill(DrawUniforms& U, const M34& V, bool neon_draw, bool blend)
++{
++  const DmRacer& d = s_dm[0];
++  if (s_nn.trace < 0)
++    s_nn.trace = File::Exists(File::GetUserPath(D_USER_IDX) + "pc5090neontrace") ? 1 : 0;
++  if (!d.have_prev)
++  {
++    if (s_nn.trace > 0 && neon_draw && (s_global_frame % 120) == 0)
++      std::fprintf(stderr, "NEONTRACE f=%llu no player (damage tracker off?)\n", static_cast<unsigned long long>(s_global_frame));
++    return;
++  }
++  NnSelect();
++  const V3 c = XP(V, d.pos);
++  const V3 f = Norm3(XV(V, s_nn.fwd), {0.0f, 0.0f, -1.0f});
++  U.nn_info = {1.0f, blend ? 1.0f : 0.0f, s_nn.speed, static_cast<float>(s_nn.nl)};
++  U.nn_fwd = {f[0], f[1], f[2], static_cast<float>(s_nn.S)};
++  U.nn_ctr = {c[0], c[1], c[2], neon_draw ? s_nn.inten : 1.0f};
++  U.nn_col = {s_nn.rgb[0], s_nn.rgb[1], s_nn.rgb[2], static_cast<float>(s_now_ms % 1000000u) * 0.001f};
++  for (int i = 0; i < s_nn.nl; i++)
++  {
++    const NnSeg& g = s_nn.sel[i];
++    const V3 a = XP(V, g.a), b = XP(V, g.b);
++    U.nn_la[i] = {a[0], a[1], a[2], s_nn.sel_d[i]};
++    U.nn_lb[i] = {b[0], b[1], b[2], s_nn.sel_side[i]};
++    U.nn_lc[i] = {g.c[0], g.c[1], g.c[2], g.k};
++  }
++  if (s_nn.trace < 0)
++    s_nn.trace = File::Exists(File::GetUserPath(D_USER_IDX) + "pc5090neontrace") ? 1 : 0;
++  if (s_nn.trace > 0 && neon_draw && (s_global_frame % 60) == 0)
++  {
++    static u64 last = 0;
++    if (last != s_global_frame)
++    {
++      last = s_global_frame;
++      std::fprintf(stderr, "NEONTRACE f=%llu segs=%zu/%zu lights=%d d0=%.1f speed=%.1f S=%.1f ctr=(%.2f %.2f %.2f) fwd=(%.2f %.2f %.2f) main=(%.2f %.2f %.2f) mainf=%llu\n",
++                   static_cast<unsigned long long>(s_global_frame), s_nn.prev.size(), s_nn.cur.size(), s_nn.nl,
++                   s_nn.nl ? s_nn.sel_d[0] : -1.0f, s_nn.speed, s_nn.S, c[0], c[1], c[2], f[0], f[1], f[2],
++                   d.main[3], d.main[7], d.main[11], static_cast<unsigned long long>(d.main_frame));
++    }
++  }
++}
++
++// lit17s33p PADPLATE: the 4 plates nearest the player (within 150 m) for the hull light layer (sf_padlight). Only
++// while a "pads" action ran this frame (BoostPlates on, race, plates read): its world -> view.
++static void PdFill(DrawUniforms& U)
++{
++  U.pd_info = {};
++  const DmRacer& d = s_dm[0];
++  if (!d.have_prev || s_pad_view_frame == ~0ull || s_global_frame - s_pad_view_frame > 2 || s_pads.pads.empty())
++    return;
++  const float* V = s_pad_view.data();
++  std::vector<std::pair<float, size_t>> cs;
++  for (size_t i = 0; i < s_pads.pads.size(); i++)
++  {
++    const float dd = std::sqrt(Dist2(s_pads.pads[i].c, {d.pos[0], d.pos[1], d.pos[2]}));
++    if (dd < 150.0f + s_pads.pads[i].hl)
++      cs.push_back({dd, i});
++  }
++  std::sort(cs.begin(), cs.end());
++  const bool looks = FxSwitchOn("BoostPadLooks");
++  const int n = static_cast<int>(std::min<size_t>(cs.size(), 4));
++  for (int j = 0; j < n; j++)
++  {
++    const Pad& p = s_pads.pads[cs[j].second];
++    float c[3], a[3];
++    for (int r = 0; r < 3; r++)
++    {
++      c[r] = V[r * 4] * p.c[0] + V[r * 4 + 1] * p.c[1] + V[r * 4 + 2] * p.c[2] + V[r * 4 + 3];
++      a[r] = V[r * 4] * p.along[0] + V[r * 4 + 1] * p.along[1] + V[r * 4 + 2] * p.along[2];
++    }
++    const float al = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
++    const float st = looks ? p.strength : 1.0f;
++    const std::array<float, 3> rgb = st < 1.25f ? std::array<float, 3>{1.0f, 0.62f, 0.16f} :
++                                     (st < 1.75f ? std::array<float, 3>{0.62f, 0.30f, 1.0f} :
++                                                   std::array<float, 3>{1.0f, 0.16f, 0.08f});
++    const s32 since = static_cast<s32>(s_now_ms - p.hit_ms);
++    const float surge = (p.hit_ever && since >= 0) ? std::exp(-static_cast<float>(since) / 300.0f) : 0.0f;
++    U.pd_a[j] = {c[0], c[1], c[2], p.hl};
++    U.pd_b[j] = {a[0] / std::max(al, 1e-6f), a[1] / std::max(al, 1e-6f), a[2] / std::max(al, 1e-6f), p.hw};
++    U.pd_c[j] = {rgb[0], rgb[1], rgb[2], surge};
++  }
++  U.pd_info = {static_cast<float>(n), static_cast<float>(s_now_ms % 1000000u) * 0.001f, 1.0f, 0.0f};
++}
++
++// lit17s33p: the plate under a board draw. V = world -> view of the frame (pads pass), M = this draw's model -> view.
++static void PdFillBoard(DrawUniforms& U, const std::array<float, 12>& M, const std::array<float, 3>& cm)
++{
++  U.pd_info = {};
++  if (s_pad_view_frame == ~0ull || s_global_frame - s_pad_view_frame > 3 || s_pads.pads.empty())
++    return;
++  float cv[3];
++  for (int r = 0; r < 3; r++)
++    cv[r] = M[r * 4] * cm[0] + M[r * 4 + 1] * cm[1] + M[r * 4 + 2] * cm[2] + M[r * 4 + 3];
++  const float* V = s_pad_view.data();
++  float best = 1e30f;
++  const Pad* bp = nullptr;
++  float bc[3] = {};
++  for (const Pad& p : s_pads.pads)
++  {
++    float c[3];
++    for (int r = 0; r < 3; r++)
++      c[r] = V[r * 4] * p.c[0] + V[r * 4 + 1] * p.c[1] + V[r * 4 + 2] * p.c[2] + V[r * 4 + 3];
++    const float d = (c[0] - cv[0]) * (c[0] - cv[0]) + (c[1] - cv[1]) * (c[1] - cv[1]) + (c[2] - cv[2]) * (c[2] - cv[2]);
++    if (d < best)
++    {
++      best = d;
++      bp = &p;
++      std::copy(c, c + 3, bc);
++    }
++  }
++  if (!bp || best > 40.0f * 40.0f)
++    return;
++  float al[3], ac[3], up[3];
++  for (int r = 0; r < 3; r++)
++  {
++    al[r] = V[r * 4] * bp->along[0] + V[r * 4 + 1] * bp->along[1] + V[r * 4 + 2] * bp->along[2];
++    ac[r] = V[r * 4] * bp->across[0] + V[r * 4 + 1] * bp->across[1] + V[r * 4 + 2] * bp->across[2];
++    up[r] = V[r * 4] * bp->up[0] + V[r * 4 + 1] * bp->up[1] + V[r * 4 + 2] * bp->up[2];
++  }
++  const float st = FxSwitchOn("BoostPadLooks") ? bp->strength : 1.0f;
++  const s32 since = static_cast<s32>(s_now_ms - bp->hit_ms);
++  U.pd_a[0] = {bc[0], bc[1], bc[2], bp->hl};
++  U.pd_b[0] = {al[0], al[1], al[2], bp->hw};
++  U.pd_c[0] = {ac[0], ac[1], ac[2], st};
++  U.pd_c[1] = {up[0], up[1], up[2], (bp->hit_ever && since >= 0) ? static_cast<float>(since) : 1e6f};
++  U.pd_info = {1.0f, static_cast<float>(s_now_ms % 1000000u) * 0.001f, 1.0f, 1.0f};
++}
++
 +void FillDrawUniforms(const std::array<float, 12>& M, std::vector<u8>* out)
 +{
++  // lit17s33p PADPLATE: a board draw - pd_a[0..] = the plate nearest the draw's centroid (view space), pd_info.w = 1
++  if (s_pb_pending)
++  {
++    s_pb_pending = false;
++    out->assign(sizeof(DrawUniforms), 0);
++    DrawUniforms U{};
++    U.sf_clock = {static_cast<float>(s_now_ms % 1000000u), static_cast<float>(s_now_ms / 1000000u), 0.0f, 0.0f};
++    PdFillBoard(U, M, s_pb_ctr);
++    std::memcpy(out->data(), &U, sizeof(U));
++    return;
++  }
++  // lit17s33n: a neon track draw: only the nn_* members (M = the track's model -> view = world -> view)
++  if (s_nn.pending)
++  {
++    s_nn.pending = false;
++    out->assign(sizeof(DrawUniforms), 0);
++    DrawUniforms U{};
++    s_nn.view = M;
++    s_nn.view_frame = s_global_frame;
++    NnFill(U, M, true, s_nn_blend_now);
++    U.sf_clock = {static_cast<float>(s_now_ms % 1000000u), static_cast<float>(s_now_ms / 1000000u), NightForBody(),
++                  s_nt.strength};
++    std::memcpy(out->data(), &U, sizeof(U));
++    return;
++  }
 +  out->assign(sizeof(DrawUniforms), 0);
 +  if (s_nt_late_draw)
 +  {
@@ -22981,6 +25887,9 @@ HcmV?d00001
 +        U.hx_inv[i] = {Ti[i * 4] * k, Ti[i * 4 + 1] * k, Ti[i * 4 + 2] * k, (Ti[i * 4 + 3] - d.hx_ctr[i]) * k};
 +    }
 +  }
++  if (s_nn.view_frame != ~0ull && s_global_frame - s_nn.view_frame <= 2)
++    NnFill(U, s_nn.view, false, false);  // lit17s33n: the neon lights for the hull (the frame's world -> view)
++  PdFill(U);  // lit17s33p: the dash plates' light on the hulls
 +  if (d.hits.empty())
 +  {
 +    std::memcpy(out->data(), &U, sizeof(U));
@@ -23011,9 +25920,154 @@ HcmV?d00001
 +  std::memcpy(out->data(), &U, sizeof(U));
 +}
 +}  // namespace DamageFx
++
++// ---- Evolution Racing dolphin-lit17s34m MACHINE METAL: the scene probe -------------------------------------------------------
++namespace PC5090Material
++{
++namespace
++{
++constexpr int kLevels = 5;  // 1/2, 1/4, 1/8, 1/16, 1/32 of the EFB (box filtered by halving blits)
++struct Probe
++{
++  std::array<std::unique_ptr<AbstractTexture>, kLevels> tex;
++  std::array<std::unique_ptr<AbstractFramebuffer>, kLevels> fb;
++  std::unique_ptr<AbstractTexture> black;
++  u32 efb_w = 0, efb_h = 0;
++  bool have = false;            // a probe was captured at the current size
++  bool pending = false;         // this flush's draw wants it
++  u64 used_frame = ~0ull;       // a probe draw ran in this frame
++  u64 captured_frame = ~0ull;
++  u64 setting_frame = ~0ull;
++  bool on = true;
++};
++Probe s_mt;
++
++bool MetalOn()
++{
++  if (s_mt.setting_frame != s_global_frame)
++  {
++    s_mt.setting_frame = s_global_frame;
++    std::string v = Config::Get(Config::GFX_PC5090_MACHINE_METAL);
++    for (auto& ch : v)
++      ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
++    s_mt.on = !(v == "off" || v == "0" || v == "false");
++  }
++  return s_mt.on;
++}
++
++bool Ensure(u32 w, u32 h)
++{
++  if (s_mt.efb_w == w && s_mt.efb_h == h && s_mt.tex[0])
++    return true;
++  s_mt = Probe{std::move(s_mt.tex), std::move(s_mt.fb), std::move(s_mt.black)};
++  for (int i = 0; i < kLevels; i++)
++  {
++    s_mt.fb[i].reset();
++    s_mt.tex[i].reset();
++    const u32 lw = std::max(1u, (w + (2u << i) - 1) >> (i + 1)), lh = std::max(1u, (h + (2u << i) - 1) >> (i + 1));
++    s_mt.tex[i] = g_gfx->CreateTexture(TextureConfig(lw, lh, 1, 1, 1, AbstractTextureFormat::RGBA8,
++                                                     AbstractTextureFlag_RenderTarget,
++                                                     AbstractTextureType::Texture_2DArray),
++                                       "machine metal probe");
++    if (!s_mt.tex[i])
++      return false;
++    s_mt.fb[i] = g_gfx->CreateFramebuffer(s_mt.tex[i].get(), nullptr);
++    if (!s_mt.fb[i])
++      return false;
++  }
++  s_mt.efb_w = w;
++  s_mt.efb_h = h;
++  s_mt.have = false;
++  return true;
++}
++
++const AbstractTexture* Black()
++{
++  if (!s_mt.black)
++  {
++    s_mt.black = g_gfx->CreateTexture(TextureConfig(1, 1, 1, 1, 1, AbstractTextureFormat::RGBA8, 0,
++                                                    AbstractTextureType::Texture_2DArray),
++                                      "machine metal off");
++    if (s_mt.black)
++    {
++      const u8 px[4] = {0, 0, 0, 0};
++      s_mt.black->Load(0, 1, 1, 1, px, 4);
++    }
++  }
++  return s_mt.black.get();
++}
++
++void Capture()
++{
++  AbstractTexture* efb = g_framebuffer_manager->GetEFBColorTexture();
++  if (!efb || efb->GetLayers() > 1)
++    return;
++  const u32 w = efb->GetWidth(), h = efb->GetHeight();
++  if (!Ensure(w, h))
++    return;
++  const MathUtil::Rectangle<int> rect(0, 0, static_cast<int>(w), static_cast<int>(h));
++  AbstractTexture* src = g_framebuffer_manager->ResolveEFBColorTexture(rect);
++  if (!src)
++    return;
++  src->FinishedRendering();  // out of the render pass, readable (no layout change inside the scale blit's pass)
++  const u64 pt0 = PC5090Prof::Enabled() ? PC5090Prof::NowNs() : 0;
++  for (int i = 0; i < kLevels; i++)
++  {
++    const AbstractTexture* from = i == 0 ? src : s_mt.tex[i - 1].get();
++    g_gfx->UnbindTexture(s_mt.tex[i].get());
++    g_gfx->ScaleTexture(s_mt.fb[i].get(), s_mt.fb[i]->GetRect(), from, from->GetConfig().GetRect());
++    s_mt.tex[i]->FinishedRendering();
++  }
++  s_mt.have = true;
++  s_mt.captured_frame = s_global_frame;
++  if (pt0 && PC5090Prof::Enabled())
++    PC5090Prof::Add(PC5090Prof::SceneCopies, 1);
++}
++}  // namespace
++
++void BeginDraw()
++{
++  s_mt.pending = false;
++}
++void NoteProbeDraw()
++{
++  s_mt.pending = true;
++}
++bool ProbePending()
++{
++  return s_mt.pending;
++}
++void OrthoDraw()
++{
++  if (s_mt.used_frame != s_global_frame || s_mt.captured_frame == s_global_frame || !MetalOn())
++    return;
++  Capture();
++}
++void Bind()
++{
++  if (!s_mt.pending)
++    return;
++  s_mt.used_frame = s_global_frame;
++  const bool on = MetalOn();
++  // nothing captured yet (first frame / size change): black until the next HUD start takes the first copy. Never
++  // capture here: this runs after the draw's own textures are bound, and the scale blits would replace them
++  SamplerState ss = RenderState::GetLinearSamplerState();
++  ss.tm0.wrap_u = WrapMode::Clamp;
++  ss.tm0.wrap_v = WrapMode::Clamp;
++  const bool ok = on && s_mt.have;
++  const AbstractTexture* t11 = ok ? s_mt.tex[2].get() : Black();
++  const AbstractTexture* t12 = ok ? s_mt.tex[4].get() : Black();
++  if (!t11 || !t12)
++    return;
++  g_gfx->SetTexture(11, t11);
++  g_gfx->SetSamplerState(11, ss);
++  g_gfx->SetTexture(12, t12);
++  g_gfx->SetSamplerState(12, ss);
++}
++}  // namespace PC5090Material
 --- a/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.h
 +++ b/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.h
-@@ -0,0 +1,453 @@
+@@ -0,0 +1,496 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -23267,6 +26321,8 @@ HcmV?d00001
 +  // "scene_copy": true -> the EFB colour is copied (once per frame, at this action's first emit) into a texture
 +  // bound at sampler 1 (eq_scene(uv) / eq_scene_px()), eq_scene_size = EFB size, 1 / size
 +  bool m_scene_copy = false;
++  // lit17s29n "near_fade": whole-quad culling + fade before the camera (sprite effects; see GenerateVertexShader)
++  bool m_near_fade = false;
 +  // Evolution Racing dolphin-lit17s6 night mode: "night": {...} marks THE night pass (one per mod set); "scene_before_night":
 +  // true -> once the night pass ran this frame, this action's scene copy is the night pass's own copy (the scene as
 +  // it was before the night grade: the albedo for lights)
@@ -23306,6 +26362,7 @@ HcmV?d00001
 +  bool m_emit_before = false;
 +  // lit17s8 "night_only": true -> no emit unless this frame's night look is dusk or night (lights only after dark)
 +  bool m_night_only = false;
++  bool m_night_fade = false;  // Evolution Racing lit17s32 "night_fade": {"dusk", "ms"} (params[15] = 1 + light level)
 +  std::unique_ptr<AbstractTexture> m_scene;
 +  u32 m_scene_frame = 0xffffffffu;
 +  const AbstractTexture* m_scene_alias = nullptr;  // lit17s14m: another action's copy of the same EFB generation
@@ -23414,6 +26471,18 @@ HcmV?d00001
 +  u32 m_frame_counter = 0;
 +  std::vector<FrameAnchor> m_this_frame;
 +  std::vector<FrameAnchor> m_prev_frame;
++  // Evolution Racing lit17s30 BOOST REWORK: "boost": true = eq_boost / eq_boost2 filled (the emitted machine's boost state);
++  // "boost_core": {...} = the boost tracker runs every frame + the camera FOV kick (GFX.ini [PC5090] BoostFov);
++  // "pads": {"range": m, "max": n} = the course's dash plates in reach (eq_surf_* packed, see the uniform block)
++  bool m_boost_fx = false;
++  bool m_boost_core = false;
++  bool m_pads = false;
++  float m_pads_range = 450.0f;
++  u32 m_pads_max = 32;
++  // Evolution Racing lit17s31: "meteor_impact": {...} = near-track meteor impacts (EmitQuadsAction.cpp, METEOR IMPACTS)
++  bool m_meteor_impact = false;
++  // Evolution Racing lit17s32: "fire_tornado": {...} = fire-tornado weather (EmitQuadsAction.cpp, FIRE TORNADOES)
++  bool m_fire_tornado = false;
 +  bool m_damage_track = false;  // Evolution Racing dolphin-lit17: "damage" (this action keeps the damage tracker on)
 +  bool m_surface_track = false;  // Evolution Racing dolphin-lit17s: "surface_layer" (surface layer state on, docs SURFACE-LAYER-LIT17S.md)
 +  bool m_hull_track = false;    // Evolution Racing dolphin-lit17c: "hull_fx" (speed heat / grip state on, eq_hx_*)
@@ -23466,10 +26535,43 @@ HcmV?d00001
 +int NightBodyLook();
 +// lit17s6: FZGX_NIGHT_TRACE=1 logs (once each) the textures drawn after the night pass in a frame
 +void NightTrace(const std::vector<std::string>& names, bool ortho, bool blend, bool additive);
++// lit17s33n NEON: a custom_pipeline with "neon" (track draws: glass tube edge lines, rails, glass panes ...) gets the
++// DamageFx block with the nn_* members filled for a track draw (see UniformBlock). NeonDrawBegin() at every flush;
++// NeonDrawNote() from the action's OnDrawStarted; probe draws hand their vertices (model space rows of 2 = one strip
++// row) to NeonAddRows - they become the frame's neon light segments (world = the track's model space).
++void NeonDrawBegin();
++// lit17s33p PADPLATE: a board draw (custom_pipeline "pad_board"); PadBoardCentroid = its vertex centroid (model space)
++void PadBoardNote();
++bool PadBoardPending();
++void PadBoardCentroid(const std::array<float, 3>& c);
++void NeonDrawNote(const std::array<float, 3>& rgb, bool probe, float chase_base, float chase_k, float intensity);
++bool NeonProbePending();
++bool NeonPending();
++void NeonSetBlend(bool blend);
++void NeonAddRows(const std::array<float, 12>& M, const std::vector<std::array<float, 3>>& model_pts, bool blend);
 +}  // namespace DamageFx
++
++// Evolution Racing dolphin-lit17s34m MACHINE METAL: an environment probe for the machine body material layer (sf_metal.glsl).
++// A custom_pipeline with "env_probe": true gets two downscaled copies of the scene bound at pixel samplers 11 (1/8 of
++// the EFB, sharp) and 12 (1/32, blurred), clamp, linear. The copy is taken once a frame at the first orthographic draw
++// (the HUD) after a probe draw, so the next frame's bodies reflect the finished 3D picture (one frame late, no HUD).
++// GFX.ini [PC5090] MachineMetal = Off binds 1x1 black textures (the layer sees size < 4 and returns).
++namespace PC5090Material
++{
++void BeginDraw();             // every flush, before the actions run
++void NoteProbeDraw();         // from the action's OnDrawStarted
++bool ProbePending();          // this draw wants the probe
++void Bind();                  // binds samplers 11 / 12 (call after the draw's textures are bound)
++void OrthoDraw();             // an orthographic draw is starting: capture if a probe draw happened this frame
++}  // namespace PC5090Material
 --- a/Source/Core/VideoCommon/GraphicsModSystem/Runtime/CustomShaderCache.cpp
 +++ b/Source/Core/VideoCommon/GraphicsModSystem/Runtime/CustomShaderCache.cpp
-@@ -6,6 +6,7 @@
+@@ -3,9 +3,12 @@
+ 
+ #include "VideoCommon/GraphicsModSystem/Runtime/CustomShaderCache.h"
+ 
++#include <chrono>
++#include <thread>
  #include <utility>
  
  #include "VideoCommon/AbstractGfx.h"
@@ -23477,7 +26579,7 @@ HcmV?d00001
  #include "VideoCommon/VideoConfig.h"
  #include "VideoCommon/VideoEvents.h"
  
-@@ -62,6 +63,7 @@
+@@ -62,6 +65,7 @@
    m_uber_ps_cache = {};
    m_pipeline_cache = {};
    m_uber_pipeline_cache = {};
@@ -23485,7 +26587,32 @@ HcmV?d00001
  }
  
  std::optional<const AbstractPipeline*>
-@@ -142,6 +144,22 @@
+@@ -80,6 +84,24 @@
+ }
+ 
+ std::optional<const AbstractPipeline*>
++CustomShaderCache::GetPipelineWait(const VideoCommon::GXPipelineUid& uid,
++                                   const CustomShaderInstance& custom_shaders,
++                                   const AbstractPipelineConfig& pipeline_config)
++{
++  if (auto r = GetPipelineAsync(uid, custom_shaders, pipeline_config))
++    return r;
++  const auto t0 = std::chrono::steady_clock::now();
++  while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(1500))
++  {
++    m_async_shader_compiler->RetrieveWorkItems();
++    if (auto holder = m_pipeline_cache.GetHolder(uid, custom_shaders); holder && !holder->pending)
++      return holder->value.get();
++    std::this_thread::sleep_for(std::chrono::microseconds(200));
++  }
++  return std::nullopt;
++}
++
++std::optional<const AbstractPipeline*>
+ CustomShaderCache::GetPipelineAsync(const VideoCommon::GXUberPipelineUid& uid,
+                                     const CustomShaderInstance& custom_shaders,
+                                     const AbstractPipelineConfig& pipeline_config)
+@@ -142,6 +164,22 @@
      {
        if (m_stages_ready)
        {
@@ -23508,7 +26635,7 @@ HcmV?d00001
          m_pipeline = g_gfx->CreatePipeline(m_config);
        }
        return true;
-@@ -151,6 +169,8 @@
+@@ -151,6 +189,8 @@
      {
        if (m_stages_ready)
        {
@@ -23517,7 +26644,7 @@ HcmV?d00001
          m_shader_cache->NotifyPipelineFinished(m_iterator, std::move(m_pipeline));
        }
        else
-@@ -164,6 +184,7 @@
+@@ -164,6 +204,7 @@
  
    private:
      CustomShaderCache* m_shader_cache;
@@ -23525,7 +26652,7 @@ HcmV?d00001
      std::unique_ptr<AbstractPipeline> m_pipeline;
      VideoCommon::GXPipelineUid m_uid;
      PipelineIterator m_iterator;
-@@ -357,8 +378,14 @@
+@@ -357,8 +398,14 @@
  CustomShaderCache::CompilePixelShader(const PixelShaderUid& uid,
                                        const CustomShaderInstance& custom_shaders) const
  {
@@ -23551,7 +26678,19 @@ HcmV?d00001
  
  #include "Common/HookableEvent.h"
  
-@@ -106,6 +107,10 @@
+@@ -49,6 +50,11 @@
+   GetPipelineAsync(const VideoCommon::GXPipelineUid& uid,
+                    const CustomShaderInstance& custom_shaders,
+                    const AbstractPipelineConfig& pipeline_config);
++  // Evolution Racing lit17s35: Synchronous compile mode - wait (up to 1.5 s) for this specialized custom pipeline instead
++  // of drawing the plain one meanwhile (first frames after a load: ungraded night signage, pilot icons)
++  std::optional<const AbstractPipeline*>
++  GetPipelineWait(const VideoCommon::GXPipelineUid& uid, const CustomShaderInstance& custom_shaders,
++                  const AbstractPipelineConfig& pipeline_config);
+   std::optional<const AbstractPipeline*>
+   GetPipelineAsync(const VideoCommon::GXUberPipelineUid& uid,
+                    const CustomShaderInstance& custom_shaders,
+@@ -106,6 +112,10 @@
      }
    };
  
@@ -24152,7 +27291,7 @@ HcmV?d00001
    ImGui::Render();
 --- a/Source/Core/VideoCommon/PC5090Menu.cpp
 +++ b/Source/Core/VideoCommon/PC5090Menu.cpp
-@@ -0,0 +1,766 @@
+@@ -0,0 +1,926 @@
 +// Copyright 2026 Evolution Racing (Evolution Racing Dolphin)
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -24205,7 +27344,7 @@ HcmV?d00001
 +};
 +constexpr Opt WEATHER[] = {{"Track default", -1}, {"None", 0},          {"Rain", 1},
 +                           {"Snowstorm", 5},      {"Ion storm", 7},     {"Meteor shower", 8},
-+                           {"Plasma rain", 9},    {"Solar flare", 10}};
++                           {"Plasma rain", 9},    {"Solar flare", 10},  {"Fire tornadoes", 13}};
 +constexpr int N_WEATHER = sizeof(WEATHER) / sizeof(WEATHER[0]);
 +constexpr const char* INTENSITY[] = {"Light", "Normal", "Heavy"};
 +constexpr float INTENSITY_VAL[] = {0.35f, 0.6f, 1.0f};  // the builder's default is 0.6 (= Normal)
@@ -24253,7 +27392,25 @@ HcmV?d00001
 +int s_dir = 0;            // 0 none, 1 up, 2 down, 3 left, 4 right
 +std::chrono::steady_clock::time_point s_repeat;
 +
-+std::string s_lab_z = "Z";  // the button the player presses for GC Z (port 1 mapping), read when the panel shows
++std::string s_lab_z = "Z";
++
++// ---- lit17s29m NATIVE PAUSE LINES (fzgx-custom scripts/nativemenu.py): the disc's own pause menu carries Weather /
++// Intensity / Time / Quality lines in the game's font. The game keeps the choices in a block of its main REL
++// ([0x800030C8] + 0x7CD98, "PMN1"); this Dolphin writes the handshake (the lines only show with it: stock Dolphin
++// keeps the stock menu), the number of options per line and the line texts, and applies the choices. GFX.ini
++// [PC5090] WeatherMenu = Native (default: native lines, no overlay) | Overlay (the lit17s28 panel, no native lines).
++const Config::Info<std::string> GFX_PC5090_WEATHER_MENU{{Config::System::GFX, "PC5090", "WeatherMenu"}, "Native"};
++constexpr u32 NM_OFF = 0x7CD98, NM_MAGIC = 0x504D4E31 /* PMN1 */, NM_HS = 0x45564F4C /* EVOL */;
++constexpr u32 NM_CNT = 8, NM_SEL = 0xC, NM_CHG = 0x12, NM_INIT = 0x13, NM_LBL = 0x30, NM_LBL_LEN = 40;
++constexpr const char* NM_INTENSITY[] = {"Track", "Light", "Normal", "Heavy"};
++constexpr const char* NM_TYPE[] = {"Clear",     "Rain",          "Storm",       "Snow",        "Sleet",
++                                   "Snowstorm", "Ice storm",     "Ion storm",   "Meteor shower", "Plasma rain",
++                                   "Solar flare", "Ash",         "Aurora",      "Fire tornadoes"};
++std::atomic<bool> s_nm_on{false};  // the disc has the lines and this Dolphin serves them
++std::atomic<int> s_nm_w{0}, s_nm_i{0}, s_nm_t{0};  // the choices (WEATHER / NM_INTENSITY / TOD indices)
++int s_nm_q = -1;          // quality choice last applied (0 low, 1 ultra)
++int s_nm_chg = -1;        // the game's change counter
++u32 s_nm_addr = 0;        // block address last logged  // the button the player presses for GC Z (port 1 mapping), read when the panel shows
 +
 +// the physical button behind a GC button on port 1: an Xbox-style SDL pad shows its own name (Z on Shoulder R -> RB)
 +std::string PadLabel(const char* gc_name)
@@ -24303,6 +27460,110 @@ HcmV?d00001
 +  std::memcpy(&v, p, 2);
 +  *o = Common::swap16(v);
 +  return true;
++}
++
++bool OverlayOn()
++{
++  std::string m = Config::Get(GFX_PC5090_WEATHER_MENU);
++  for (auto& ch : m)
++    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
++  return m == "overlay";
++}
++
++bool QualityUltra();
++
++// CPU thread (every pad poll of port 1): the native pause lines' block
++void NativeSync(bool serve)
++{
++  auto& memory = Core::System::GetInstance().GetMemory();
++  u32 rel = 0, magic = 0;
++  if (!Read32(0x800030C8, &rel) || rel < 0x80000000u || rel >= 0x81700000u ||
++      !Read32(rel + NM_OFF, &magic) || magic != NM_MAGIC)
++  {
++    s_nm_on = false;
++    return;
++  }
++  const u32 a = rel + NM_OFF;
++  u8* p = memory.GetPointerForRange(a, NM_LBL + 4 * NM_LBL_LEN);
++  if (!p)
++  {
++    s_nm_on = false;
++    return;
++  }
++  if (a != s_nm_addr)
++  {
++    s_nm_addr = a;
++    std::fprintf(stderr, "NATIVEMENU block at %08x (%s)\n", a, serve ? "native lines" : "overlay mode: lines off");
++  }
++  if (!serve)
++  {
++    std::memset(p + 4, 0, 4);  // no handshake: the game adds no lines
++    s_nm_on = false;
++    return;
++  }
++  const bool wx = WeatherAvailable(), night = NightAvailable(), ultra = UltraAvailable();
++  const u8 cnt[4] = {static_cast<u8>(wx ? N_WEATHER : 0), static_cast<u8>(wx ? 4 : 0),
++                     static_cast<u8>(night ? N_TOD : 0), static_cast<u8>(wx && ultra ? 2 : 0)};
++  std::memcpy(p + NM_CNT, cnt, 4);
++  if (p[NM_INIT] == 0)  // a new boot: quality starts as GFX.ini has it
++  {
++    p[NM_SEL + 3] = QualityUltra() ? 1 : 0;
++    p[NM_INIT] = 1;
++    s_nm_q = p[NM_SEL + 3];
++    s_nm_chg = -1;
++  }
++  for (int i = 0; i < 4; i++)
++    if (cnt[i] && p[NM_SEL + i] >= cnt[i])
++      p[NM_SEL + i] = 0;
++  s_nm_w = p[NM_SEL + 0] < N_WEATHER ? p[NM_SEL + 0] : 0;
++  s_nm_i = p[NM_SEL + 1] < 4 ? p[NM_SEL + 1] : 0;
++  s_nm_t = p[NM_SEL + 2] < N_TOD ? p[NM_SEL + 2] : 0;
++  const int q = p[NM_SEL + 3] ? 1 : 0;
++  if (cnt[3] && q != s_nm_q)
++  {
++    Config::SetBaseOrCurrent(Config::GFX_PC5090_WEATHER_QUALITY, std::string(q ? "Ultra" : "Low"));
++    s_nm_q = q;
++  }
++  const bool cur_ultra = QualityUltra();
++  // the line texts (the game's font: printable ASCII)
++  char lab[4][NM_LBL_LEN];
++  const int tw = s_track_wtype.load(), tl = s_track_look.load();
++  const int w = s_nm_w.load(), t = s_nm_t.load();
++  if (WEATHER[w].code < 0)
++  {
++    if (tw >= 0 && tw < static_cast<int>(sizeof(NM_TYPE) / sizeof(NM_TYPE[0])))
++      std::snprintf(lab[0], NM_LBL_LEN, "Weather: Track - %s", NM_TYPE[tw]);
++    else
++      std::snprintf(lab[0], NM_LBL_LEN, "Weather: Track");
++  }
++  else
++    std::snprintf(lab[0], NM_LBL_LEN, "Weather: %s", NM_TYPE[WEATHER[w].code]);
++  std::snprintf(lab[1], NM_LBL_LEN, "Intensity: %s", NM_INTENSITY[s_nm_i.load()]);
++  if (TOD[t].code < 0)
++  {
++    if (tl >= 0 && tl <= 2)
++      std::snprintf(lab[2], NM_LBL_LEN, "Time: Track - %s", LOOK_NAME[tl]);
++    else
++      std::snprintf(lab[2], NM_LBL_LEN, "Time: Track");
++  }
++  else
++    std::snprintf(lab[2], NM_LBL_LEN, "Time: %s", TOD[t].name);
++  std::snprintf(lab[3], NM_LBL_LEN, "Quality: %s", cur_ultra ? "Ultra" : "Low");
++  for (int i = 0; i < 4; i++)
++  {
++    u8* d = p + NM_LBL + i * NM_LBL_LEN;
++    if (std::memcmp(d, lab[i], std::strlen(lab[i]) + 1) != 0)
++      std::memcpy(d, lab[i], std::strlen(lab[i]) + 1);
++  }
++  const u32 hs = Common::swap32(NM_HS);
++  std::memcpy(p + 4, &hs, 4);
++  s_nm_on = true;
++  if (p[NM_CHG] != s_nm_chg)
++  {
++    if (s_nm_chg >= 0)
++      std::fprintf(stderr, "NATIVEMENU set: %s | %s | %s | %s\n", lab[0], lab[1], lab[2], lab[3]);
++    s_nm_chg = p[NM_CHG];
++  }
 +}
 +
 +bool RowShown(int r)
@@ -24630,6 +27891,13 @@ HcmV?d00001
 +
 +int NightOverride(u32 slot, int track_look)
 +{
++  if (s_nm_on.load())
++  {
++    s_track_look = track_look;
++    return TOD[s_nm_t.load()].code;
++  }
++  if (!OverlayOn())
++    return -1;
 +  if (slot == s_slot.load())
 +    s_track_look = track_look;
 +  std::lock_guard lk(s_mu);
@@ -24641,6 +27909,28 @@ HcmV?d00001
 +
 +void WeatherOverride(u32 slot, std::array<float, 4>* w)
 +{
++  if (s_nm_on.load())
++  {
++    s_track_wtype = static_cast<int>((*w)[0] + 0.5f);
++    const int type = WEATHER[s_nm_w.load()].code, in = s_nm_i.load();
++    const bool track_wx = (*w)[0] > 0.5f;
++    if (type < 0)
++    {
++      if (track_wx && in > 0)
++        (*w)[1] = INTENSITY_VAL[in - 1];  // the track's weather at the picked intensity
++      return;
++    }
++    if (type == 0)
++    {
++      *w = {};
++      return;
++    }
++    *w = {static_cast<float>(type), in > 0 ? INTENSITY_VAL[in - 1] : 0.6f, track_wx ? (*w)[2] : 0.0f,
++          track_wx ? (*w)[3] : 0.0f};
++    return;
++  }
++  if (!OverlayOn())
++    return;
 +  if (slot == s_slot.load())
 +    s_track_wtype = static_cast<int>((*w)[0] + 0.5f);
 +  std::lock_guard lk(s_mu);
@@ -24665,6 +27955,10 @@ HcmV?d00001
 +{
 +  if (chan != 0 || !s)
 +    return;
++  const bool overlay = OverlayOn();
++  NativeSync(!overlay);
++  if (!overlay)
++    return;  // lit17s29m: the native pause lines; the overlay panel is off (GFX.ini [PC5090] WeatherMenu = Overlay)
 +  const u16 raw = s->button;
 +  const u16 pressed = raw & ~s_prev;
 +  s_prev = raw;
@@ -24777,6 +28071,11 @@ HcmV?d00001
 +
 +void Draw(float W, float H)
 +{
++  if (!OverlayOn())
++  {
++    s_visible = false;
++    return;
++  }
 +  Update();
 +  if (!s_visible.load() || W < 64 || H < 64)
 +    return;
@@ -24921,7 +28220,7 @@ HcmV?d00001
 +}  // namespace PC5090Menu
 --- a/Source/Core/VideoCommon/PC5090Menu.h
 +++ b/Source/Core/VideoCommon/PC5090Menu.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,42 @@
 +// Copyright 2026 Evolution Racing (Evolution Racing Dolphin)
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -24929,6 +28228,10 @@ HcmV?d00001
 +// game's pause menu (ImGui, over the game). Z on the controller focuses it; while it has focus the game sees a neutral
 +// pad (Start still resumes). The choices override the disc's WTH1 / TOD1 entry of that course slot for this session
 +// ("Track default" = what the builder set); they are remembered per course slot until Dolphin closes.
++//
++// lit17s29m: by default the panel is OFF and the disc's own pause menu carries native Weather / Intensity / Time /
++// Quality lines (fzgx-custom scripts/nativemenu.py); FilterPad serves their RAM block every poll. GFX.ini [PC5090]
++// WeatherMenu = Overlay brings the panel back (and hides the native lines).
 +
 +#pragma once
 +
@@ -25869,7 +29172,7 @@ HcmV?d00001
            }
  
            const float custom_tex_scale = cache_entry->GetWidth() / float(cache_entry->native_width);
-@@ -615,10 +813,24 @@
+@@ -615,10 +813,26 @@
      std::vector<std::string> custom_pixel_texture_names;
      std::span<u8> custom_pixel_shader_uniforms;
      bool skip = false;
@@ -25884,6 +29187,8 @@ HcmV?d00001
 +    const AbstractTexture* damage_texture = nullptr;
 +    const AbstractTexture* hull_texture = nullptr;  // Evolution Racing dolphin-lit17c
 +    const AbstractTexture* surface_texture = nullptr;  // Evolution Racing dolphin-lit17s
++    DamageFx::NeonDrawBegin();  // Evolution Racing lit17s33n
++    PC5090Material::BeginDraw();  // Evolution Racing lit17s34m
      for (size_t i = 0; i < texture_names.size(); i++)
      {
        GraphicsModActionData::DrawStarted draw_started{texture_units, &skip, &custom_pixel_shader,
@@ -25895,7 +29200,7 @@ HcmV?d00001
        for (const auto& action : g_graphics_mod_manager->GetDrawStartedActions(texture_names[i]))
        {
          action->OnDrawStarted(&draw_started);
-@@ -630,6 +842,31 @@
+@@ -630,6 +844,31 @@
          custom_pixel_shader = std::nullopt;
        }
      }
@@ -25927,7 +29232,7 @@ HcmV?d00001
  
      // Now the vertices can be flushed to the GPU. Everything following the CommitBuffer() call
      // must be careful to not upload any utility vertices, as the binding will be lost otherwise.
-@@ -637,10 +874,108 @@
+@@ -637,10 +876,152 @@
      if (num_indices == 0)
        return;
  
@@ -25967,13 +29272,56 @@ HcmV?d00001
 +        }
 +      }
 +      std::copy(&xfmem.posMatrices[mtx * 4], &xfmem.posMatrices[mtx * 4] + 12, M.begin());
++      // Evolution Racing lit17s33n NEON: a light-source draw hands its vertices (model space, buffer order = strip rows)
++      if (DamageFx::NeonPending())
++      {
++        DamageFx::NeonSetBlend(bpmem.blendmode.blend_enable);
++        if (DamageFx::NeonProbePending() && fmt && nv > 0)
++        {
++          const PortableVertexDeclaration& decl = fmt->GetVertexDeclaration();
++          if (decl.position.enable && decl.position.type == ComponentFormat::Float && decl.stride > 0 &&
++              decl.position.components >= 3 && nv <= 8192)
++          {
++            const u32 stride = static_cast<u32>(decl.stride);
++            const u8* first = m_cur_buffer_pointer - static_cast<size_t>(nv) * stride;
++            std::vector<std::array<float, 3>> pts(nv);
++            for (u32 k = 0; k < nv; k++)
++              std::memcpy(pts[k].data(), first + static_cast<size_t>(k) * stride + decl.position.offset,
++                          sizeof(float) * 3);
++            DamageFx::NeonAddRows(M, pts, bpmem.blendmode.blend_enable);
++          }
++        }
++      }
++      // Evolution Racing lit17s33p PADPLATE: a board draw hands its vertex centroid (model space)
++      if (DamageFx::PadBoardPending() && fmt && nv > 0)
++      {
++        const PortableVertexDeclaration& decl = fmt->GetVertexDeclaration();
++        if (decl.position.enable && decl.position.type == ComponentFormat::Float && decl.stride > 0 &&
++            decl.position.components >= 3 && nv <= 8192)
++        {
++          const u32 stride = static_cast<u32>(decl.stride);
++          const u8* first = m_cur_buffer_pointer - static_cast<size_t>(nv) * stride;
++          std::array<float, 3> c{};
++          for (u32 k = 0; k < nv; k++)
++          {
++            float q[3];
++            std::memcpy(q, first + static_cast<size_t>(k) * stride + decl.position.offset, sizeof(float) * 3);
++            for (int j = 0; j < 3; j++)
++              c[j] += q[j] / static_cast<float>(nv);
++          }
++          DamageFx::PadBoardCentroid(c);
++        }
++      }
 +      DamageFx::FillDrawUniforms(M, &m_damage_uniforms);
 +      custom_pixel_shader_uniforms = std::span<u8>(m_damage_uniforms.data(), m_damage_uniforms.size());
 +    }
 +
 +    // Evolution Racing lit17s21: the HUD (orthographic draws) starts: composite the queued half-res effects first
 +    if (xfmem.projection.type == ProjectionType::Orthographic)
++    {
 +      EmitQuadsAction::FlushHalfRes();
++      PC5090Material::OrthoDraw();  // Evolution Racing lit17s34m: the machine metal probe (finished 3D, before the HUD)
++    }
 +    // Evolution Racing emit-quads hook: measure the target draw before its vertices are committed.
 +    EmitQuadsAnchor emit_anchor;
 +    if (!quad_emitters.empty())
@@ -26033,10 +29381,11 @@ HcmV?d00001
 +      g_gfx->SetTexture(10, surface_texture);
 +      g_gfx->SetSamplerState(10, ss);
 +    }
++    PC5090Material::Bind();  // Evolution Racing lit17s34m: env probe at samplers 11 / 12 for "env_probe" draws
  
      if (!skip)
      {
-@@ -649,20 +984,64 @@
+@@ -649,20 +1030,64 @@
        if (m_current_pipeline_object)
        {
          const AbstractPipeline* pipeline_object = m_current_pipeline_object;
@@ -26104,7 +29453,7 @@ HcmV?d00001
      // Even if we skip the draw, emulated state should still be impacted
      OnDraw();
  
-@@ -1063,8 +1442,8 @@
+@@ -1063,8 +1488,8 @@
    // Now we can upload uniforms, as nothing else will override them.
    geometry_shader_manager.SetConstants(primitive_type);
    pixel_shader_manager.SetConstants();
@@ -26115,7 +29464,7 @@ HcmV?d00001
    {
      pixel_shader_manager.custom_constants_dirty = true;
    }
-@@ -1103,8 +1482,10 @@
+@@ -1103,8 +1528,10 @@
      const CustomPixelShaderContents& custom_pixel_shader_contents,
      const VideoCommon::GXPipelineUid& current_pipeline_config,
      const VideoCommon::GXUberPipelineUid& current_uber_pipeline_config,
@@ -26127,7 +29476,7 @@ HcmV?d00001
    if (current_pipeline)
    {
      if (!custom_pixel_shader_contents.shaders.empty())
-@@ -1119,6 +1500,8 @@
+@@ -1119,6 +1546,8 @@
          if (auto pipeline = m_custom_shader_cache->GetPipelineAsync(
                  current_pipeline_config, custom_shaders, current_pipeline->m_config))
          {
@@ -26136,7 +29485,7 @@ HcmV?d00001
            return *pipeline;
          }
        }
-@@ -1132,6 +1515,8 @@
+@@ -1132,6 +1561,8 @@
            if (auto pipeline = m_custom_shader_cache->GetPipelineAsync(
                    current_pipeline_config, custom_shaders, current_pipeline->m_config))
            {
@@ -26145,7 +29494,7 @@ HcmV?d00001
              return *pipeline;
            }
          }
-@@ -1150,6 +1535,8 @@
+@@ -1150,6 +1581,8 @@
          if (auto pipeline = m_custom_shader_cache->GetPipelineAsync(
                  current_pipeline_config, custom_shaders, current_pipeline->m_config))
          {
