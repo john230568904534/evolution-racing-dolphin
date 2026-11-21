@@ -13643,6 +13643,42 @@ n#BBd<r1E|0)Bo$~fbTwQpw`$4RQ>lSVg6$!o*cR+r=I@_CVCBu
 literal 0
 HcmV?d00001
 
+--- a/Source/Core/Common/Version.cpp
++++ b/Source/Core/Common/Version.cpp
+@@ -41,6 +41,22 @@
+   return scm_rev_str;
+ }
+ 
++// Evolution Racing member build id (one id for the Linux and the Windows build of the same source)
++#ifndef ER_BUILD_ID
++#define ER_BUILD_ID "lit17s35mv"
++#endif
++const std::string& GetERBuildStr()
++{
++  static const std::string s = ER_BUILD_ID;
++  return s;
++}
++
++const std::string& GetERVersionStr()
++{
++  static const std::string s = "Evolution Racing Dolphin " ER_BUILD_ID;
++  return s;
++}
++
+ const std::string& GetScmRevGitStr()
+ {
+   static const std::string scm_rev_git_str = SCM_REV_STR;
+--- a/Source/Core/Common/Version.h
++++ b/Source/Core/Common/Version.h
+@@ -17,4 +17,8 @@
+ const std::string& GetScmUpdateTrackStr();
+ const std::string& GetNetplayDolphinVer();
+ int GetScmCommitsAheadMaster();
++// Evolution Racing: the member build id shown in the window title, the About box and at game start ("Evolution Racing
++// Dolphin lit17s35mv"); the hub compares it with the build its effects packs and tracks need
++const std::string& GetERBuildStr();
++const std::string& GetERVersionStr();
+ }  // namespace Common
 --- a/Source/Core/Core/CMakeLists.txt
 +++ b/Source/Core/Core/CMakeLists.txt
 @@ -57,6 +57,8 @@
@@ -13709,14 +13745,49 @@ HcmV?d00001
  #ifdef USE_MEMORYWATCHER
    if (s_memory_watcher)
    {
-@@ -347,6 +350,7 @@
+@@ -347,6 +350,33 @@
      if (delete_savestate)
        File::Delete(*savestate_path);
    }
 +  ERTest::OnBoot();  // Evolution Racing Test in game: this boot's test takes over
++  {
++    // Evolution Racing: the build id at every game start, then the lines of User/Config/er-status.txt (what the start
++    // script installed: effects pack, HD textures, quality preset), so a member sees in game what is loaded
++    DisplayMessage(Common::GetERVersionStr(), 9000);
++    std::fprintf(stderr, "ERSTATUS %s\n", Common::GetERVersionStr().c_str());
++    std::string status;
++    if (File::ReadFileToString(File::GetUserPath(D_CONFIG_IDX) + "er-status.txt", status))
++    {
++      size_t a = 0;
++      for (int n = 0; a < status.size() && n < 6; ++n)
++      {
++        size_t b = status.find('\n', a);
++        if (b == std::string::npos)
++          b = status.size();
++        std::string line = status.substr(a, b - a);
++        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
++          line.pop_back();
++        if (!line.empty())
++        {
++          DisplayMessage(line.substr(0, 160), 9000);
++          std::fprintf(stderr, "ERSTATUS %s\n", line.c_str());  // the same lines in the log (support reports)
++        }
++        a = b + 1;
++      }
++    }
++  }
  
    {
      std::unique_lock core_lock(s_core_mutex);
+@@ -899,7 +929,7 @@
+       "{} {} | {} | {}", system.GetPowerPC().GetCPUName(), system.IsDualCoreMode() ? "DC" : "SC",
+       g_video_backend->GetDisplayName(), Config::Get(Config::MAIN_DSP_HLE) ? "HLE" : "LLE");
+ 
+-  std::string message = fmt::format("{} | {}", Common::GetScmRevStr(), SSettings);
++  std::string message = fmt::format("{} | {}", Common::GetERVersionStr(), SSettings);
+   if (Config::Get(Config::MAIN_SHOW_ACTIVE_TITLE))
+   {
+     const std::string& title = SConfig::GetInstance().GetTitleDescription();
 --- a/Source/Core/Core/ERTest.cpp
 +++ b/Source/Core/Core/ERTest.cpp
 @@ -0,0 +1,1215 @@
@@ -15022,6 +15093,17 @@ HcmV?d00001
  
    // Our GCAdapter code sets PAD_GET_ORIGIN when a new device has been connected.
    // Watch for this to calibrate real controllers on connection.
+--- a/Source/Core/DolphinQt/AboutDialog.cpp
++++ b/Source/Core/DolphinQt/AboutDialog.cpp
+@@ -68,7 +68,7 @@
+ <a href='https://forums.dolphin-emu.org/'>%SUPPORT%</a>
+ )")
+           .replace(QStringLiteral("%VERSION_STRING%"),
+-                   QString::fromUtf8(Common::GetScmDescStr().c_str()))
++                   QString::fromUtf8((Common::GetERVersionStr() + " (Dolphin " + Common::GetScmDescStr() + ")").c_str()))
+           .replace(QStringLiteral("%BRANCH%"),
+                    // i18n: "Branch" means the version control term, not a literal tree branch.
+                    tr("Branch: %1").arg(branch_str))
 --- a/Source/Core/DolphinQt/Main.cpp
 +++ b/Source/Core/DolphinQt/Main.cpp
 @@ -28,6 +28,7 @@
@@ -15086,6 +15168,15 @@ HcmV?d00001
  #include "Core/CommonTitles.h"
  #include "Core/Config/AchievementSettings.h"
  #include "Core/Config/MainSettings.h"
+@@ -217,7 +220,7 @@
+                        const std::string& movie_path)
+     : QMainWindow(nullptr), m_system(system)
+ {
+-  setWindowTitle(QString::fromStdString(Common::GetScmRevStr()));
++  setWindowTitle(QString::fromStdString(Common::GetERVersionStr()));
+   setWindowIcon(Resources::GetAppIcon());
+   setUnifiedTitleAndToolBarOnMac(true);
+   setAcceptDrops(true);
 @@ -1166,6 +1169,46 @@
        paths, boot_session_data ? std::move(*boot_session_data) : BootSessionData()));
  }
@@ -15133,6 +15224,15 @@ HcmV?d00001
  void MainWindow::StartGame(std::unique_ptr<BootParameters>&& parameters)
  {
    if (parameters && std::holds_alternative<BootParameters::Disc>(parameters->parameters))
+@@ -1301,7 +1344,7 @@
+     m_rendering_to_main = false;
+     m_stack->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+     disconnect(Host::GetInstance(), &Host::RequestTitle, this, &MainWindow::setWindowTitle);
+-    setWindowTitle(QString::fromStdString(Common::GetScmRevStr()));
++    setWindowTitle(QString::fromStdString(Common::GetERVersionStr()));
+   }
+ 
+   // The following code works around a driver bug that would lead to Dolphin crashing when changing
 --- a/Source/Core/DolphinQt/MainWindow.h
 +++ b/Source/Core/DolphinQt/MainWindow.h
 @@ -84,6 +84,8 @@
@@ -15640,7 +15740,7 @@ HcmV?d00001
  std::optional<GraphicsTargetConfig> DeserializeTargetFromConfig(const picojson::object& obj);
 --- a/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/CustomPipelineAction.cpp
 +++ b/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/CustomPipelineAction.cpp
-@@ -3,10 +3,20 @@
+@@ -3,12 +3,190 @@
  
  #include "VideoCommon/GraphicsModSystem/Runtime/Actions/CustomPipelineAction.h"
  
@@ -15660,8 +15760,178 @@ HcmV?d00001
 +
  #include "VideoCommon/Resources/CustomResourceManager.h"
  
++// ---- Evolution Racing lit17s40p PERF: shared texture loads + worker-decoded metal masks
++#include <atomic>
++#include <condition_variable>
++#include <deque>
++#include <map>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++struct P40MaskJob
++{
++  std::string file;
++  std::atomic<int> state{0};  // 0 queued / decoding, 1 ready, 2 failed
++  u32 width = 0, height = 0;
++  std::vector<std::vector<u8>> levels;
++};
++
++namespace
++{
++// the surface layer texture's box-filtered mip chain (the lit17s loop, unchanged: the same bytes)
++std::vector<std::vector<u8>> P40Mips(const u8* rgba, size_t size, u32 width, u32 height)
++{
++  std::vector<std::vector<u8>> out;
++  u32 levels = 1;
++  while ((width >> levels) > 0 && (height >> levels) > 0 && levels < 12)
++    levels++;
++  out.emplace_back(rgba, rgba + size);
++  u32 w = width, h = height;
++  for (u32 l = 1; l < levels; l++)
++  {
++    const std::vector<u8>& cur = out.back();
++    const u32 nw = std::max(w / 2, 1u), nh = std::max(h / 2, 1u);
++    std::vector<u8> nxt(static_cast<size_t>(nw) * nh * 4);
++    for (u32 y = 0; y < nh; y++)
++      for (u32 x = 0; x < nw; x++)
++        for (u32 c = 0; c < 4; c++)
++        {
++          const u32 x0 = std::min(2 * x, w - 1), x1 = std::min(2 * x + 1, w - 1);
++          const u32 y0 = std::min(2 * y, h - 1), y1 = std::min(2 * y + 1, h - 1);
++          const u32 sum = cur[(static_cast<size_t>(y0) * w + x0) * 4 + c] + cur[(static_cast<size_t>(y0) * w + x1) * 4 + c] +
++                          cur[(static_cast<size_t>(y1) * w + x0) * 4 + c] + cur[(static_cast<size_t>(y1) * w + x1) * 4 + c];
++          nxt[(static_cast<size_t>(y) * nw + x) * 4 + c] = static_cast<u8>((sum + 2) / 4);
++        }
++    out.push_back(std::move(nxt));
++    w = nw;
++    h = nh;
++  }
++  return out;
++}
++
++bool P40Decode(const std::string& file, Common::UniqueBuffer<u8>* rgba, u32* width, u32* height)
++{
++  std::string png;
++  return File::ReadFileToString(file, png) &&
++         Common::LoadPNG(std::span(reinterpret_cast<const u8*>(png.data()), png.size()), rgba, width, height) &&
++         *width > 0 && *height > 0;
++}
++
++std::shared_ptr<AbstractTexture> P40Upload(const std::vector<std::vector<u8>>& levels, u32 width, u32 height,
++                                           std::string_view name)
++{
++  auto t = std::shared_ptr<AbstractTexture>(
++      g_gfx->CreateTexture(TextureConfig(width, height, static_cast<u32>(levels.size()), 1, 1, AbstractTextureFormat::RGBA8,
++                                         0, AbstractTextureType::Texture_2DArray),
++                           name));
++  if (!t)
++    return nullptr;
++  u32 w = width, h = height;
++  for (u32 l = 0; l < levels.size(); l++)
++  {
++    t->Load(l, w, h, w, levels[l].data(), levels[l].size());
++    w = std::max(w / 2, 1u);
++    h = std::max(h / 2, 1u);
++  }
++  return t;
++}
++
++// one texture per file for every action (damage_detail.png / hull_heat.png were decoded and kept once PER action)
++std::shared_ptr<AbstractTexture> P40Shared(const std::string& file, bool mips, std::string_view name)
++{
++  static std::map<std::string, std::weak_ptr<AbstractTexture>> cache;
++  const std::string key = file + (mips ? "#mips" : "");
++  if (const auto it = cache.find(key); it != cache.end())
++    if (auto t = it->second.lock())
++      return t;
++  Common::UniqueBuffer<u8> rgba;
++  u32 width = 0, height = 0;
++  if (!P40Decode(file, &rgba, &width, &height))
++    return nullptr;
++  std::vector<std::vector<u8>> levels;
++  if (mips)
++    levels = P40Mips(rgba.data(), rgba.size(), width, height);
++  else
++    levels.emplace_back(rgba.data(), rgba.data() + rgba.size());
++  auto t = P40Upload(levels, width, height, name);
++  if (t)
++    cache[key] = t;
++  return t;
++}
++
++// 2 worker threads decode the metal masks (PNG + mips: CPU only); the video thread uploads a finished one
++std::mutex s_p40_mu;
++std::condition_variable s_p40_cv;
++std::deque<std::shared_ptr<P40MaskJob>> s_p40_queue;
++bool s_p40_started = false;
++
++void P40Worker()
++{
++  for (;;)
++  {
++    std::shared_ptr<P40MaskJob> job;
++    {
++      std::unique_lock lk(s_p40_mu);
++      s_p40_cv.wait(lk, [] { return !s_p40_queue.empty(); });
++      job = std::move(s_p40_queue.front());
++      s_p40_queue.pop_front();
++    }
++    Common::UniqueBuffer<u8> rgba;
++    u32 width = 0, height = 0;
++    if (job.use_count() > 1 && P40Decode(job->file, &rgba, &width, &height))
++    {
++      job->levels = P40Mips(rgba.data(), rgba.size(), width, height);
++      job->width = width;
++      job->height = height;
++      job->state.store(1, std::memory_order_release);
++    }
++    else
++    {
++      job->state.store(2, std::memory_order_release);
++    }
++  }
++}
++
++std::shared_ptr<P40MaskJob> P40Queue(const std::string& file)
++{
++  auto job = std::make_shared<P40MaskJob>();
++  job->file = file;
++  std::lock_guard lk(s_p40_mu);
++  if (!s_p40_started)
++  {
++    s_p40_started = true;
++    for (int i = 0; i < 2; i++)
++      std::thread(P40Worker).detach();
++  }
++  s_p40_queue.push_back(job);
++  s_p40_cv.notify_one();
++  return job;
++}
++
++// metal 0 / gloss 0 / coat 0 / height 1: the metal layer's "no material" (= the MachineMetal = Off look)
++const AbstractTexture* P40NeutralMask()
++{
++  static std::unique_ptr<AbstractTexture> t;
++  if (!t)
++  {
++    t = g_gfx->CreateTexture(TextureConfig(1, 1, 1, 1, 1, AbstractTextureFormat::RGBA8, 0,
++                                           AbstractTextureType::Texture_2DArray),
++                             "metal mask (neutral, lit17s40p)");
++    if (t)
++    {
++      const u8 px[4] = {0, 0, 0, 255};
++      t->Load(0, 1, 1, 1, px, sizeof(px));
++    }
++  }
++  return t.get();
++}
++}  // namespace
++
  std::unique_ptr<CustomPipelineAction>
-@@ -19,6 +29,80 @@
+ CustomPipelineAction::Create(std::shared_ptr<VideoCommon::CustomAssetLibrary> library)
+ {
+@@ -19,6 +197,82 @@
  CustomPipelineAction::Create(const picojson::value& json_data,
                               std::shared_ptr<VideoCommon::CustomAssetLibrary> library)
  {
@@ -15683,6 +15953,8 @@ HcmV?d00001
 +      ERROR_LOG_FMT(VIDEO, "custom pipeline: cannot read '{}'", *vs_file);
 +      return nullptr;
 +    }
++    if (const auto g = ReadStringFromJson(obj, "group_switch"))
++      action->m_group_switch = *g;  // lit17s35mv: GFX.ini [PC5090] Fx<Group> = Off draws the stock look
 +    if (const auto d = ReadBoolFromJson(obj, "damage"); d && *d)
 +      action->m_damage = true;
 +    if (const auto t = ReadStringFromJson(obj, "damage_texture_file"))
@@ -15742,7 +16014,7 @@ HcmV?d00001
    auto material_asset = ReadStringFromJson(json_data.get<picojson::object>(), "material_asset");
  
    if (!material_asset)
-@@ -36,15 +120,170 @@
+@@ -36,15 +290,135 @@
  {
  }
  
@@ -15761,6 +16033,8 @@ HcmV?d00001
 +  if (!draw_started || !draw_started->custom_pixel_shader ||
 +      (m_draw_shader.empty() && m_draw_vertex_shader.empty()))
 +    return;
++  if (!m_group_switch.empty() && !ERFxSwitchOn(m_group_switch))
++    return;  // lit17s35mv: the member switched this effect group off (the stock draw)
 +  CustomPixelShader shader;
 +  shader.custom_shader = m_draw_shader_text;  // null = emulated process_fragment
 +  if (m_night_late)
@@ -15777,20 +16051,8 @@ HcmV?d00001
 +  shader.custom_vertex_shader = m_draw_vertex_shader_text;
 +  if (m_hull && !m_hull_texture_file.empty() && !m_hull_texture && !m_hull_texture_failed)
 +  {
-+    // Evolution Racing dolphin-lit17c: the hull effects texture (pixel sampler 9)
-+    std::string png;
-+    Common::UniqueBuffer<u8> rgba;
-+    u32 width = 0, height = 0;
-+    if (File::ReadFileToString(m_hull_texture_file, png) &&
-+        Common::LoadPNG(std::span(reinterpret_cast<const u8*>(png.data()), png.size()), &rgba, &width, &height) &&
-+        width > 0 && height > 0)
-+    {
-+      m_hull_texture = g_gfx->CreateTexture(TextureConfig(width, height, 1, 1, 1, AbstractTextureFormat::RGBA8, 0,
-+                                                          AbstractTextureType::Texture_2DArray),
-+                                            "hull fx texture");
-+      if (m_hull_texture)
-+        m_hull_texture->Load(0, width, height, width, rgba.data(), rgba.size());
-+    }
++    // Evolution Racing dolphin-lit17c: the hull effects texture (pixel sampler 9); lit17s40p: shared hull texture (one per file)
++    m_hull_texture = P40Shared(m_hull_texture_file, false, "hull fx texture");
 +    if (!m_hull_texture)
 +    {
 +      ERROR_LOG_FMT(VIDEO, "custom pipeline: cannot load hull texture '{}'", m_hull_texture_file);
@@ -15801,54 +16063,42 @@ HcmV?d00001
 +    *draw_started->hull_texture = m_hull_texture.get();
 +  if (!m_surface_texture_file.empty() && !m_surface_texture && !m_surface_texture_failed)
 +  {
-+    // Evolution Racing dolphin-lit17s: the surface layer texture (pixel sampler 10), with a box-filtered mip chain
-+    std::string png;
-+    Common::UniqueBuffer<u8> rgba;
-+    u32 width = 0, height = 0;
-+    if (File::ReadFileToString(m_surface_texture_file, png) &&
-+        Common::LoadPNG(std::span(reinterpret_cast<const u8*>(png.data()), png.size()), &rgba, &width, &height) &&
-+        width > 0 && height > 0)
++    // Evolution Racing dolphin-lit17s: the surface layer texture (pixel sampler 10), with a box-filtered mip chain.
++    // lit17s40p: metal masks (env_probe) decode on a worker (none while MachineMetal = Off); others shared per file
++    if (m_env_probe)
 +    {
-+      u32 levels = 1;
-+      while ((width >> levels) > 0 && (height >> levels) > 0 && levels < 12)
-+        levels++;
-+      m_surface_texture = g_gfx->CreateTexture(TextureConfig(width, height, levels, 1, 1, AbstractTextureFormat::RGBA8,
-+                                                             0, AbstractTextureType::Texture_2DArray),
-+                                               "surface layer texture");
-+      if (m_surface_texture)
++      if (!m_surface_job)
 +      {
-+        std::vector<u8> cur(rgba.data(), rgba.data() + rgba.size());
-+        u32 w = width, h = height;
-+        m_surface_texture->Load(0, w, h, w, cur.data(), cur.size());
-+        for (u32 l = 1; l < levels; l++)
-+        {
-+          const u32 nw = std::max(w / 2, 1u), nh = std::max(h / 2, 1u);
-+          std::vector<u8> nxt(static_cast<size_t>(nw) * nh * 4);
-+          for (u32 y = 0; y < nh; y++)
-+            for (u32 x = 0; x < nw; x++)
-+              for (u32 c = 0; c < 4; c++)
-+              {
-+                const u32 x0 = std::min(2 * x, w - 1), x1 = std::min(2 * x + 1, w - 1);
-+                const u32 y0 = std::min(2 * y, h - 1), y1 = std::min(2 * y + 1, h - 1);
-+                const u32 sum = cur[(static_cast<size_t>(y0) * w + x0) * 4 + c] + cur[(static_cast<size_t>(y0) * w + x1) * 4 + c] +
-+                                cur[(static_cast<size_t>(y1) * w + x0) * 4 + c] + cur[(static_cast<size_t>(y1) * w + x1) * 4 + c];
-+                nxt[(static_cast<size_t>(y) * nw + x) * 4 + c] = static_cast<u8>((sum + 2) / 4);
-+              }
-+          m_surface_texture->Load(l, nw, nh, nw, nxt.data(), nxt.size());
-+          cur = std::move(nxt);
-+          w = nw;
-+          h = nh;
-+        }
++        if (PC5090Material::MetalEnabled())
++          m_surface_job = P40Queue(m_surface_texture_file);
++      }
++      else if (const int st = m_surface_job->state.load(std::memory_order_acquire); st == 1)
++      {
++        m_surface_texture = P40Upload(m_surface_job->levels, m_surface_job->width, m_surface_job->height,
++                                      "surface layer texture");
++        m_surface_job.reset();
++        if (!m_surface_texture)
++          m_surface_texture_failed = true;
++      }
++      else if (st == 2)
++      {
++        m_surface_job.reset();
++        m_surface_texture_failed = true;
 +      }
 +    }
-+    if (!m_surface_texture)
++    else
 +    {
-+      ERROR_LOG_FMT(VIDEO, "custom pipeline: cannot load surface texture '{}'", m_surface_texture_file);
-+      m_surface_texture_failed = true;
++      m_surface_texture = P40Shared(m_surface_texture_file, true, "surface layer texture");
++      if (!m_surface_texture)
++        m_surface_texture_failed = true;
 +    }
++    if (m_surface_texture_failed)
++      ERROR_LOG_FMT(VIDEO, "custom pipeline: cannot load surface texture '{}'", m_surface_texture_file);
 +  }
 +  if (draw_started->surface_texture && m_surface_texture)
 +    *draw_started->surface_texture = m_surface_texture.get();
++  else if (draw_started->surface_texture && m_env_probe)
++    *draw_started->surface_texture = P40NeutralMask();  // lit17s40p: mask still decoding / MachineMetal = Off
 +  if (m_env_probe)
 +    PC5090Material::NoteProbeDraw();  // lit17s34m machine metal
 +  if (m_pad_board)
@@ -15886,20 +16136,7 @@ HcmV?d00001
 +      *draw_started->damage = true;
 +    if (!m_damage_texture_file.empty() && !m_damage_texture && !m_damage_texture_failed)
 +    {
-+      std::string png;
-+      Common::UniqueBuffer<u8> rgba;
-+      u32 width = 0, height = 0;
-+      if (File::ReadFileToString(m_damage_texture_file, png) &&
-+          Common::LoadPNG(std::span(reinterpret_cast<const u8*>(png.data()), png.size()), &rgba, &width,
-+                          &height) &&
-+          width > 0 && height > 0)
-+      {
-+        m_damage_texture = g_gfx->CreateTexture(TextureConfig(width, height, 1, 1, 1, AbstractTextureFormat::RGBA8, 0,
-+                                                              AbstractTextureType::Texture_2DArray),
-+                                                "damage detail texture");
-+        if (m_damage_texture)
-+          m_damage_texture->Load(0, width, height, width, rgba.data(), rgba.size());
-+      }
++      m_damage_texture = P40Shared(m_damage_texture_file, false, "damage detail texture");  // lit17s40p: shared
 +      if (!m_damage_texture)
 +      {
 +        ERROR_LOG_FMT(VIDEO, "custom pipeline: cannot load damage texture '{}'", m_damage_texture_file);
@@ -15935,7 +16172,7 @@ HcmV?d00001
  
  class CustomPipelineAction final : public GraphicsModAction
  {
-@@ -26,6 +29,40 @@
+@@ -26,6 +29,42 @@
                         std::string material_asset);
    void OnDrawStarted(GraphicsModActionData::DrawStarted*) override;
    void AfterEFB(GraphicsModActionData::PostEFB*) override;
@@ -15948,23 +16185,25 @@ HcmV?d00001
 +  // "damage_texture_file": a PNG bound to pixel sampler 8 (dm_tex in the shaders)
 +  bool m_damage = false;
 +  std::string m_damage_texture_file;
-+  std::unique_ptr<AbstractTexture> m_damage_texture;
++  std::shared_ptr<AbstractTexture> m_damage_texture;  // lit17s40p: shared per file
 +  bool m_damage_texture_failed = false;
 +  // Evolution Racing dolphin-lit17c: "hull_fx": true -> the same per-draw block (speed heat members, hx_*) without damage;
 +  // "hull_texture_file": a PNG bound to pixel sampler 9 (hx_tex)
 +  // Evolution Racing lit17s6 "night_late": true: a late world draw - the custom shader only once this frame's night pass ran
 +  // (else the draw stays the emulated one: no cost); "pixel_shader_file" = the night grade, "dusk_shader_file" = dusk
 +  bool m_night_late = false;
++  std::string m_group_switch;  // lit17s35mv: GFX.ini [PC5090] Fx<Group>
 +  std::string m_dusk_shader;
 +  ShaderText m_dusk_shader_text;
 +  bool m_hull = false;
 +  std::string m_hull_texture_file;
-+  std::unique_ptr<AbstractTexture> m_hull_texture;
++  std::shared_ptr<AbstractTexture> m_hull_texture;
 +  bool m_hull_texture_failed = false;
 +  // Evolution Racing dolphin-lit17s: "surface_texture_file": a PNG (mipmapped) bound to pixel sampler 10 (sf_tex)
 +  std::string m_surface_texture_file;
 +  bool m_env_probe = false;  // Evolution Racing lit17s34m: "env_probe": the machine metal scene probe at samplers 11 / 12
-+  std::unique_ptr<AbstractTexture> m_surface_texture;
++  std::shared_ptr<AbstractTexture> m_surface_texture;
++  std::shared_ptr<struct P40MaskJob> m_surface_job;  // lit17s40p mask job (worker decode, env_probe masks)
 +  bool m_surface_texture_failed = false;
 +  // Evolution Racing lit17s33n NEON: "neon": {"color": [r,g,b], "probe": bool, "chase": [base m/s, k x player speed],
 +  // "intensity": f} -> the DamageFx block with nn_* filled on this (track) draw; probe draws are neon light sources
@@ -15978,7 +16217,7 @@ HcmV?d00001
    std::shared_ptr<VideoCommon::CustomAssetLibrary> m_library;
 --- a/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.cpp
 +++ b/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.cpp
-@@ -0,0 +1,10086 @@
+@@ -0,0 +1,10101 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -18465,6 +18704,8 @@ HcmV?d00001
 +  }
 +  if (const auto v = ReadStringFromJson(obj, "switch"))
 +    action->m_switch = *v;
++  if (const auto v = ReadStringFromJson(obj, "group_switch"))
++    action->m_group_switch = *v;
 +  if (const auto it = obj.find("gate_ram"); it != obj.end() && it->second.is<picojson::object>())
 +  {
 +    const auto& g = it->second.get<picojson::object>();
@@ -19472,6 +19713,8 @@ HcmV?d00001
 +  }
 +  if (!m_switch.empty() && !FxSwitchOn(m_switch))
 +    return;  // lit17s24: GFX.ini [PC5090] <switch> = Off
++  if (!m_group_switch.empty() && !FxSwitchOn(m_group_switch))
++    return;  // lit17s35mv: the member's effects picker, GFX.ini [PC5090] Fx<Group> = Off
 +  if (m_pads && !PadsReady())
 +    return;  // lit17s30: no race / no plates in reach (no copies, no draw)
 +  // lit17s31: nothing between impacts (no copies, no draw); none start inside a tube (MiUpdate). lit17s33pt: one that
@@ -21331,6 +21574,13 @@ HcmV?d00001
 +  return s.on;
 +}
 +}  // namespace
++
++// Evolution Racing lit17s35mv: the members' per-group effect switches (GFX.ini [PC5090] Fx<Group> = On | Off, e.g.
++// FxWeather = Off), read by emit_quads and custom_pipeline features with "group_switch" (the effects pack sets it)
++bool ERFxSwitchOn(const std::string& name)
++{
++  return FxSwitchOn(name);
++}
 +
 +// ---- Evolution Racing lit17s30 BOOST REWORK ----
 +// Boost tracker (every frame while a "boost_core" / "pads" action exists, from RefreshRacerEvents): per racer a KICK =
@@ -26029,6 +26279,10 @@ HcmV?d00001
 +{
 +  s_mt.pending = false;
 +}
++bool MetalEnabled()
++{
++  return MetalOn();
++}
 +void NoteProbeDraw()
 +{
 +  s_mt.pending = true;
@@ -26067,7 +26321,7 @@ HcmV?d00001
 +}  // namespace PC5090Material
 --- a/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.h
 +++ b/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.h
-@@ -0,0 +1,496 @@
+@@ -0,0 +1,501 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -26093,6 +26347,9 @@ HcmV?d00001
 +#include "Common/CommonTypes.h"
 +#include "VideoCommon/GraphicsModSystem/Runtime/GraphicsModAction.h"
 +#include "VideoCommon/RenderState.h"
++
++// Evolution Racing: GFX.ini [PC5090] <name> = On (default) | Off, re-read every 30 frames
++bool ERFxSwitchOn(const std::string& name);
 +
 +class AbstractFramebuffer;
 +class AbstractPipeline;
@@ -26278,6 +26535,7 @@ HcmV?d00001
 +  bool m_ev_fallback = false;
 +  bool m_ev_noanchor = false;  // "no_anchor": true (per_racer) -> also emit racers with no machine drawn, at their position  // "fallback": true -> no event = emit with the classic gate
 +  std::string m_switch;
++  std::string m_group_switch;  // lit17s35mv: GFX.ini [PC5090] Fx<Group> (the members' effects picker)
 +  bool m_ram_edge = false;     // "edge": a new run starts each time the (masked) word INCREASES
 +  bool m_ram_value_f32 = false;  // "value": "f32": eq_gate.z = the gate word as a float, eq_gate.w = 2
 +  std::vector<u32> m_ram_and_chain;  // "and": {"chain", "mask"} - a second word that must have mask bits set
@@ -26559,7 +26817,8 @@ HcmV?d00001
 +namespace PC5090Material
 +{
 +void BeginDraw();             // every flush, before the actions run
-+void NoteProbeDraw();         // from the action's OnDrawStarted
++void NoteProbeDraw();
++bool MetalEnabled();  // lit17s40p: GFX.ini [PC5090] MachineMetal (read once a frame)         // from the action's OnDrawStarted
 +bool ProbePending();          // this draw wants the probe
 +void Bind();                  // binds samplers 11 / 12 (call after the draw's textures are bound)
 +void OrthoDraw();             // an orthographic draw is starting: capture if a probe draw happened this frame
