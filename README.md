@@ -46,3 +46,13 @@ cmake --build build --target dolphin-emu
 - Gates driven by game state (race vs menus, course, time of day)
 - Night / dusk grading, with lights shown only at dusk and night
 - 3D scenery: glTF models placed per course from a JSON file, lit to the course, fogged like the game
+
+## Windows x64 build (lit17s35mvuw)
+
+The Windows build is the same source plus a small port to the MinGW-w64 compiler, cross-compiled on Linux:
+
+- `windows/evolution-racing-dolphin-windows.patch` (applied after `evolution-racing-dolphin.patch`): MSVC-only code
+  paths made portable; the Direct3D 11/12 backends are left out (Vulkan and OpenGL remain).
+- `windows/Containerfile` (Fedora 44 + MinGW-w64 + MinGW-w64 Qt 6), `windows/mingw.cmake` (toolchain)
+- `build-windows.sh`: clones Dolphin 409881c34357d0f105fd473167d15ab0bd9c1628, applies both patches, builds in that container and collects
+  `Dolphin.exe` with the DLLs it needs (`./build-windows.sh` -> `dolphin-win/dist/dolphin`). Needs git and podman (or docker).
