@@ -13643,15 +13643,290 @@ n#BBd<r1E|0)Bo$~fbTwQpw`$4RQ>lSVg6$!o*cR+r=I@_CVCBu
 literal 0
 HcmV?d00001
 
+--- a/Source/Core/Common/CMakeLists.txt
++++ b/Source/Core/Common/CMakeLists.txt
+@@ -60,6 +60,8 @@
+   DynamicLibrary.h
+   ENet.cpp
+   ENet.h
++  ERDownload.cpp
++  ERDownload.h
+   EnumFormatter.h
+   EnumMap.h
+   Event.h
+--- a/Source/Core/Common/ERDownload.cpp
++++ b/Source/Core/Common/ERDownload.cpp
+@@ -0,0 +1,210 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Common/ERDownload.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cstdio>
++#include <memory>
++#include <vector>
++
++#include <curl/curl.h>
++#include <fmt/format.h>
++#include <mbedtls/sha256.h>
++
++#include "Common/FileUtil.h"
++#include "Common/IOFile.h"
++
++namespace Common::ERDownload
++{
++namespace
++{
++struct Ctx
++{
++  File::IOFile* file = nullptr;
++  Result* res = nullptr;
++  u64 base = 0;      // bytes already on disk when the transfer started
++  u64 total = 0;     // whole file size when known
++  bool writing = false;
++  bool failed = false;
++  const std::function<bool(u64, u64)>* progress = nullptr;
++  const std::atomic<bool>* cancel = nullptr;
++  long code = 0;
++  CURL* curl = nullptr;
++  std::string path;
++};
++
++size_t OnHeader(char* data, size_t size, size_t n, void* user)
++{
++  Ctx* c = static_cast<Ctx*>(user);
++  std::string line(data, size * n);
++  const auto colon = line.find(':');
++  if (colon != std::string::npos)
++  {
++    std::string k = line.substr(0, colon), v = line.substr(colon + 1);
++    std::transform(k.begin(), k.end(), k.begin(), [](unsigned char ch) { return std::tolower(ch); });
++    while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
++      v.erase(v.begin());
++    while (!v.empty() && (v.back() == '\r' || v.back() == '\n' || v.back() == ' '))
++      v.pop_back();
++    c->res->headers[k] = v;
++  }
++  else if (line.starts_with("HTTP/"))
++  {
++    c->res->headers.clear();  // a new response (redirect / 100)
++  }
++  return size * n;
++}
++
++size_t OnData(char* data, size_t size, size_t n, void* user)
++{
++  Ctx* c = static_cast<Ctx*>(user);
++  const size_t len = size * n;
++  if (!c->writing)
++  {
++    curl_easy_getinfo(c->curl, CURLINFO_RESPONSE_CODE, &c->code);
++    if (c->code != 200 && c->code != 206)
++    {
++      if (c->res->body.size() < 65536)
++        c->res->body.append(data, std::min(len, 65536 - c->res->body.size()));
++      return len;
++    }
++    if (c->code == 200 && c->base > 0)
++    {
++      // the server sent the whole file again: start over
++      c->file->Close();
++      c->file->Open(c->path, "wb");
++      c->base = 0;
++    }
++    c->writing = true;
++  }
++  if (!c->file->WriteBytes(data, len))
++  {
++    c->failed = true;
++    return 0;
++  }
++  return len;
++}
++
++int OnProgress(void* user, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t)
++{
++  Ctx* c = static_cast<Ctx*>(user);
++  if (c->cancel && c->cancel->load())
++    return 1;
++  if (c->progress && *c->progress && c->writing)
++  {
++    const u64 total = dltotal > 0 ? c->base + static_cast<u64>(dltotal) : 0;
++    if (!(*c->progress)(c->base + static_cast<u64>(dlnow), total))
++      return 1;
++  }
++  return 0;
++}
++}  // namespace
++
++Result ToFile(const std::string& url, const std::map<std::string, std::string>& headers, const std::string& path,
++              bool resume, const std::function<bool(u64, u64)>& progress, const std::atomic<bool>* cancel)
++{
++  Result r;
++  static bool inited = (curl_global_init(CURL_GLOBAL_DEFAULT), true);
++  (void)inited;
++  std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), curl_easy_cleanup);
++  if (!curl)
++  {
++    r.error = "the network library did not start";
++    return r;
++  }
++  const u64 have = resume && File::Exists(path) ? File::GetSize(path) : 0;
++  File::IOFile f(path, have ? "ab" : "wb");
++  if (!f.IsOpen())
++  {
++    r.error = "cannot write " + path;
++    return r;
++  }
++  Ctx c;
++  c.file = &f;
++  c.res = &r;
++  c.base = have;
++  c.progress = &progress;
++  c.cancel = cancel;
++  c.curl = curl.get();
++  c.path = path;
++  curl_slist* list = nullptr;
++  for (const auto& [k, v] : headers)
++    list = curl_slist_append(list, (k + ": " + v).c_str());
++  if (have)
++    list = curl_slist_append(list, fmt::format("Range: bytes={}-", have).c_str());
++  std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> hold(list, curl_slist_free_all);
++  CURL* h = curl.get();
++  char err[CURL_ERROR_SIZE] = {};
++  curl_easy_setopt(h, CURLOPT_URL, url.c_str());
++  curl_easy_setopt(h, CURLOPT_HTTPHEADER, list);
++  curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
++  curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 20L);
++  curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);   // nothing for 60 s: give up (resumed next time)
++  curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, 60L);
++  curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 0L);
++  curl_easy_setopt(h, CURLOPT_ERRORBUFFER, err);
++  curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, OnHeader);
++  curl_easy_setopt(h, CURLOPT_HEADERDATA, &c);
++  curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, OnData);
++  curl_easy_setopt(h, CURLOPT_WRITEDATA, &c);
++  curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
++  curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, OnProgress);
++  curl_easy_setopt(h, CURLOPT_XFERINFODATA, &c);
++  const CURLcode rc = curl_easy_perform(h);
++  long code = 0;
++  curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
++  r.status = static_cast<int>(code);
++  f.Flush();
++  f.Close();
++  r.bytes = File::Exists(path) ? File::GetSize(path) : 0;
++  if (c.failed)
++    r.error = "could not write the file (is the disk full?)";
++  else if (rc == CURLE_ABORTED_BY_CALLBACK)
++    r.error = "stopped";
++  else if (rc != CURLE_OK)
++    r.error = std::string("the download stopped: ") + (err[0] ? err : curl_easy_strerror(rc));
++  else if (code == 416 && have)
++    r.error = "";  // the file was complete already
++  else if (code != 200 && code != 206)
++    r.error = fmt::format("the hub answered HTTP {}", code);
++  return r;
++}
++
++std::string Sha256File(const std::string& path, const std::function<bool(u64, u64)>& progress)
++{
++  File::IOFile f(path, "rb");
++  if (!f.IsOpen())
++    return {};
++  const u64 total = f.GetSize();
++  mbedtls_sha256_context ctx;
++  mbedtls_sha256_init(&ctx);
++  mbedtls_sha256_starts_ret(&ctx, 0);
++  std::vector<u8> buf(1 << 20);
++  u64 done = 0;
++  while (done < total)
++  {
++    const size_t n = static_cast<size_t>(std::min<u64>(buf.size(), total - done));
++    if (!f.ReadBytes(buf.data(), n))
++    {
++      mbedtls_sha256_free(&ctx);
++      return {};
++    }
++    mbedtls_sha256_update_ret(&ctx, buf.data(), n);
++    done += n;
++    if (progress && !progress(done, total))
++    {
++      mbedtls_sha256_free(&ctx);
++      return {};
++    }
++  }
++  u8 out[32];
++  mbedtls_sha256_finish_ret(&ctx, out);
++  mbedtls_sha256_free(&ctx);
++  std::string hex;
++  for (u8 b : out)
++    hex += fmt::format("{:02x}", b);
++  return hex;
++}
++}  // namespace Common::ERDownload
+--- a/Source/Core/Common/ERDownload.h
++++ b/Source/Core/Common/ERDownload.h
+@@ -0,0 +1,34 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// A download straight to a file (resumes a cut one with Range), for the Evolution Racing updater: packs and Dolphin
++// builds are up to a few GB, so they never sit in memory (Common::HttpRequest keeps the whole answer in a vector).
++
++#pragma once
++
++#include <atomic>
++#include <functional>
++#include <map>
++#include <string>
++
++#include "Common/CommonTypes.h"
++
++namespace Common::ERDownload
++{
++struct Result
++{
++  int status = 0;            // HTTP status (200 / 206), 0 = no answer
++  std::string error;         // "" when the whole file is there
++  std::string body;          // the answer when it was not the file (the hub's JSON error), at most 64 KB
++  std::map<std::string, std::string> headers;  // lower-case names
++  u64 bytes = 0;             // size of the file on disk afterwards
++};
++
++// GET url into path (appends to an existing path from byte File::GetSize(path) with a Range request when resume).
++// progress(done, total) is called now and then; return false (or set *cancel) to stop.
++Result ToFile(const std::string& url, const std::map<std::string, std::string>& headers, const std::string& path,
++              bool resume, const std::function<bool(u64, u64)>& progress, const std::atomic<bool>* cancel);
++
++// sha256 of a file as lowercase hex ("" when it cannot be read); progress(done, total) as above
++std::string Sha256File(const std::string& path, const std::function<bool(u64, u64)>& progress = nullptr);
++}  // namespace Common::ERDownload
 --- a/Source/Core/Common/Version.cpp
 +++ b/Source/Core/Common/Version.cpp
-@@ -41,6 +41,22 @@
+@@ -3,8 +3,13 @@
+ 
+ #include "Common/Version.h"
+ 
++#include <mutex>
++#include <regex>
+ #include <string>
++#include <vector>
+ 
++#include "Common/CommonPaths.h"
++#include "Common/FileUtil.h"
+ #include "Common/scmrev.h"
+ 
+ namespace Common
+@@ -41,6 +46,94 @@
    return scm_rev_str;
  }
  
 +// Evolution Racing member build id (one id for the Linux and the Windows build of the same source)
 +#ifndef ER_BUILD_ID
-+#define ER_BUILD_ID "lit17s35mvp"
++#define ER_BUILD_ID "lit17s35mvu"
 +#endif
 +const std::string& GetERBuildStr()
 +{
@@ -13659,10 +13934,82 @@ HcmV?d00001
 +  return s;
 +}
 +
-+const std::string& GetERVersionStr()
++// Evolution Racing X.Y (hub/server/versions.json; lighting_mod/updater/apply_version.py sets it)
++#ifndef ER_VERSION
++#define ER_VERSION "1.3"
++#endif
++// "ER_VERSION=1.3" stays in the binary (not const, read below): scripts/dolphinpack.py / winpack.py look for it
++extern char er_version_marker[];
++char er_version_marker[] = "ER_VERSION=" ER_VERSION;
++
++const std::string& GetERFriendlyStr()
 +{
-+  static const std::string s = "Evolution Racing Dolphin " ER_BUILD_ID;
++  static const std::string s = er_version_marker + 11;
 +  return s;
++}
++
++static std::vector<int> ERParts(const std::string& v)
++{
++  std::vector<int> p;
++  size_t i = 0;
++  while (i < v.size() && p.size() < 3)
++  {
++    size_t j = i;
++    while (j < v.size() && v[j] >= '0' && v[j] <= '9')
++      ++j;
++    if (j == i || j - i > 6)
++      return {};
++    p.push_back(std::stoi(v.substr(i, j - i)));
++    if (j < v.size() && v[j] != '.')
++      return {};
++    i = j + 1;
++  }
++  while (p.size() < 3)
++    p.push_back(0);
++  return p;
++}
++
++int ERVersionCompare(const std::string& a, const std::string& b)
++{
++  const auto x = ERParts(a), y = ERParts(b);
++  return x < y ? -1 : (x > y ? 1 : 0);
++}
++
++static std::mutex s_er_mu;
++static std::string s_er_setup;
++static bool s_er_dirty = true;
++
++void ERVersionChanged()
++{
++  std::lock_guard lk(s_er_mu);
++  s_er_dirty = true;
++}
++
++std::string GetERSetupVersion()
++{
++  std::lock_guard lk(s_er_mu);
++  if (s_er_dirty)
++  {
++    s_er_dirty = false;
++    s_er_setup = GetERFriendlyStr();
++    std::string text;
++    std::smatch m;
++    static const std::regex re("\"er_version\"\\s*:\\s*\"([0-9]+\\.[0-9]+(\\.[0-9]+)?)\"");
++    if (File::ReadFileToString(File::GetUserPath(D_CONFIG_IDX) + "er-installed.json", text) &&
++        std::regex_search(text, m, re))
++    {
++      const auto own = ERParts(GetERFriendlyStr()), inst = ERParts(m[1].str());
++      // the packs' .Z counts on this Dolphin's own X.Y line only (a 1.3 Dolphin with 1.3.1 packs = 1.3.1)
++      if (!inst.empty() && !own.empty() && inst[0] == own[0] && inst[1] == own[1] && inst > own)
++        s_er_setup = m[1].str();
++    }
++  }
++  return s_er_setup;
++}
++
++std::string GetERVersionStr()
++{
++  return "Evolution Racing " + GetERSetupVersion();
 +}
 +
  const std::string& GetScmRevGitStr()
@@ -13670,23 +14017,33 @@ HcmV?d00001
    static const std::string scm_rev_git_str = SCM_REV_STR;
 --- a/Source/Core/Common/Version.h
 +++ b/Source/Core/Common/Version.h
-@@ -17,4 +17,8 @@
+@@ -17,4 +17,14 @@
  const std::string& GetScmUpdateTrackStr();
  const std::string& GetNetplayDolphinVer();
  int GetScmCommitsAheadMaster();
 +// Evolution Racing: the member build id shown in the window title, the About box and at game start ("Evolution Racing
 +// Dolphin lit17s35mv"); the hub compares it with the build its effects packs and tracks need
 +const std::string& GetERBuildStr();
-+const std::string& GetERVersionStr();
++// Evolution Racing X.Y.Z (the hub's versions.json): "Evolution Racing 1.3" in the title, the About box and at game
++// start. ER_VERSION is compiled in; the packs the updater installed can add a .Z on the same X.Y line.
++std::string GetERVersionStr();
++const std::string& GetERFriendlyStr();  // "1.3" (compiled in)
++std::string GetERSetupVersion();        // "1.3" or "1.3.1" (User/Config/er-installed.json "er_version")
++void ERVersionChanged();                // er-installed.json was written: read it again
++int ERVersionCompare(const std::string& a, const std::string& b);  // <0, 0, >0 ("1.3" < "1.3.1" < "1.4")
  }  // namespace Common
 --- a/Source/Core/Core/CMakeLists.txt
 +++ b/Source/Core/Core/CMakeLists.txt
-@@ -57,6 +57,8 @@
+@@ -57,6 +57,12 @@
    ConfigManager.h
    Core.cpp
    Core.h
 +  ERTest.cpp
 +  ERTest.h
++  ERGhosts.cpp
++  ERGhosts.h
++  ERUpdates.cpp
++  ERUpdates.h
    CoreTiming.cpp
    CoreTiming.h
    CPUThreadConfigCallback.cpp
@@ -13719,15 +14076,16 @@ HcmV?d00001
  extern const Info<int> GFX_CUSTOM_ASPECT_RATIO_HEIGHT;
 --- a/Source/Core/Core/Core.cpp
 +++ b/Source/Core/Core/Core.cpp
-@@ -46,6 +46,7 @@
+@@ -46,6 +46,8 @@
  #include "Core/CoreTiming.h"
  #include "Core/DSPEmulator.h"
  #include "Core/DolphinAnalytics.h"
++#include "Core/ERGhosts.h"
 +#include "Core/ERTest.h"
  #include "Core/FifoPlayer/FifoPlayer.h"
  #include "Core/FreeLookManager.h"
  #include "Core/HLE/HLE.h"
-@@ -134,7 +135,8 @@
+@@ -134,7 +136,8 @@
  
  bool GetIsThrottlerTempDisabled()
  {
@@ -13737,15 +14095,16 @@ HcmV?d00001
  }
  
  void SetIsThrottlerTempDisabled(bool disable)
-@@ -150,6 +152,7 @@
+@@ -150,6 +153,8 @@
  
  void OnFrameEnd(Core::System& system)
  {
 +  ERTest::OnFrame(system);
++  ERGhosts::OnFrame(system);  // Evolution Racing run telemetry (reads nothing unless linked + on)
  #ifdef USE_MEMORYWATCHER
    if (s_memory_watcher)
    {
-@@ -347,6 +350,33 @@
+@@ -347,6 +352,33 @@
      if (delete_savestate)
        File::Delete(*savestate_path);
    }
@@ -13754,7 +14113,7 @@ HcmV?d00001
 +    // Evolution Racing: the build id at every game start, then the lines of User/Config/er-status.txt (what the start
 +    // script installed: effects pack, HD textures, quality preset), so a member sees in game what is loaded
 +    DisplayMessage(Common::GetERVersionStr(), 9000);
-+    std::fprintf(stderr, "ERSTATUS %s\n", Common::GetERVersionStr().c_str());
++    std::fprintf(stderr, "ERSTATUS %s (%s)\n", Common::GetERVersionStr().c_str(), Common::GetERBuildStr().c_str());
 +    std::string status;
 +    if (File::ReadFileToString(File::GetUserPath(D_CONFIG_IDX) + "er-status.txt", status))
 +    {
@@ -13779,15 +14138,1204 @@ HcmV?d00001
  
    {
      std::unique_lock core_lock(s_core_mutex);
-@@ -899,7 +929,7 @@
+@@ -899,7 +931,9 @@
        "{} {} | {} | {}", system.GetPowerPC().GetCPUName(), system.IsDualCoreMode() ? "DC" : "SC",
        g_video_backend->GetDisplayName(), Config::Get(Config::MAIN_DSP_HLE) ? "HLE" : "LLE");
  
 -  std::string message = fmt::format("{} | {}", Common::GetScmRevStr(), SSettings);
 +  std::string message = fmt::format("{} | {}", Common::GetERVersionStr(), SSettings);
++  if (ERGhosts::Offline())
++    message += " | Offline";  // Play offline (Tools menu): no connections
    if (Config::Get(Config::MAIN_SHOW_ACTIVE_TITLE))
    {
      const std::string& title = SConfig::GetInstance().GetTitleDescription();
+--- a/Source/Core/Core/ERGhosts.cpp
++++ b/Source/Core/Core/ERGhosts.cpp
+@@ -0,0 +1,1044 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/ERGhosts.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cmath>
++#include <cstring>
++#include <filesystem>
++#include <atomic>
++#include <chrono>
++#include <deque>
++#include <memory>
++#include <map>
++#include <mutex>
++#include <random>
++#include <set>
++#include <span>
++
++#include <fmt/format.h>
++#include <picojson.h>
++#include <zstd.h>
++
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <fcntl.h>
++#include <sys/file.h>
++#include <unistd.h>
++#endif
++
++#include "Common/CommonPaths.h"
++#include "Common/Crypto/SHA1.h"
++#include "Common/FileSearch.h"
++#include "Common/FileUtil.h"
++#include "Common/HttpRequest.h"
++#include "Common/IOFile.h"
++#include "Common/Logging/Log.h"
++#include "Common/StringUtil.h"
++#include "Common/Version.h"
++#include "Core/Config/MainSettings.h"
++#include "Core/HW/EXI/EXI.h"
++#include "Core/HW/Memmap.h"
++#include "Core/System.h"
++#include "Common/Swap.h"
++#include "DiscIO/DiscExtractor.h"
++#include "DiscIO/Enums.h"
++#include "DiscIO/Filesystem.h"
++#include "DiscIO/Volume.h"
++
++namespace ERGhosts
++{
++namespace
++{
++constexpr size_t GCI_HEADER = 0x40;
++constexpr size_t DATA_LEN = 3 * 0x2000;
++constexpr size_t GCI_SIZE = GCI_HEADER + DATA_LEN;  // 24640
++constexpr size_t GHOST = 0x2060;                    // the run inside the card data
++constexpr size_t STAFF_LEN = 16040;
++constexpr int MAX_SAMPLES = (STAFF_LEN - 0x30) / 16;
++
++const char* const MACHINES[] = {
++    "Red Gazelle",    "White Cat",     "Golden Fox",     "Iron Tiger",     "Fire Stingray",  "Wild Goose",
++    "Blue Falcon",    "Deep Claw",     "Great Star",     "Little Wyvern",  "Mad Wolf",       "Super Piranha",
++    "Death Anchor",   "Astro Robin",   "Big Fang",       "Sonic Phantom",  "Green Panther",  "Hyper Speeder",
++    "Space Angler",   "King Meteor",   "Queen Meteor",   "Twin Noritta",   "Night Thunder",  "Wild Boar",
++    "Blood Hawk",     "Wonder Wasp",   "Mighty Typhoon", "Mighty Hurricane", "Crazy Bear",   "Black Bull",
++    "Dark Schneider", "Fat Shark",     "Cosmic Dolphin", "Pink Spider",    "Magic Seagull",  "Silver Rat",
++    "Spark Moon",     "Bunny Flash",   "Groovy Taxi",    "Rolling Turtle", "Rainbow Phoenix"};
++
++std::mutex s_mutex;
++std::string s_boot_disc;
++bool s_boot_test = false;
++std::map<std::string, std::pair<u64, std::string>> s_scan;  // path -> (size ^ mtime, sha1 or "" when not good yet)
++std::set<std::string> s_offered;                             // sha1s handed out this session
++std::atomic<int> s_offline{-1};                              // Play offline (-1: not read yet)
++#ifdef _WIN32
++HANDLE s_lock = INVALID_HANDLE_VALUE;
++#else
++int s_lock = -1;
++#endif
++
++u16 BE16(const u8* p)
++{
++  return static_cast<u16>(p[0] << 8 | p[1]);
++}
++
++u16 Crc16X25(const u8* d, size_t n)
++{
++  u16 crc = 0xFFFF;
++  for (size_t i = 0; i < n; ++i)
++  {
++    crc ^= d[i];
++    for (int b = 0; b < 8; ++b)
++      crc = (crc & 1) ? static_cast<u16>((crc >> 1) ^ 0x8408) : static_cast<u16>(crc >> 1);
++  }
++  return static_cast<u16>(crc ^ 0xFFFF);
++}
++
++std::string Hex(const Common::SHA1::Digest& d)
++{
++  std::string s;
++  for (u8 b : d)
++    s += fmt::format("{:02x}", b);
++  return s;
++}
++
++std::string SettingsPath()
++{
++  return File::GetUserPath(D_CONFIG_IDX) + "er-ghosts.txt";
++}
++
++std::string LedgerPath()
++{
++  return Dir() + "ledger.txt";
++}
++
++std::set<std::string> ReadLedger(bool* exists)
++{
++  std::set<std::string> out;
++  std::string text;
++  *exists = File::ReadFileToString(LedgerPath(), text);
++  for (const std::string& line : SplitString(text, '\n'))
++  {
++    const auto sp = line.find(' ');
++    if (sp == 40)
++      out.insert(line.substr(0, 40));
++  }
++  return out;
++}
++
++void AppendLedger(const std::string& sha1, const std::string& what)
++{
++  File::CreateFullPath(Dir());
++  File::IOFile f(LedgerPath(), "ab");
++  const std::string line =
++      fmt::format("{} {} {}\n", sha1, what,
++                  std::chrono::duration_cast<std::chrono::seconds>(
++                      std::chrono::system_clock::now().time_since_epoch())
++                      .count());
++  f.WriteString(line);
++}
++
++std::string UrlPart(const std::string& s)
++{
++  std::string out;
++  for (unsigned char c : s)
++  {
++    if (std::isalnum(c) || c == '-' || c == '_' || c == '.')
++      out += static_cast<char>(c);
++    else
++      out += fmt::format("%{:02X}", c);
++  }
++  return out;
++}
++
++std::string Unescape(const std::string& s)
++{
++  std::string out;
++  for (size_t i = 0; i < s.size(); ++i)
++  {
++    if (s[i] == '%' && i + 2 < s.size() && std::isxdigit(static_cast<unsigned char>(s[i + 1])) &&
++        std::isxdigit(static_cast<unsigned char>(s[i + 2])))
++    {
++      out += static_cast<char>(std::stoi(s.substr(i + 1, 2), nullptr, 16));
++      i += 2;
++      continue;
++    }
++    out += s[i];
++  }
++  return out;
++}
++
++bool SafePart(const std::string& s, size_t max)
++{
++  return !s.empty() && s.size() <= max && s != "." && s != ".." &&
++         std::all_of(s.begin(), s.end(), [](unsigned char c) {
++           return std::isalnum(c) || c == '-' || c == '_' || c == '.';
++         });
++}
++
++Reply Call(const Settings& s, const std::string& path, const std::vector<u8>* body,
++           std::vector<u8>* raw_out)
++{
++  Reply r;
++  if (s.offline)
++  {
++    r.error = "Play offline is on";  // no connection at all
++    return r;
++  }
++  if (s.token.empty())
++  {
++    r.error = "this Dolphin is not linked to the hub";
++    return r;
++  }
++  if (!HubAllowed(s.hub))
++  {
++    r.error = "the hub address is not allowed: " + s.hub;
++    return r;
++  }
++  Common::HttpRequest req(std::chrono::milliseconds(20000));
++  if (!req.IsValid())
++  {
++    r.error = "the network library did not start";
++    return r;
++  }
++  Common::HttpRequest::Headers h = {{"X-ER-Dolphin", s.token},
++                                    {"X-ER-Build", Common::GetERBuildStr()},
++                                    {"X-ER-Ghosts", "1"},
++                                    {"Accept", "application/json"},
++                                    {"Expect", std::nullopt}};
++  std::string url = s.hub;
++  while (!url.empty() && url.back() == '/')
++    url.pop_back();
++  url += "/hub/api/erd/" + path;
++  Common::HttpRequest::Response resp;
++  if (body)
++  {
++    h["Content-Type"] = "application/octet-stream";
++    resp = req.Post(url, std::span<const u8>(body->data(), body->size()), h,
++                    Common::HttpRequest::AllowedReturnCodes::All);
++  }
++  else
++  {
++    resp = req.Get(url, h, Common::HttpRequest::AllowedReturnCodes::All);
++  }
++  if (!resp)
++  {
++    r.error = "the hub did not answer (no network?)";
++    return r;
++  }
++  r.status = req.GetLastResponseCode();
++  if (raw_out && r.status == 200)
++  {
++    *raw_out = std::move(*resp);
++    return r;
++  }
++  r.text.assign(resp->begin(), resp->end());
++  if (r.status != 200)
++  {
++    r.error = Field(r.text, "error");
++    if (r.error.empty())
++      r.error = fmt::format("the hub answered HTTP {}", r.status);
++  }
++  return r;
++}
++}  // namespace
++
++// ---------------------------------------------------------------- settings
++std::string ModeName(Mode m)
++{
++  return m == Mode::Off ? "off" : m == Mode::Auto ? "auto" : "ask";
++}
++
++Settings LoadFile();
++
++Settings Load()
++{
++  Settings s = LoadFile();
++  s_offline = s.offline ? 1 : 0;
++  return s;
++}
++
++bool Offline()
++{
++  if (s_offline < 0)
++    Load();
++  return s_offline == 1;
++}
++
++Settings LoadFile()
++{
++  Settings s;
++  std::string text;
++  if (!File::ReadFileToString(SettingsPath(), text))
++    return s;
++  for (std::string line : SplitString(text, '\n'))
++  {
++    while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
++      line.pop_back();
++    const auto eq = line.find('=');
++    if (eq == std::string::npos)
++      continue;
++    const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
++    if (k == "mode")
++      s.mode = v == "off" ? Mode::Off : v == "auto" ? Mode::Auto : Mode::Ask;
++    else if (k == "hub" && !v.empty())
++      s.hub = v;
++    else if (k == "token")
++      s.token = v;
++    else if (k == "user")
++      s.username = v;
++    else if (k == "told_unlinked")
++      s.told_unlinked = v == "1";
++    else if (k == "offline")
++      s.offline = v == "1";
++
++  }
++  return s;
++}
++
++void Save(const Settings& s)
++{
++  File::CreateFullPath(File::GetUserPath(D_CONFIG_IDX));
++  const std::string text = fmt::format(
++      "# Evolution Racing ghosts (Tools > Evolution Racing ghosts): mode = auto | ask | off\n"
++      "mode={}\nhub={}\ntoken={}\nuser={}\ntold_unlinked={}\noffline={}\n",
++      ModeName(s.mode), s.hub, s.token, s.username, s.told_unlinked ? 1 : 0, s.offline ? 1 : 0);
++  s_offline = s.offline ? 1 : 0;
++  File::WriteStringToFile(SettingsPath() + ".tmp", text);
++  File::Rename(SettingsPath() + ".tmp", SettingsPath());
++}
++
++// ---------------------------------------------------------------- the ghost file
++std::string Check(const std::vector<u8>& gci, Ghost* out)
++{
++  if (gci.size() != GCI_SIZE)
++    return fmt::format("not a Time Attack ghost (size {} bytes, a ghost is {})", gci.size(), GCI_SIZE);
++  const u8* h = gci.data();
++  if (std::memcmp(h, "GFZE", 4) != 0 || std::memcmp(h + 4, "8P", 2) != 0)
++    return "not a ghost from the USA game (GFZE)";
++  std::string name(reinterpret_cast<const char*>(h + 8), 32);
++  name = name.substr(0, name.find('\0'));
++  bool name_ok = name.size() == 23 && name.starts_with("fzg") && name.ends_with(".dat");
++  for (size_t i = 3; name_ok && i < 19; ++i)
++    name_ok = std::isxdigit(static_cast<unsigned char>(name[i])) && !std::isupper(static_cast<unsigned char>(name[i]));
++  if (!name_ok)
++    return "not a Time Attack ghost (the memory card file name is not fzg...dat)";
++  if (BE16(h + 0x38) != 3)
++    return "not a Time Attack ghost (a ghost has 3 memory card blocks)";
++  const u8* d = h + GCI_HEADER;
++  if (BE16(d) != Crc16X25(d + 2, DATA_LEN - 2))
++    return "the file is damaged or was edited (its checksum does not match)";
++  const u8* g = d + GHOST;
++  if (g[8] != 'F' || g[9] != 'Z')
++    return "not a Time Attack ghost (missing marker)";
++  const int mm = g[0x24], ss = g[0x25], ms = BE16(g + 0x26);
++  const u32 total = static_cast<u32>((mm * 60 + ss) * 1000 + ms);
++  if (ss >= 60 || ms >= 1000 || total == 0 || total >= 3600000)
++    return "the time in the file is not a real race time";
++  const int samples = BE16(g + 0x18), frames = BE16(g + 0x1E);
++  if (samples <= 0 || samples > MAX_SAMPLES)
++    return "the ghost has no usable race data";
++  if (std::abs(frames - static_cast<double>(total) * 60 / 1000) > 2)
++    return "the race time and the race length in frames do not agree";
++  int sum = 0;
++  for (int k = 0; k < samples; ++k)
++    sum += g[0x30 + 16 * k + 8];
++  if (std::abs(sum - frames) > 6)
++    return "the race data does not add up to the race time";
++  if (out)
++  {
++    out->name = name;
++    out->machine = g[0];
++    out->slot = g[1];
++    out->total_ms = total;
++    out->frames = frames;
++    out->time = fmt::format("{}'{:02}\"{:03}", mm, ss, ms);
++    out->machine_name = g[0] < std::size(MACHINES) ? MACHINES[g[0]] : "Custom machine";
++    out->sha1 = Hex(Common::SHA1::CalculateDigest(gci));
++  }
++  return {};
++}
++
++// ---------------------------------------------------------------- host side
++std::string Dir()
++{
++  return File::GetUserPath(D_USER_IDX) + "ERGhosts/";
++}
++
++bool IsArg(const std::string& arg)
++{
++  return arg.starts_with("evoracing://link/") || arg.starts_with("evoracing://ghost/") ||
++         arg.starts_with("evoracing:link/") || arg.starts_with("evoracing:ghost/") ||
++         arg.starts_with("evoracing://update") || arg.starts_with("evoracing:update") ||  // the updater (ERUpdatesUI.cpp)
++         arg.starts_with("evoracing://restart") || arg.starts_with("evoracing:restart");
++}
++
++bool ForwardIfRunning(const std::string& arg)
++{
++  File::CreateFullPath(Dir());
++  const std::string lock = Dir() + "running.lock";
++#ifdef _WIN32
++  if (s_lock == INVALID_HANDLE_VALUE)
++    s_lock = CreateFileW(UTF8ToWString(lock).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
++                         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
++  const bool mine = s_lock != INVALID_HANDLE_VALUE;
++#else
++  if (s_lock < 0)
++  {
++    s_lock = open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
++    if (s_lock >= 0 && flock(s_lock, LOCK_EX | LOCK_NB) != 0)
++    {
++      close(s_lock);
++      s_lock = -1;
++    }
++  }
++  const bool mine = s_lock >= 0;
++#endif
++  if (mine || arg.empty())
++    return false;
++  std::random_device rd;
++  const std::string name = Dir() + fmt::format("{:08x}{:08x}", rd(), rd());
++  File::WriteStringToFile(name + ".tmp", arg);
++  File::Rename(name + ".tmp", name + ".arg");
++  return true;
++}
++
++std::vector<std::string> TakeForwarded()
++{
++  std::vector<std::string> out;
++  for (const std::string& f : Common::DoFileSearch(Dir(), ".arg", false))
++  {
++    std::string arg;
++    if (File::ReadFileToString(f, arg) && IsArg(arg))
++      out.push_back(arg);
++    File::Delete(f);
++  }
++  return out;
++}
++
++void SetBootDisc(const std::string& path, bool er_test)
++{
++  std::lock_guard lk(s_mutex);
++  s_boot_disc = path;
++  s_boot_test = er_test;
++}
++
++bool BootedForTest()
++{
++  std::lock_guard lk(s_mutex);
++  return s_boot_test;
++}
++
++std::string CourseSha1(int slot)
++{
++  std::string path;
++  {
++    std::lock_guard lk(s_mutex);
++    path = s_boot_disc;
++  }
++  if (path.empty() || slot < 0 || slot > 99)
++    return {};
++  const std::unique_ptr<DiscIO::Volume> vol = DiscIO::CreateVolume(path);
++  if (!vol)
++    return {};
++  const DiscIO::Partition part = vol->GetGamePartition();
++  const DiscIO::FileSystem* fs = vol->GetFileSystem(part);
++  if (!fs)
++    return {};
++  const auto info = fs->FindFileInfo(fmt::format("stage/COLI_COURSE{:02}.lz", slot));
++  if (!info || info->GetSize() == 0 || info->GetSize() > (64u << 20))
++    return {};
++  std::vector<u8> buf(info->GetSize());
++  if (DiscIO::ReadFile(*vol, part, info.get(), buf.data(), buf.size()) != buf.size())
++    return {};
++  return Hex(Common::SHA1::CalculateDigest(buf));
++}
++
++std::string GciFolder()
++{
++  return Config::GetGCIFolderPath(ExpansionInterface::Slot::A, DiscIO::Region::NTSC_U);
++}
++
++std::vector<Ghost> TakeNew()
++{
++  std::vector<Ghost> out;
++  const std::string folder = GciFolder();
++  if (!File::IsDirectory(folder))
++    return out;
++  bool had_ledger = false;
++  const std::set<std::string> ledger = ReadLedger(&had_ledger);
++  for (const std::string& path : Common::DoFileSearch(folder, ".gci", false))
++  {
++    const std::string base = path.substr(path.find_last_of("/\\") + 1);
++    if (!base.starts_with("8P-GFZE-fzg"))
++      continue;
++    std::error_code ec;
++    const auto mtime = std::filesystem::last_write_time(StringToPath(path), ec);
++    const u64 sig = File::GetSize(path) ^
++                    (static_cast<u64>(ec ? 0 : mtime.time_since_epoch().count()) * 0x9E3779B97F4A7C15ull);
++    auto it = s_scan.find(path);
++    if (it != s_scan.end() && it->second.first == sig)
++      continue;
++    std::string text;
++    if (!File::ReadFileToString(path, text))
++      continue;
++    Ghost g;
++    g.data.assign(text.begin(), text.end());
++    g.path = path;
++    const std::string bad = Check(g.data, &g);
++    s_scan[path] = {sig, bad.empty() ? g.sha1 : std::string()};
++    if (!bad.empty())
++      continue;  // not a ghost (or not written completely yet): looked at again when it changes
++    if (ledger.contains(g.sha1) || s_offered.contains(g.sha1))
++      continue;
++    if (!had_ledger)
++    {
++      AppendLedger(g.sha1, "there-before");  // ghosts from before this feature are not sent
++      continue;
++    }
++    s_offered.insert(g.sha1);
++    out.push_back(std::move(g));
++  }
++  if (!had_ledger)
++  {
++    File::CreateFullPath(Dir());
++    if (!File::Exists(LedgerPath()))
++      File::WriteStringToFile(LedgerPath(), "");
++  }
++  return out;
++}
++
++void MarkDone(const std::string& sha1, const std::string& what)
++{
++  AppendLedger(sha1, what);
++}
++
++void ReleaseLock()
++{
++#ifdef _WIN32
++  if (s_lock != INVALID_HANDLE_VALUE)
++  {
++    CloseHandle(s_lock);
++    s_lock = INVALID_HANDLE_VALUE;
++  }
++#else
++  if (s_lock >= 0)
++  {
++    close(s_lock);
++    s_lock = -1;
++  }
++#endif
++}
++
++std::vector<Ghost> TakeOffline()
++{
++  // the ledger's last word per ghost; "offline" = saved while Play offline was on, never sent since
++  std::string text;
++  File::ReadFileToString(LedgerPath(), text);
++  std::map<std::string, std::string> last;
++  for (const std::string& line : SplitString(text, '\n'))
++  {
++    if (line.size() < 42 || line[40] != ' ')
++      continue;
++    const std::string rest = line.substr(41);
++    last[line.substr(0, 40)] = rest.substr(0, rest.find(' '));
++  }
++  std::vector<Ghost> out;
++  const std::string folder = GciFolder();
++  if (!File::IsDirectory(folder))
++    return out;
++  for (const std::string& path : Common::DoFileSearch(folder, ".gci", false))
++  {
++    std::string raw;
++    if (!File::ReadFileToString(path, raw))
++      continue;
++    Ghost g;
++    g.data.assign(raw.begin(), raw.end());
++    g.path = path;
++    if (!Check(g.data, &g).empty())
++      continue;
++    const auto it = last.find(g.sha1);
++    if (it != last.end() && it->second == "offline")
++      out.push_back(std::move(g));
++  }
++  return out;
++}
++
++// ---------------------------------------------------------------- hub calls
++std::string Field(const std::string& json, const std::string& key)
++{
++  picojson::value v;
++  if (!picojson::parse(v, json).empty() || !v.is<picojson::object>())
++    return {};
++  const auto& o = v.get<picojson::object>();
++  const auto it = o.find(key);
++  if (it == o.end() || it->second.is<picojson::null>())
++    return {};
++  if (it->second.is<std::string>())
++    return it->second.get<std::string>();
++  if (it->second.is<double>())
++    return fmt::format("{}", static_cast<long long>(it->second.get<double>()));
++  if (it->second.is<bool>())
++    return it->second.get<bool>() ? "true" : "false";
++  return it->second.serialize();
++}
++
++Reply Hello(const Settings& s)
++{
++  return Call(s, "hello", nullptr, nullptr);
++}
++
++Reply Upload(const Settings& s, const Ghost& g, const std::string& coli_sha1, bool dry)
++{
++  return Call(s, fmt::format("ghost?slot={}&coli={}{}", g.slot, coli_sha1, dry ? "&dry=1" : ""), &g.data,
++              nullptr);
++}
++
++Reply Fetch(const Settings& s, const std::string& what, std::vector<u8>* out)
++{
++  return Call(s, what, nullptr, out);
++}
++
++bool Install(const std::vector<u8>& gci, std::string* message)
++{
++  Ghost g;
++  const std::string bad = Check(gci, &g);
++  if (!bad.empty())
++  {
++    *message = "The hub sent a file that is not a good ghost: " + bad;
++    return false;
++  }
++  const std::string folder = GciFolder();
++  File::CreateFullPath(folder + "/");
++  const std::string path = folder + "/8P-GFZE-" + g.name + ".gci";
++  std::string old;
++  if (File::ReadFileToString(path, old))
++  {
++    if (std::vector<u8>(old.begin(), old.end()) == gci)
++    {
++      *message = fmt::format("That ghost ({} {}) is already in your memory card.", g.machine_name, g.time);
++      return true;
++    }
++  }
++  AppendLedger(g.sha1, "installed");  // first: the watcher must never send someone else's ghost as this member's
++  s_offered.insert(g.sha1);
++  if (!File::WriteStringToFile(path + ".tmp", std::string(gci.begin(), gci.end())) ||
++      !File::Rename(path + ".tmp", path))
++  {
++    *message = "Could not write the ghost into " + folder;
++    return false;
++  }
++  *message = fmt::format("Ghost installed: {} {}. In Time Attack pick the course, then Y / X (Load Ghost) "
++                         "to race it. If the game is running, start it again to see it.",
++                         g.machine_name, g.time);
++  return true;
++}
++
++bool ParseLink(const std::string& arg, std::string* code, std::string* hub)
++{
++  std::string s = arg.substr(arg.find("link/") + 5);
++  std::string query;
++  const auto q = s.find('?');
++  if (q != std::string::npos)
++  {
++    query = s.substr(q + 1);
++    s = s.substr(0, q);
++  }
++  while (!s.empty() && s.back() == '/')
++    s.pop_back();
++  if (!s.starts_with("erd_") || !SafePart(s, 80))
++    return false;
++  *code = s;
++  hub->clear();
++  for (const std::string& kv : SplitString(query, '&'))
++    if (kv.starts_with("hub="))
++      *hub = Unescape(kv.substr(4));
++  return true;
++}
++
++bool ParseGhost(const std::string& arg, std::string* what)
++{
++  std::string s = arg.substr(arg.find("ghost/") + 6);
++  const auto q = s.find_first_of("?#");
++  if (q != std::string::npos)
++    s = s.substr(0, q);
++  std::vector<std::string> p;
++  for (const std::string& x : SplitString(s, '/'))
++    if (!x.empty())
++      p.push_back(Unescape(x));
++  if (p.size() == 2 && p[0] == "staff" && SafePart(p[1], 80))
++  {
++    *what = "staffghost/" + UrlPart(p[1]) + ".gci";
++    return true;
++  }
++  if (p.size() == 3 && SafePart(p[0], 80) && (p[1] == "race" || p[1] == "lap") && SafePart(p[2], 40))
++  {
++    *what = "ghost/" + UrlPart(p[0]) + "/" + p[1] + "/" + UrlPart(p[2]) + ".gci";
++    return true;
++  }
++  return false;
++}
++
++std::string OfficialHub()
++{
++  static const std::string hub = [] {
++    std::string t;
++    if (!File::ReadFileToString(File::GetSysDirectory() + "er-hub.txt", t))
++      return std::string();
++    t = t.substr(0, t.find_first_of("\r\n"));
++    while (!t.empty() && (t.back() == '/' || t.back() == ' ' || t.back() == '\t'))
++      t.pop_back();
++    return t.starts_with("https://") && HubAllowed(t) ? t : std::string();
++  }();
++  return hub;
++}
++
++bool HubAllowed(const std::string& hub)
++{
++  if (hub.starts_with("https://") && hub.size() > 8 && hub.find_first_of(" \t\r\n@") == std::string::npos)
++    return true;
++  return hub.starts_with("http://127.0.0.1:") || hub.starts_with("http://localhost:") ||
++         hub == "http://127.0.0.1" || hub == "http://localhost";
++}
++
++// ---------------------------------------------------------------- full-rate run telemetry
++namespace
++{
++struct ProbeField
++{
++  std::string name;
++  std::vector<s32> path;  // from the racer: deref every offset but the last
++  int type = 0;           // 0 u32/s32, 1 f32, 2 u8, 3 u16
++  double scale = 1;
++};
++struct Probe
++{
++  std::vector<u32> base;    // a = u32(base[0]); a = u32(a + base[i]) ...: the player's racer
++  u32 counter = 0;          // u32: 0 outside a race, counts from the countdown
++  std::vector<s32> end_path;
++  u32 end_mask = 0;         // the racer word that says finished / retired
++  std::vector<ProbeField> fields;
++  int max_frames = 72000;
++};
++struct Run
++{
++  std::vector<s32> values;  // frame-major, fields.size() per frame
++  int frames = 0;
++  int finish = -1;          // frame index the finish word was first set
++};
++
++std::mutex s_run_mutex;
++std::shared_ptr<const Probe> s_probe;
++std::atomic<bool> s_probe_ok{false};
++std::vector<s32> s_ring;    // CPU thread only: the last max_frames frames
++size_t s_ring_pos = 0, s_ring_count = 0;
++const void* s_ring_probe = nullptr;
++bool s_finished = false;
++int s_after = -1;
++std::deque<Run> s_runs;     // finished (guarded by s_run_mutex)
++
++// User/ERGhosts/runs.log: one line per run event (a few per race; diagnostics for members and for us)
++void RunLog(const std::string& line)
++{
++  File::IOFile f(Dir() + "runs.log", "ab");
++  if (f.IsOpen() && f.GetSize() < (256u << 10))
++    f.WriteString(line + "\n");
++}
++
++bool RdU32(Core::System& system, u32 addr, u32* out)
++{
++  if (addr < 0x80000000 || addr > 0x817FFFFC)
++    return false;
++  u32 v;
++  system.GetMemory().CopyFromEmu(&v, addr, 4);
++  *out = Common::swap32(v);
++  return true;
++}
++
++bool Resolve(Core::System& system, u32 racer, const std::vector<s32>& path, u32* addr)
++{
++  u32 a = racer;
++  for (size_t i = 0; i + 1 < path.size(); ++i)
++    if (!RdU32(system, a + static_cast<u32>(path[i]), &a) || a < 0x80000000)
++      return false;
++  *addr = a + static_cast<u32>(path.empty() ? 0 : path.back());
++  return true;
++}
++
++s32 ReadField(Core::System& system, u32 racer, const ProbeField& f)
++{
++  u32 a = 0;
++  if (!Resolve(system, racer, f.path, &a) || a < 0x80000000 || a > 0x817FFFFC)
++    return 0;
++  auto& mem = system.GetMemory();
++  switch (f.type)
++  {
++  case 1:
++  {
++    u32 v;
++    mem.CopyFromEmu(&v, a, 4);
++    v = Common::swap32(v);
++    float fl;
++    std::memcpy(&fl, &v, 4);
++    if (!std::isfinite(fl))
++      return 0;
++    const double d = std::clamp(static_cast<double>(fl) * f.scale, -2.0e9, 2.0e9);
++    return static_cast<s32>(std::lround(d));
++  }
++  case 2:
++  {
++    u8 v;
++    mem.CopyFromEmu(&v, a, 1);
++    return v;
++  }
++  case 3:
++  {
++    u16 v;
++    mem.CopyFromEmu(&v, a, 2);
++    return Common::swap16(v);
++  }
++  default:
++  {
++    u32 v;
++    mem.CopyFromEmu(&v, a, 4);
++    return static_cast<s32>(Common::swap32(v));
++  }
++  }
++}
++
++void PutVar(std::vector<u8>& out, u32 v)
++{
++  while (v >= 0x80)
++  {
++    out.push_back(static_cast<u8>(v | 0x80));
++    v >>= 7;
++  }
++  out.push_back(static_cast<u8>(v));
++}
++
++std::vector<s32> Ints(const picojson::value& v)
++{
++  std::vector<s32> out;
++  if (v.is<picojson::array>())
++    for (const auto& x : v.get<picojson::array>())
++      if (x.is<double>())
++        out.push_back(static_cast<s32>(static_cast<long long>(x.get<double>())));
++  return out;
++}
++}  // namespace
++
++std::vector<u8> Zstd(const std::vector<u8>& raw)
++{
++  std::vector<u8> out(ZSTD_compressBound(raw.size()));
++  const size_t n = ZSTD_compress(out.data(), out.size(), raw.data(), raw.size(), 9);
++  if (ZSTD_isError(n))
++    return {};
++  out.resize(n);
++  return out;
++}
++
++bool LoadProbe(const std::string& json)
++{
++  picojson::value v;
++  if (!picojson::parse(v, json).empty() || !v.is<picojson::object>())
++    return false;
++  const auto& o = v.get<picojson::object>();
++  auto get = [&](const char* k) -> const picojson::value& {
++    static const picojson::value none;
++    const auto it = o.find(k);
++    return it == o.end() ? none : it->second;
++  };
++  auto p = std::make_shared<Probe>();
++  for (s32 x : Ints(get("base")))
++    p->base.push_back(static_cast<u32>(x));
++  if (get("counter").is<double>())
++    p->counter = static_cast<u32>(static_cast<long long>(get("counter").get<double>()));
++  p->end_path = Ints(get("end_path"));
++  if (get("end_mask").is<double>())
++    p->end_mask = static_cast<u32>(static_cast<long long>(get("end_mask").get<double>()));
++  if (get("max_frames").is<double>())
++    p->max_frames = std::clamp(static_cast<int>(get("max_frames").get<double>()), 600, 216000);
++  if (get("fields").is<picojson::array>())
++    for (const auto& f : get("fields").get<picojson::array>())
++    {
++      if (!f.is<picojson::object>())
++        continue;
++      const auto& fo = f.get<picojson::object>();
++      ProbeField fl;
++      if (fo.count("n") && fo.at("n").is<std::string>())
++        fl.name = fo.at("n").get<std::string>();
++      if (fo.count("p"))
++        fl.path = Ints(fo.at("p"));
++      if (fo.count("t") && fo.at("t").is<std::string>())
++      {
++        const std::string ty = fo.at("t").get<std::string>();
++        fl.type = ty == "f32" ? 1 : ty == "u8" ? 2 : ty == "u16" ? 3 : 0;
++      }
++      if (fo.count("s") && fo.at("s").is<double>())
++        fl.scale = fo.at("s").get<double>();
++      if (!fl.name.empty() && !fl.path.empty() && p->fields.size() < 48)
++        p->fields.push_back(std::move(fl));
++    }
++  if (p->base.empty() || p->counter < 0x80000000 || p->fields.empty())
++    return false;
++  {
++    std::lock_guard lk(s_run_mutex);
++    s_probe = p;
++  }
++  File::CreateFullPath(Dir());
++  File::WriteStringToFile(Dir() + "probe.json", json);
++  return true;
++}
++
++bool HasProbe()
++{
++  std::lock_guard lk(s_run_mutex);
++  return s_probe != nullptr;
++}
++
++void EnableRecording(bool on)
++{
++  std::lock_guard lk(s_run_mutex);
++  s_probe_ok = on && s_probe != nullptr;
++}
++
++void OnFrame(Core::System& system)
++{
++  // Every frame of the player's racer goes into a ring of the probe's max_frames (about 5 MB); when the finish word rises,
++  // the ring up to 30 frames after it becomes a run. No start signal is needed: the ghost's own length (and the hub,
++  // which lines the run up with the ghost's positions) says where the race began.
++  if (!s_probe_ok)
++    return;  // no probe (not linked / ghosts off): nothing read
++  std::shared_ptr<const Probe> p;
++  {
++    std::lock_guard lk(s_run_mutex);
++    p = s_probe;
++  }
++  if (!p)
++    return;
++  const size_t nf = p->fields.size(), cap = static_cast<size_t>(p->max_frames);
++  if (s_ring_probe != p.get())
++  {
++    s_ring.assign(cap * nf, 0);
++    s_ring_pos = s_ring_count = 0;
++    s_ring_probe = p.get();
++    s_finished = false;
++    s_after = -1;
++  }
++  u32 racer = 0;
++  bool ok = RdU32(system, p->base[0], &racer);
++  for (size_t i = 1; ok && i < p->base.size(); ++i)
++    ok = RdU32(system, racer + p->base[i], &racer) && racer >= 0x80000000;
++  s32* row = &s_ring[s_ring_pos * nf];
++  bool fin = false;
++  if (ok)
++  {
++    for (size_t i = 0; i < nf; ++i)
++      row[i] = ReadField(system, racer, p->fields[i]);
++    u32 a = 0, w = 0;
++    fin = p->end_mask && Resolve(system, racer, p->end_path, &a) && RdU32(system, a, &w) && (w & p->end_mask);
++  }
++  else
++  {
++    std::fill(row, row + nf, 0);
++  }
++  s_ring_pos = (s_ring_pos + 1) % cap;
++  s_ring_count = std::min(s_ring_count + 1, cap);
++  if (fin && !s_finished && s_after < 0)
++  {
++    s_after = 30;  // the finish: keep 30 more frames (the machine coasting over the line)
++    RunLog(fmt::format("finish after {} frames in the ring", s_ring_count));
++  }
++  s_finished = fin;
++  if (s_after > 0 && --s_after == 0)
++  {
++    Run r;
++    r.frames = static_cast<int>(s_ring_count);
++    r.finish = r.frames - 31;
++    r.values.resize(s_ring_count * nf);
++    const size_t start = (s_ring_pos + cap - s_ring_count) % cap;
++    for (size_t k = 0; k < s_ring_count; ++k)
++      std::copy_n(&s_ring[((start + k) % cap) * nf], nf, &r.values[k * nf]);
++    std::lock_guard lk(s_run_mutex);
++    s_runs.push_back(std::move(r));
++    while (s_runs.size() > 3)
++      s_runs.pop_front();
++    s_after = -1;
++  }
++}
++
++std::vector<u8> TakeRunFor(int frames)
++{
++  std::lock_guard lk(s_run_mutex);
++  if (!s_probe)
++    return {};
++  RunLog(fmt::format("ghost of {} frames: {} run(s) kept", frames, s_runs.size()));
++  for (auto it = s_runs.rbegin(); it != s_runs.rend(); ++it)
++  {
++    const int lead = it->finish - frames;  // GO, as far as the finish says
++    RunLog(fmt::format("  run: {} frames, finish {}, GO at {}", it->frames, it->finish, lead));
++    if (lead < 0)
++      continue;
++    // only the race: from 10 s before GO to the end
++    const int cut = std::max(0, lead - 600);
++    if (cut > 0)
++    {
++      const size_t nf0 = s_probe->fields.size();
++      it->values.erase(it->values.begin(), it->values.begin() + static_cast<std::ptrdiff_t>(cut * nf0));
++      it->frames -= cut;
++      it->finish -= cut;
++    }
++    const size_t nf = s_probe->fields.size();
++    picojson::array names, scales;
++    for (const ProbeField& f : s_probe->fields)
++    {
++      names.emplace_back(f.name);
++      scales.emplace_back(f.scale);
++    }
++    picojson::object hdr;
++    hdr["v"] = picojson::value(1.0);
++    hdr["fields"] = picojson::value(names);
++    hdr["scale"] = picojson::value(scales);
++    hdr["frames"] = picojson::value(static_cast<double>(it->frames));
++    hdr["finish"] = picojson::value(static_cast<double>(it->finish));
++    hdr["ghost_frames"] = picojson::value(static_cast<double>(frames));
++    hdr["build"] = picojson::value(Common::GetERBuildStr());
++    const std::string h = picojson::value(hdr).serialize();
++    std::vector<u8> raw = {'E', 'R', 'R', 'U', 'N', '1', 0, 0};
++    const u32 hl = static_cast<u32>(h.size());
++    for (int b = 0; b < 4; ++b)
++      raw.push_back(static_cast<u8>(hl >> (8 * b)));
++    raw.insert(raw.end(), h.begin(), h.end());
++    for (size_t c = 0; c < nf; ++c)
++    {
++      s32 prev = 0;
++      for (int fr = 0; fr < it->frames; ++fr)
++      {
++        const s32 v = it->values[static_cast<size_t>(fr) * nf + c];
++        const s32 d = static_cast<s32>(static_cast<u32>(v) - static_cast<u32>(prev));
++        PutVar(raw, (static_cast<u32>(d) << 1) ^ static_cast<u32>(d >> 31));
++        prev = v;
++      }
++    }
++    Run taken = std::move(*it);
++    s_runs.erase(std::next(it).base());
++    return Zstd(raw);
++  }
++  return {};
++}
++
++Reply GetProbe(const Settings& s)
++{
++  return Call(s, "probe", nullptr, nullptr);
++}
++
++Reply UploadExtra(const Settings& s, const std::string& ghost_sha1, const std::string& kind,
++                  const std::vector<u8>& data)
++{
++  return Call(s, fmt::format("run?ghost={}&kind={}", ghost_sha1, kind), &data, nullptr);
++}
++}  // namespace ERGhosts
+--- a/Source/Core/Core/ERGhosts.h
++++ b/Source/Core/Core/ERGhosts.h
+@@ -0,0 +1,137 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Auto ghost upload for Evolution Racing members.
++//
++// F-Zero GX saves a Time Attack ghost as a GameCube memory card file (8P-GFZE-fzg<16 hex>.dat.gci) in Dolphin's GCI
++// folder for slot A. This Dolphin notices new ones and, as the member chose (Auto / Ask / Off, default Ask), sends each
++// to the member's hub account (the hub link: a code the member made on the hub's Ghosts page). The hub checks the ghost
++// against the track and puts it on that track's Time Attack leaderboard. The other way round, evoracing://ghost/...
++// links on the hub's track pages put a leaderboard ghost into this Dolphin's memory card.
++//
++// Nothing here knows the hub's tracks: the Dolphin sends the ghost file, the sha1 of the disc's course file for the
++// ghost's course slot (stage/COLI_COURSE<slot>.lz, so the hub can tell which of its tracks it is), and its build id.
++
++#pragma once
++
++#include <string>
++#include <vector>
++
++#include "Common/CommonTypes.h"
++
++namespace Core
++{
++class System;
++}
++
++namespace ERGhosts
++{
++enum class Mode
++{
++  Off,
++  Ask,
++  Auto
++};
++
++// The project's hub: the first line of Sys/er-hub.txt in the member package (the address is kept out of the source);
++// "" without that file (then only a link that names its hub can link this Dolphin)
++std::string OfficialHub();
++
++struct Settings
++{
++  Mode mode = Mode::Ask;
++  std::string hub = OfficialHub();
++  std::string token;     // the hub link code (erd_...), empty = not linked
++  std::string username;  // who the code belongs to (from the hub's hello)
++  bool told_unlinked = false;
++  bool offline = false;  // Play offline: no hub call at all (ERUpdates too)
++};
++
++Settings Load();
++// Play offline is on (the last Load / Save): the title bar marker, and no hub call
++bool Offline();
++// The updater's Restart now: let go of the user folder's running.lock before the newer folder copies this one
++void ReleaseLock();
++void Save(const Settings& s);
++std::string ModeName(Mode m);
++
++// One ghost file the game saved.
++struct Ghost
++{
++  std::string path;     // the .gci in the GCI folder
++  std::string sha1;     // of the whole file
++  std::string name;     // fzg<16 hex>.dat
++  int slot = -1;        // course slot
++  int machine = -1;     // machine id
++  u32 total_ms = 0;
++  int frames = 0;       // race frames (60 a second)
++  std::string time;     // m'ss"mmm as the game shows it
++  std::string machine_name;
++  std::vector<u8> data;
++};
++
++// The file check the game itself would pass (size, header, file name, checksum, time and frames agree). "" = good.
++std::string Check(const std::vector<u8>& gci, Ghost* out);
++
++// ---------------------------------------------------------------- host side
++// evoracing://link/<code>?hub=<url> or evoracing://ghost/... (hub pages)
++bool IsArg(const std::string& arg);
++// Takes the per-user-folder lock. True = another Dolphin of this user folder runs: the argument was handed to it.
++bool ForwardIfRunning(const std::string& arg);
++// Arguments handed over by later launches since the last call.
++std::vector<std::string> TakeForwarded();
++std::string Dir();  // User/ERGhosts/
++
++// The disc this Dolphin booted (MainWindow::StartGame), for the course file hash. Test in game boots are marked.
++void SetBootDisc(const std::string& path, bool er_test);
++// sha1 (lowercase hex) of stage/COLI_COURSE<slot>.lz on the booted disc, "" when unknown
++std::string CourseSha1(int slot);
++bool BootedForTest();
++
++// The GCI folder of slot A (USA). New ghost files there since the last call (the first call ever only notes what is
++// there already: those are not sent). Files that are not good ghosts yet (still being written) are looked at again.
++std::string GciFolder();
++std::vector<Ghost> TakeNew();
++// Remember a ghost's outcome (sent / skipped / installed ...): it is never offered again.
++void MarkDone(const std::string& sha1, const std::string& what);
++// Ghosts saved while Play offline was on (ledger "offline", file still in the card folder): "Upload saved ghosts now"
++std::vector<Ghost> TakeOffline();
++
++// ---------------------------------------------------------------- hub calls (any thread; blocking, ~20 s at most)
++struct Reply
++{
++  int status = 0;          // HTTP status, 0 = no answer
++  std::string error;       // the hub's "error" (or a network problem), "" when ok
++  std::string text;        // the raw answer
++  bool ok() const { return status == 200 && error.empty(); }
++};
++Reply Hello(const Settings& s);
++Reply Upload(const Settings& s, const Ghost& g, const std::string& coli_sha1, bool dry);
++// what = "ghost/<track>/<race|lap>/<user>.gci" or "staffghost/<track>.gci"
++Reply Fetch(const Settings& s, const std::string& what, std::vector<u8>* out);
++// A string field of a JSON answer ("" when missing).
++std::string Field(const std::string& json, const std::string& key);
++
++// A ghost file from the hub into the GCI folder (checked first). *message says what happened.
++bool Install(const std::vector<u8>& gci, std::string* message);
++// evoracing://link/... -> {code, hub}; evoracing://ghost/... -> the Fetch path. False when the argument is malformed.
++bool ParseLink(const std::string& arg, std::string* code, std::string* hub);
++bool ParseGhost(const std::string& arg, std::string* what);
++// A hub address the link may use: https://..., or http:// on this computer (a local test hub).
++bool HubAllowed(const std::string& hub);
++
++// ---------------------------------------------------------------- full-rate run telemetry
++// The hub's probe (which RAM words to read per frame: the player's racer, the race counter, the finish flag) is kept in
++// User/ERGhosts/probe.json; no game knowledge is built in. While a race runs, every frame's values are kept; the newest
++// finished runs (3) stay in memory until a ghost that fits one is sent.
++bool LoadProbe(const std::string& json);  // true = usable; also saved for the next start
++bool HasProbe();
++void EnableRecording(bool on);            // off (ghosts Off / not linked): OnFrame reads nothing
++void OnFrame(Core::System& system);       // CPU thread, every frame (Core.cpp OnFrameEnd)
++// The newest finished run whose finish fits a ghost of `frames` race frames, encoded (columns, zigzag deltas, zstd).
++std::vector<u8> TakeRunFor(int frames);
++Reply GetProbe(const Settings& s);
++// kind = "tele" (TakeRunFor): stored with the member's ghost on the hub
++Reply UploadExtra(const Settings& s, const std::string& ghost_sha1, const std::string& kind, const std::vector<u8>& data);
++std::vector<u8> Zstd(const std::vector<u8>& raw);
++}  // namespace ERGhosts
 --- a/Source/Core/Core/ERTest.cpp
 +++ b/Source/Core/Core/ERTest.cpp
 @@ -0,0 +1,1215 @@
@@ -15064,6 +16612,1276 @@ HcmV?d00001
 +bool Unthrottled();
 +void FilterPad(int chan, GCPadStatus* pad);
 +}  // namespace ERTest
+--- a/Source/Core/Core/ERUpdates.cpp
++++ b/Source/Core/Core/ERUpdates.cpp
+@@ -0,0 +1,1156 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/ERUpdates.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cctype>
++#include <filesystem>
++#include <map>
++#include <regex>
++#include <set>
++#include <thread>
++
++#include <fmt/format.h>
++#include <mz.h>
++#include <mz_strm.h>
++#include <mz_zip.h>
++#include <mz_zip_rw.h>
++#include <picojson.h>
++
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <fcntl.h>
++#include <sys/file.h>
++#include <unistd.h>
++#endif
++
++#include "Common/CommonPaths.h"
++#include "Common/ERDownload.h"
++#include "Common/FileSearch.h"
++#include "Common/FileUtil.h"
++#include "Common/HttpRequest.h"
++#include "Common/IOFile.h"
++#include "Common/IniFile.h"
++#include "Common/ScopeGuard.h"
++#include "Common/StringUtil.h"
++#include "Common/Version.h"
++
++namespace fs = std::filesystem;
++
++namespace ERUpdates
++{
++namespace
++{
++const char* const EFFECT_DIRS[] = {"GFZE01-effects", "GFZE01-machinelight", "GFZE01-strips", "GFZE01-rails"};
++
++s64 Now()
++{
++  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
++}
++
++std::string Strip(std::string s)
++{
++  while (!s.empty() && (s.back() == '/' || s.back() == '\\'))
++    s.pop_back();
++  return s;
++}
++
++fs::path P(const std::string& s)
++{
++  return StringToPath(s);
++}
++
++std::string S(const fs::path& p)
++{
++  return PathToString(p);
++}
++
++std::string SettingsPath()
++{
++  return File::GetUserPath(D_CONFIG_IDX) + "er-updates.txt";
++}
++
++std::string InstalledPath()
++{
++  return File::GetUserPath(D_CONFIG_IDX) + "er-installed.json";
++}
++
++picojson::object ReadJsonObject(const std::string& path)
++{
++  std::string text;
++  picojson::value v;
++  if (File::ReadFileToString(path, text) && picojson::parse(v, text).empty() && v.is<picojson::object>())
++    return v.get<picojson::object>();
++  return {};
++}
++
++void WriteJson(const std::string& path, const picojson::object& o)
++{
++  File::CreateFullPath(path);
++  File::WriteStringToFile(path + ".tmp", picojson::value(o).serialize(true));
++  File::Rename(path + ".tmp", path);
++}
++
++std::string Str(const picojson::object& o, const std::string& k)
++{
++  const auto it = o.find(k);
++  if (it == o.end())
++    return {};
++  if (it->second.is<std::string>())
++    return it->second.get<std::string>();
++  if (it->second.is<double>())
++    return fmt::format("{}", static_cast<s64>(it->second.get<double>()));
++  return {};
++}
++
++bool Bool(const picojson::object& o, const std::string& k)
++{
++  const auto it = o.find(k);
++  return it != o.end() && it->second.is<bool>() && it->second.get<bool>();
++}
++
++u64 Num(const picojson::object& o, const std::string& k)
++{
++  const auto it = o.find(k);
++  return it != o.end() && it->second.is<double>() ? static_cast<u64>(it->second.get<double>()) : 0;
++}
++
++bool SafeName(const std::string& n)
++{
++  if (n.empty() || n.front() == '/' || n.find('\\') != std::string::npos || n.find(':') != std::string::npos)
++    return false;
++  for (const std::string& part : SplitString(n, '/'))
++    if (part == "..")
++      return false;
++  return true;
++}
++
++// ---- one zip: the entries (name, size), then unpack the chosen ones (CRC checked by minizip on every entry)
++struct Zip
++{
++  void* r = nullptr;
++  std::vector<std::pair<std::string, u64>> entries;
++  std::string error;
++  explicit Zip(const std::string& path)
++  {
++    r = mz_zip_reader_create();
++    if (!r || mz_zip_reader_open_file(r, path.c_str()) != MZ_OK)
++    {
++      error = "the download is not a complete zip (no central directory): download it again";
++      return;
++    }
++    if (mz_zip_reader_goto_first_entry(r) != MZ_OK)
++    {
++      error = "the zip is empty";
++      return;
++    }
++    do
++    {
++      mz_zip_file* info = nullptr;
++      if (mz_zip_reader_entry_get_info(r, &info) != MZ_OK || !info || !info->filename)
++      {
++        error = "the zip's directory is damaged";
++        return;
++      }
++      entries.emplace_back(info->filename, info->uncompressed_size);
++    } while (mz_zip_reader_goto_next_entry(r) == MZ_OK);
++  }
++  ~Zip()
++  {
++    if (r)
++    {
++      mz_zip_reader_close(r);
++      mz_zip_reader_delete(&r);
++    }
++  }
++  bool Read(const std::string& name, std::string* out)
++  {
++    if (mz_zip_reader_locate_entry(r, name.c_str(), 0) != MZ_OK)
++      return false;
++    mz_zip_file* info = nullptr;
++    if (mz_zip_reader_entry_get_info(r, &info) != MZ_OK || info->uncompressed_size > (16 << 20))
++      return false;
++    out->resize(info->uncompressed_size);
++    if (mz_zip_reader_entry_open(r) != MZ_OK)
++      return false;
++    Common::ScopeGuard g{[&] { mz_zip_reader_entry_close(r); }};
++    s64 done = 0;
++    while (done < static_cast<s64>(out->size()))
++    {
++      const s32 n = mz_zip_reader_entry_read(r, out->data() + done, static_cast<s32>(std::min<s64>(1 << 20, out->size() - done)));
++      if (n <= 0)
++        return false;
++      done += n;
++    }
++    return true;
++  }
++  // unpack every entry ok(name) says yes to under dest (name -> dest + strip(name)); returns how many, -1 on error
++  int Extract(const std::function<bool(const std::string&)>& ok, const std::function<std::string(const std::string&)>& to,
++              std::vector<std::string>* written)
++  {
++    int n = 0;
++    if (mz_zip_reader_goto_first_entry(r) != MZ_OK)
++      return -1;
++    do
++    {
++      mz_zip_file* info = nullptr;
++      if (mz_zip_reader_entry_get_info(r, &info) != MZ_OK)
++        return -1;
++      const std::string name = info->filename;
++      if (name.empty() || name.back() == '/' || !ok(name))
++        continue;
++      const std::string dest = to(name);
++      File::CreateFullPath(dest);
++      if (mz_zip_reader_entry_save_file(r, dest.c_str()) != MZ_OK)
++      {
++        error = "could not unpack " + name + " (damaged download, or the disk is full)";
++        return -1;
++      }
++      if (static_cast<s64>(File::GetSize(dest)) != info->uncompressed_size)
++      {
++        error = "unpacked size of " + name + " is wrong";
++        return -1;
++      }
++      if (written)
++        written->push_back(dest);
++      ++n;
++    } while (mz_zip_reader_goto_next_entry(r) == MZ_OK);
++    return n;
++  }
++};
++
++// ---- backup / roll back of the folders and files a pack replaces
++struct Backup
++{
++  std::string dir;  // User/ERUpdates/backup/<kind>/
++  std::vector<std::pair<std::string, std::string>> moved;  // (original, backup)
++  std::vector<std::string> roots;                          // what the pack writes (removed on roll back)
++  std::string error;
++  bool Take(const std::string& kind, const std::vector<std::string>& paths)
++  {
++    dir = Dir() + "backup/" + kind + "/";
++    std::error_code ec;
++    fs::remove_all(P(dir), ec);
++    File::CreateFullPath(dir);
++    int i = 0;
++    for (const std::string& p : paths)
++    {
++      roots.push_back(p);
++      if (!fs::exists(P(Strip(p)), ec))
++        continue;
++      const std::string b = dir + fmt::format("{:02}", i++);
++      fs::rename(P(Strip(p)), P(b), ec);
++      if (ec)
++      {
++        error = "could not set " + p + " aside (" + ec.message() + ")";
++        Restore();
++        return false;
++      }
++      moved.emplace_back(Strip(p), b);
++    }
++    return true;
++  }
++  void Restore()
++  {
++    std::error_code ec;
++    for (const std::string& r : roots)
++      fs::remove_all(P(Strip(r)), ec);
++    for (auto it = moved.rbegin(); it != moved.rend(); ++it)
++    {
++      File::CreateFullPath(it->first);
++      fs::rename(P(it->second), P(it->first), ec);
++    }
++    moved.clear();
++  }
++  void Drop(const std::string& keep_as = "")
++  {
++    std::error_code ec;
++    if (!keep_as.empty())
++    {
++      fs::remove_all(P(Dir() + "previous/" + keep_as), ec);
++      File::CreateFullPath(Dir() + "previous/");
++      fs::rename(P(Strip(dir)), P(Dir() + "previous/" + keep_as), ec);
++      if (!ec)
++        return;
++    }
++    fs::remove_all(P(Strip(dir)), ec);
++  }
++};
++
++void WriteMetadata()
++{
++  // every graphics mod's metadata.json from its metadata.json.in for where this folder is now (the start scripts do
++  // the same at every start; forward slashes are valid on Windows too)
++  std::string u = Strip(UserDir());
++  std::replace(u.begin(), u.end(), '\\', '/');
++  std::string esc;
++  for (char c : u)
++    esc += c == '"' ? std::string("\\\"") : std::string(1, c);
++  const std::string gm = UserDir() + "Load/GraphicMods/";
++  std::error_code ec;
++  for (const auto& e : fs::directory_iterator(P(gm), ec))
++  {
++    const std::string in = S(e.path() / "metadata.json.in");
++    std::string t;
++    if (!File::ReadFileToString(in, t))
++      continue;
++    size_t pos = 0;
++    while ((pos = t.find("@USERDIR@", pos)) != std::string::npos)
++    {
++      t.replace(pos, 9, esc);
++      pos += esc.size();
++    }
++    File::WriteStringToFile(S(e.path() / "metadata.json"), t);
++  }
++}
++
++void StatusLine(const std::string& prefix, const std::string& line)
++{
++  // Config/er-status.txt (shown when a game starts): replace the line that starts with prefix
++  const std::string f = File::GetUserPath(D_CONFIG_IDX) + "er-status.txt";
++  std::string t;
++  File::ReadFileToString(f, t);
++  std::vector<std::string> lines;
++  bool done = false;
++  for (const std::string& l : SplitString(t, '\n'))
++  {
++    if (l.empty())
++      continue;
++    if (l.starts_with(prefix))
++    {
++      lines.push_back(line);
++      done = true;
++    }
++    else
++      lines.push_back(l);
++  }
++  if (!done)
++    lines.push_back(line);
++  std::string out;
++  for (const std::string& l : lines)
++    out += l + "\n";
++  File::WriteStringToFile(f, out);
++}
++
++std::string Day()
++{
++  const std::time_t t = std::time(nullptr);
++  char buf[32];
++  std::strftime(buf, sizeof buf, "%d %b", std::localtime(&t));
++  return buf;
++}
++
++bool WaitLockFree(const std::string& user_dir, int seconds)
++{
++  // the older folder's Dolphin (ERGhosts running.lock) must have closed before its saves are copied
++  const std::string lock = Strip(user_dir) + "/ERGhosts/running.lock";
++  if (!File::Exists(lock))
++    return true;
++  for (int i = 0; i < seconds * 4; ++i)
++  {
++#ifdef _WIN32
++    HANDLE h = CreateFileW(UTF8ToWString(lock).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
++                           FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (h != INVALID_HANDLE_VALUE)
++    {
++      CloseHandle(h);
++      return true;
++    }
++#else
++    const int fd = open(lock.c_str(), O_RDWR | O_CLOEXEC);
++    if (fd < 0)
++      return true;
++    const bool free = flock(fd, LOCK_EX | LOCK_NB) == 0;
++    close(fd);  // (closing drops the lock again)
++    if (free)
++      return true;
++#endif
++    std::this_thread::sleep_for(std::chrono::milliseconds(250));
++  }
++  return false;
++}
++
++void CopyTree(const fs::path& from, const fs::path& to, bool hardlink, int* files)
++{
++  std::error_code ec;
++  if (!fs::is_directory(from, ec))
++    return;
++  for (auto it = fs::recursive_directory_iterator(from, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
++  {
++    const fs::path rel = fs::relative(it->path(), from, ec);
++    const fs::path dst = to / rel;
++    if (it->is_directory(ec))
++    {
++      fs::create_directories(dst, ec);
++      continue;
++    }
++    fs::create_directories(dst.parent_path(), ec);
++    std::error_code e2;
++    if (fs::exists(dst, e2))
++      fs::remove(dst, e2);
++    bool ok = false;
++    if (hardlink)
++    {
++      fs::create_hard_link(it->path(), dst, e2);  // same disk: no second copy of the HD textures
++      ok = !e2;
++    }
++    if (!ok)
++      fs::copy_file(it->path(), dst, fs::copy_options::overwrite_existing, e2);
++    if (files)
++      ++*files;
++  }
++}
++
++std::string UserOf(const std::string& top)
++{
++  for (const char* n : {"user", "User"})
++    if (File::IsDirectory(Strip(top) + "/" + n + "/Config"))
++      return Strip(top) + "/" + n + "/";
++  return {};
++}
++}  // namespace
++
++// ---------------------------------------------------------------- settings, paths
++std::string ModeName(Mode m)
++{
++  return m == Mode::Off ? "off" : m == Mode::Auto ? "auto" : "notify";
++}
++
++Settings Load()
++{
++  Settings s;
++  std::string text;
++  if (!File::ReadFileToString(SettingsPath(), text))
++    return s;
++  for (std::string line : SplitString(text, '\n'))
++  {
++    while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
++      line.pop_back();
++    const auto eq = line.find('=');
++    if (eq == std::string::npos)
++      continue;
++    const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
++    if (k == "mode")
++      s.mode = v == "off" ? Mode::Off : v == "auto" ? Mode::Auto : Mode::Notify;
++    else if (k == "asked")
++      s.asked = v == "1";
++  }
++  return s;
++}
++
++void Save(const Settings& s)
++{
++  File::CreateFullPath(File::GetUserPath(D_CONFIG_IDX));
++  File::WriteStringToFile(SettingsPath() + ".tmp",
++                          fmt::format("# Evolution Racing updates (optional; Tools > Evolution Racing settings): "
++                                      "mode = off | notify | auto\nmode={}\nasked={}\n",
++                                      ModeName(s.mode), s.asked ? 1 : 0));
++  File::Rename(SettingsPath() + ".tmp", SettingsPath());
++}
++
++std::string UserDir()
++{
++  return File::GetUserPath(D_USER_IDX);
++}
++
++std::string TopDir()
++{
++  return S(P(Strip(UserDir())).parent_path()) + "/";
++}
++
++std::string Dir()
++{
++  return UserDir() + "ERUpdates/";
++}
++
++std::string Platform()
++{
++#ifdef _WIN32
++  return "windows";
++#else
++  return "linux";
++#endif
++}
++
++bool UpdateHubAllowed(const std::string& hub)
++{
++  const std::string h = Strip(hub);
++  const std::string official = ERGhosts::OfficialHub();  // Sys/er-hub.txt of the member package
++  return (!official.empty() && h == official) || h.starts_with("http://127.0.0.1:") || h.starts_with("http://localhost:");
++}
++
++bool BuildHas(const std::string& own, const std::string& need)
++{
++  static const std::regex re("lit17s(\\d+)([a-z]*)");
++  std::smatch a, b;
++  if (need.empty() || !std::regex_match(need, b, re))
++    return true;
++  if (!std::regex_match(own, a, re))
++    return false;
++  const int an = std::stoi(a[1]), bn = std::stoi(b[1]);
++  if (an != bn)
++    return an > bn;
++  const std::string al = a[2], bl = b[2];
++  return std::all_of(bl.begin(), bl.end(), [&](char c) { return al.find(c) != std::string::npos; });
++}
++
++std::string Human(u64 n)
++{
++  if (n >= 1000000000ull)
++    return fmt::format("{:.2f} GB", n / 1e9);
++  if (n >= 10ull << 20)
++    return fmt::format("{:.0f} MB", n / 1048576.0);
++  return fmt::format("{:.1f} MB", n / 1048576.0);
++}
++
++void Log(const std::string& line)
++{
++  File::CreateFullPath(Dir());
++  File::IOFile f(Dir() + "updates.log", "ab");
++  const std::time_t t = std::time(nullptr);
++  char buf[32];
++  std::strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S", std::localtime(&t));
++  f.WriteString(fmt::format("{} {}\n", buf, line));
++}
++
++std::string InstalledJson()
++{
++  return picojson::value(ReadJsonObject(InstalledPath())).serialize();
++}
++
++// ---------------------------------------------------------------- the hub
++CheckResult Check(const ERGhosts::Settings& s)
++{
++  CheckResult r;
++  if (s.offline)
++  {
++    r.error = "Play offline is on";
++    return r;
++  }
++  if (s.token.empty())
++  {
++    r.error = "this Dolphin is not linked to the hub";
++    return r;
++  }
++  if (!UpdateHubAllowed(s.hub))
++  {
++    r.error = "updates come only from the project's hub" +
++              (ERGhosts::OfficialHub().empty() ? std::string() : " " + ERGhosts::OfficialHub()) + " (this Dolphin is linked to " + s.hub + ")";
++    return r;
++  }
++  Common::HttpRequest req(std::chrono::milliseconds(30000));
++  if (!req.IsValid())
++  {
++    r.error = "the network library did not start";
++    return r;
++  }
++  picojson::object body;
++  body["platform"] = picojson::value(Platform());
++  body["build"] = picojson::value(Common::GetERBuildStr());
++  body["installed"] = picojson::value(ReadJsonObject(InstalledPath()));
++  const std::string payload = picojson::value(body).serialize();
++  Common::HttpRequest::Headers h = {{"X-ER-Dolphin", s.token},
++                                    {"X-ER-Build", Common::GetERBuildStr()},
++                                    {"X-ER-Ghosts", "1"},
++                                    {"Content-Type", "application/json"},
++                                    {"Accept", "application/json"},
++                                    {"Expect", std::nullopt}};
++  const auto resp = req.Post(Strip(s.hub) + "/hub/api/erd/updates", std::string_view(payload), h,
++                             Common::HttpRequest::AllowedReturnCodes::All);
++  if (!resp)
++  {
++    r.error = "the hub did not answer (no network?)";
++    return r;
++  }
++  r.status = req.GetLastResponseCode();
++  const std::string text(resp->begin(), resp->end());
++  picojson::value v;
++  if (!picojson::parse(v, text).empty() || !v.is<picojson::object>())
++  {
++    r.error = fmt::format("the hub answered HTTP {}", r.status);
++    return r;
++  }
++  const auto& o = v.get<picojson::object>();
++  if (r.status != 200)
++  {
++    r.error = Str(o, "error");
++    r.relink = r.status == 401;
++    if (r.error.empty())
++      r.error = fmt::format("the hub answered HTTP {}", r.status);
++    return r;
++  }
++  const auto it = o.find("items");
++  if (it == o.end() || !it->second.is<picojson::array>())
++    return r;
++  for (const auto& x : it->second.get<picojson::array>())
++  {
++    if (!x.is<picojson::object>())
++      continue;
++    const auto& io = x.get<picojson::object>();
++    Item i;
++    i.id = Str(io, "id");
++    i.kind = Str(io, "kind");
++    i.title = Str(io, "title");
++    i.detail = Str(io, "detail");
++    i.version = Str(io, "version");
++    i.url = Str(io, "url");
++    i.sha256 = Str(io, "sha256");
++    i.needs = Str(io, "needs");
++    i.note = Str(io, "note");
++    i.blocked = Str(io, "blocked");
++    i.file = Str(io, "file");
++    i.size = Num(io, "size");
++    i.required = Bool(io, "required");
++    i.preparing = Bool(io, "preparing");
++    i.after_dolphin = Bool(io, "after_dolphin");
++    i.er_version = Str(io, "er_version");
++    static const std::set<std::string> kinds = {"dolphin", "effects", "hd", "machines", "track-hd", "scenery"};
++    if (!kinds.contains(i.kind) || !i.url.starts_with("/hub/api/erd/get/"))
++      continue;
++    r.items.push_back(std::move(i));
++  }
++  return r;
++}
++
++bool Download(const ERGhosts::Settings& s, const Item& it, std::string* path, std::string* error, const ProgressFn& progress,
++              const std::atomic<bool>* cancel)
++{
++  if (s.offline)
++  {
++    *error = "Play offline is on";
++    return false;
++  }
++  if (!UpdateHubAllowed(s.hub) || s.token.empty())
++  {
++    *error = "not linked to the project's hub";
++    return false;
++  }
++  if (!it.Ready())
++  {
++    *error = it.note.empty() ? "not ready on the hub yet" : it.note;
++    return false;
++  }
++  const std::string dl = Dir() + "dl/";
++  File::CreateFullPath(dl);
++  std::string ext = it.kind == "dolphin" ? (it.file.ends_with(".zip") ? ".zip" : ".tar.gz") : ".zip";
++  const std::string name = fmt::format("{}-{}{}", it.kind, it.sha256.substr(0, 16), ext);
++  const std::string done = dl + name, part = done + ".part";
++  if (File::Exists(done) && File::GetSize(done) == it.size && Common::ERDownload::Sha256File(done) == it.sha256)
++  {
++    *path = done;
++    return true;
++  }
++  // (the hub serves the member's own copy: the same sha256 as the manifest said, else the download is refused below)
++  std::map<std::string, std::string> h = {{"X-ER-Dolphin", s.token}, {"X-ER-Build", Common::GetERBuildStr()},
++                                          {"X-ER-Ghosts", "1"}};
++  Common::ERDownload::Result r;
++  for (int attempt = 0; attempt < 3; ++attempt)
++  {
++    r = Common::ERDownload::ToFile(Strip(s.hub) + it.url, h, part, true, progress, cancel);
++    if (r.error.empty() || r.error == "stopped" || (r.status >= 400 && r.status != 503))
++      break;
++  }
++  if (!r.error.empty())
++  {
++    std::string msg = r.error;
++    picojson::value v;
++    if (!r.body.empty() && picojson::parse(v, r.body).empty() && v.is<picojson::object>() &&
++        !Str(v.get<picojson::object>(), "error").empty())
++      msg = Str(v.get<picojson::object>(), "error");
++    if (r.status >= 400)
++      File::Delete(part);  // not the file: start over next time
++    *error = msg;
++    return false;
++  }
++  if (r.bytes != it.size)
++  {
++    *error = fmt::format("the download has {} bytes, the hub said {}: it will download again", r.bytes, it.size);
++    if (r.bytes > it.size)
++      File::Delete(part);
++    return false;
++  }
++  const std::string got = Common::ERDownload::Sha256File(part);
++  if (got != it.sha256)
++  {
++    File::Delete(part);
++    *error = "the download is damaged (its sha256 does not match the hub's): it will download again";
++    return false;
++  }
++  File::Delete(done);
++  if (!File::Rename(part, done))
++  {
++    *error = "could not keep the download";
++    return false;
++  }
++  Log(fmt::format("downloaded {} {} {} bytes sha256 {}", it.kind, it.version, it.size, it.sha256));
++  *path = done;
++  return true;
++}
++
++// ---------------------------------------------------------------- packs
++bool InstallPack(const Item& it, const std::string& zip, std::string* message)
++{
++  const std::string u = UserDir(), tex = u + "Load/Textures/", gm = u + "Load/GraphicMods/";
++  Zip z(zip);
++  if (!z.error.empty())
++  {
++    *message = z.error;
++    return false;
++  }
++  u64 need = 0;
++  for (const auto& [n, sz] : z.entries)
++  {
++    if (!SafeName(n))
++    {
++      *message = "the pack holds a file name this Dolphin does not unpack: " + n;
++      return false;
++    }
++    need += sz;
++  }
++  std::error_code ec;
++  const auto space = fs::space(P(u), ec);
++  if (!ec && space.available < need + (200ull << 20))
++  {
++    *message = fmt::format("not enough free disk space ({} needed, {} free)", Human(need), Human(space.available));
++    return false;
++  }
++  picojson::object inst = ReadJsonObject(InstalledPath());
++  picojson::object upd = inst.count("updater") && inst["updater"].is<picojson::object>() ?
++                             inst["updater"].get<picojson::object>() :
++                             picojson::object{};
++  const s64 now = Now();
++  const std::string file = P(zip).filename().string();
++  Backup b;
++  std::vector<std::string> roots;
++  std::function<bool(const std::string&)> ok;
++  std::function<std::string(const std::string&)> to;
++  int expect = 0;
++  picojson::object man;
++  std::string keep_prev;
++
++  if (it.kind == "effects")
++  {
++    std::string mj;
++    if (!z.Read("Config/er-pack.json", &mj))
++    {
++      *message = "not an effects pack from the hub (no Config/er-pack.json)";
++      return false;
++    }
++    picojson::value v;
++    if (!picojson::parse(v, mj).empty() || !v.is<picojson::object>())
++    {
++      *message = "the effects pack's manifest is damaged";
++      return false;
++    }
++    man = v.get<picojson::object>();
++    if (!BuildHas(Common::GetERBuildStr(), Str(man, "needs")))
++    {
++      *message = "this effects pack needs Evolution Racing Dolphin " + Str(man, "needs") + " or newer";
++      return false;
++    }
++    expect = static_cast<int>(Num(man, "files"));
++    for (const char* d : EFFECT_DIRS)
++      roots.push_back(gm + d);
++    roots.push_back(tex + "0-GFZE01-strips");
++    for (const char* f : {"GraphicMods/GFZE01.json", "er-pack.json", "er-pack-settings.ini"})
++      roots.push_back(u + "Config/" + f);
++    ok = [](const std::string& n) {
++      if (n.starts_with("README"))
++        return false;
++      return n.starts_with("Load/GraphicMods/") || n.starts_with("Load/Textures/0-GFZE01-strips/") || n.starts_with("Config/");
++    };
++    for (const auto& [n, sz] : z.entries)
++      if (!n.ends_with("/") && !ok(n) && !n.starts_with("README"))
++      {
++        *message = "not an effects pack from the hub: " + n;
++        return false;
++      }
++    to = [u](const std::string& n) { return u + n; };
++    keep_prev = "effects";
++  }
++  else if (it.kind == "hd")
++  {
++    roots.push_back(tex + "GFZE01");
++    ok = [](const std::string& n) { return n.starts_with("GFZE01/"); };
++    to = [tex](const std::string& n) { return tex + n; };
++    for (const auto& [n, sz] : z.entries)
++      if (!n.ends_with("/") && !ok(n))
++      {
++        *message = "not an HD texture pack from the hub: " + n;
++        return false;
++      }
++  }
++  else if (it.kind == "machines")
++  {
++    roots.push_back(tex + "GFZE01/00-machine-remasters");
++    ok = [](const std::string& n) { return n.starts_with("GFZE01/00-machine-remasters/"); };
++    to = [tex](const std::string& n) { return tex + n; };
++  }
++  else if (it.kind == "track-hd")
++  {
++    ok = [](const std::string& n) { return n.starts_with("GFZE01/"); };
++    to = [tex](const std::string& n) { return tex + n; };
++    for (const auto& [n, sz] : z.entries)
++      if (!n.ends_with("/") && ok(n))
++        roots.push_back(tex + n);  // single files: each one set aside when it is there already
++  }
++  else if (it.kind == "scenery")
++  {
++    roots.push_back(gm + "GFZE01-fx/scenery");
++    ok = [](const std::string& n) { return n.starts_with("scenery/"); };
++    to = [gm](const std::string& n) { return gm + "GFZE01-fx/" + n; };
++  }
++  else
++  {
++    *message = "unknown pack kind " + it.kind;
++    return false;
++  }
++  if (!b.Take(it.kind, roots))
++  {
++    *message = b.error;
++    return false;
++  }
++  std::vector<std::string> written;
++  const int n = z.Extract(ok, to, &written);
++  std::string fail;
++  if (n < 0)
++    fail = z.error;
++  else if (n == 0)
++    fail = "the pack has nothing to install";
++  else if (expect && n != expect)
++    fail = fmt::format("{} of {} files: the pack is incomplete", n, expect);
++  if (!fail.empty())
++  {
++    b.Restore();
++    Log("install failed, rolled back: " + it.kind + " " + it.version + ": " + fail);
++    *message = fail + ". Nothing changed: what you had is back.";
++    return false;
++  }
++  // the HD pack replaces GFZE01: the machine remasters inside it come back
++  if (it.kind == "hd")
++  {
++    for (const auto& [orig, bak] : b.moved)
++    {
++      const fs::path mr = P(bak) / "00-machine-remasters";
++      if (orig == Strip(tex + "GFZE01") && fs::is_directory(mr, ec) && !fs::exists(P(tex + "GFZE01/00-machine-remasters"), ec))
++        fs::rename(mr, P(tex + "GFZE01/00-machine-remasters"), ec);
++    }
++  }
++  // what is installed now (the same keys the start scripts write)
++  if (it.kind == "effects")
++  {
++    picojson::object e;
++    e["at"] = picojson::value(static_cast<double>(now));
++    e["file"] = picojson::value(file);
++    e["legacy"] = picojson::value(false);
++    for (const char* k : {"needs", "effects_build", "made", "tier", "chosen", "labels", "total"})
++      if (man.count(k))
++        e[k] = man[k];
++    inst["effects"] = picojson::value(e);
++    const auto ch = man.count("chosen") && man["chosen"].is<picojson::array>() ? man["chosen"].get<picojson::array>().size() : 0;
++    StatusLine("Effects pack:", fmt::format("Effects pack: {} of {} effects{} (installed {})", ch, Str(man, "total"),
++                                            Str(man, "tier").empty() ? "" : ", " + Str(man, "tier"), Day()));
++  }
++  else if (it.kind == "hd")
++  {
++    picojson::object h;
++    const std::string tier = it.url.find("tier=high") != std::string::npos ? "high" : "standard";
++    h["at"] = picojson::value(static_cast<double>(now));
++    h["file"] = picojson::value(file);
++    h["files"] = picojson::value(static_cast<double>(n));
++    h["tier"] = picojson::value(tier);
++    inst["hd"] = picojson::value(h);
++    StatusLine("HD textures:", fmt::format("HD textures: {} ({} files, {})", tier == "high" ? "High" : "Standard", n, Day()));
++  }
++  else if (it.kind == "machines" || it.kind == "track-hd")
++  {
++    picojson::array extra = inst.count("hd_extra") && inst["hd_extra"].is<picojson::array>() ? inst["hd_extra"].get<picojson::array>() :
++                                                                                               picojson::array{};
++    picojson::object x;
++    x["at"] = picojson::value(static_cast<double>(now));
++    x["file"] = picojson::value(it.kind == "machines" ? std::string("Machine-remasters-updater.zip") : file);
++    x["files"] = picojson::value(static_cast<double>(n));
++    extra.push_back(picojson::value(x));
++    inst["hd_extra"] = picojson::value(extra);
++  }
++  else if (it.kind == "scenery")
++  {
++    picojson::object sc;
++    sc["at"] = picojson::value(static_cast<double>(now));
++    sc["file"] = picojson::value(file);
++    sc["slots"] = picojson::value(static_cast<double>(n));
++    inst["scenery"] = picojson::value(sc);
++  }
++  upd[it.kind] = picojson::value(it.version);
++  // the setup's Evolution Racing X.Y.Z: the newest pack version installed (Common::GetERSetupVersion reads it)
++  if (!it.er_version.empty() && it.kind != "dolphin" &&
++      (!inst.count("er_version") || !inst["er_version"].is<std::string>() ||
++       Common::ERVersionCompare(it.er_version, inst["er_version"].get<std::string>()) > 0))
++    inst["er_version"] = picojson::value(it.er_version);
++  inst["updater"] = picojson::value(upd);
++  WriteJson(InstalledPath(), inst);
++  Common::ERVersionChanged();
++  WriteMetadata();
++  b.Drop(keep_prev);
++  Log(fmt::format("installed {} {} ({} files)", it.kind, it.version, n));
++  *message = fmt::format("{} installed ({} files)", it.title.empty() ? it.kind : it.title, n);
++  return true;
++}
++
++void KeepForNewDolphin(const Item& it, const std::string& zip)
++{
++  const std::string dir = Dir() + "pending/";
++  File::CreateFullPath(dir);
++  const std::string dst = dir + P(zip).filename().string();
++  File::Rename(zip, dst);
++  picojson::object o;
++  o["kind"] = picojson::value(it.kind);
++  o["version"] = picojson::value(it.version);
++  o["title"] = picojson::value(it.title);
++  o["url"] = picojson::value(it.url);
++  o["needs"] = picojson::value(it.needs);
++  WriteJson(dst + ".json", o);
++  Log("kept for the new Dolphin: " + it.kind + " " + it.version);
++}
++
++std::vector<std::pair<Item, std::string>> PendingPacks()
++{
++  std::vector<std::pair<Item, std::string>> out;
++  for (const std::string& j : Common::DoFileSearch({Dir() + "pending/"}, {".json"}, false))
++  {
++    const std::string zip = j.substr(0, j.size() - 5);
++    if (!File::Exists(zip))
++    {
++      File::Delete(j);
++      continue;
++    }
++    const picojson::object o = ReadJsonObject(j);
++    Item i;
++    i.kind = Str(o, "kind");
++    i.version = Str(o, "version");
++    i.title = Str(o, "title");
++    i.url = Str(o, "url");
++    i.needs = Str(o, "needs");
++    if (BuildHas(Common::GetERBuildStr(), i.needs))
++      out.emplace_back(i, zip);
++  }
++  return out;
++}
++
++void PendingDone(const std::string& zip)
++{
++  File::Delete(zip);
++  File::Delete(zip + ".json");
++}
++
++// ---------------------------------------------------------------- a newer Dolphin
++bool StageDolphin(const Item& it, const std::string& archive, std::string* message)
++{
++  picojson::object o;
++  o["version"] = picojson::value(it.version);
++  o["file"] = picojson::value(P(archive).filename().string());
++  o["sha256"] = picojson::value(it.sha256);
++  o["size"] = picojson::value(static_cast<double>(it.size));
++#ifdef _WIN32
++  // unpack next to this folder now (the next start, or Restart, switches to it)
++  const fs::path parent = P(Strip(TopDir())).parent_path();
++  std::string target = S(parent / ("EvolutionRacing-Dolphin-" + it.version));
++  for (int k = 2; File::Exists(target) && !File::Exists(target + "/er-staged-by-updater.txt"); ++k)
++    target = S(parent / fmt::format("EvolutionRacing-Dolphin-{}-{}", it.version, k));
++  std::error_code ec;
++  const std::string tmp = S(parent / (".er-update-" + it.version));
++  fs::remove_all(P(tmp), ec);
++  fs::remove_all(P(target), ec);
++  {
++    Zip z(archive);
++    if (!z.error.empty())
++    {
++      *message = z.error;
++      return false;
++    }
++    for (const auto& [n, sz] : z.entries)
++      if (!SafeName(n) || !n.starts_with("EvolutionRacing-Dolphin/"))
++      {
++        *message = "not an Evolution Racing Dolphin download: " + n;
++        return false;
++      }
++    if (z.Extract([](const std::string&) { return true; }, [&](const std::string& n) { return tmp + "/" + n; }, nullptr) <= 0)
++    {
++      fs::remove_all(P(tmp), ec);
++      *message = "could not unpack the new Dolphin next to this folder: " + z.error;
++      return false;
++    }
++  }
++  fs::rename(P(tmp + "/EvolutionRacing-Dolphin"), P(target), ec);
++  fs::remove_all(P(tmp), ec);
++  if (ec || !File::Exists(target + "/Dolphin.exe"))
++  {
++    *message = "could not put the new Dolphin next to this folder (" + ec.message() + ")";
++    return false;
++  }
++  File::WriteStringToFile(target + "/er-staged-by-updater.txt", it.version + "\n");
++  const std::string nu = target + "/User/Config/";
++  File::CreateFullPath(nu);
++  for (const char* f : {"GFX.ini", "er-quality.txt"})  // no quality question in the new folder
++    File::Copy(File::GetUserPath(D_CONFIG_IDX) + f, nu + f);
++  File::WriteStringToFile(nu + "er-import-from.txt", Strip(TopDir()) + "\n");
++  o["folder"] = picojson::value(target);
++  File::Delete(archive);
++#endif
++  WriteJson(Dir() + "pending-dolphin.json", o);
++  Log("new Dolphin ready: " + it.version);
++  *message = "Evolution Racing Dolphin " + it.version + " is ready";
++  return true;
++}
++
++bool DolphinStaged()
++{
++  return File::Exists(Dir() + "pending-dolphin.json") || File::Exists(Dir() + "moved-to.txt");
++}
++
++bool StartNewFolder(const std::vector<std::string>& args)
++{
++#ifdef _WIN32
++  std::string target;
++  if (File::ReadFileToString(Dir() + "moved-to.txt", target))
++  {
++    target = Strip(std::string(StripWhitespace(target)));
++  }
++  else
++  {
++    const picojson::object o = ReadJsonObject(Dir() + "pending-dolphin.json");
++    target = Str(o, "folder");
++    if (target.empty())
++      return false;
++  }
++  const std::string exe = target + "/Dolphin.exe";
++  if (!File::Exists(exe))
++    return false;
++  File::WriteStringToFile(Dir() + "moved-to.txt", target + "\n");
++  File::Delete(Dir() + "pending-dolphin.json");
++  std::wstring cmd = L"\"" + UTF8ToWString(exe) + L"\" -u \"" + UTF8ToWString(target + "/User") + L"\"";
++  for (size_t i = 0; i < args.size(); ++i)
++  {
++    if (args[i] == "-u" || args[i] == "--user")
++    {
++      ++i;
++      continue;
++    }
++    cmd += L" \"" + UTF8ToWString(args[i]) + L"\"";
++  }
++  STARTUPINFOW si{};
++  si.cb = sizeof si;
++  PROCESS_INFORMATION pi{};
++  std::wstring wdir = UTF8ToWString(target);
++  if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, wdir.c_str(), &si, &pi))
++    return false;
++  CloseHandle(pi.hThread);
++  CloseHandle(pi.hProcess);
++  Log("started the new folder " + target);
++  return true;
++#else
++  (void)args;
++  return false;
++#endif
++}
++
++void RestartViaLink()
++{
++  Log("restart asked (evoracing://restart through the desktop)");
++}
++
++std::string ImportIfAsked()
++{
++  const std::string marker = File::GetUserPath(D_CONFIG_IDX) + "er-import-from.txt";
++  std::string old;
++  if (!File::ReadFileToString(marker, old))
++    return {};
++  old = Strip(std::string(StripWhitespace(old)));
++  const std::string ou = UserOf(old), nu = UserDir();
++  if (ou.empty() || P(Strip(ou)) == P(Strip(nu)))
++  {
++    File::Delete(marker);
++    return "the older folder was not found: nothing was brought over (" + old + ")";
++  }
++  if (!WaitLockFree(ou, 60))
++    return {};  // the older Dolphin still runs: next start
++  int files = 0;
++  for (const char* d : {"GC", "Wii", "StateSaves", "Load/GraphicMods/GFZE01-fx/scenery", "ERGhosts"})
++    CopyTree(P(ou + d), P(nu + d), false, &files);
++  std::error_code ec;
++  fs::remove(P(nu + "ERGhosts/running.lock"), ec);
++  CopyTree(P(ou + "Load/Textures"), P(nu + "Load/Textures"), true, &files);
++  // the effects pack fits the newer Dolphin too (an effects pack only ever needs an older or the same build)
++  bool fx = false;
++  for (const char* d : EFFECT_DIRS)
++    if (File::IsDirectory(ou + "Load/GraphicMods/" + d))
++    {
++      fs::remove_all(P(nu + "Load/GraphicMods/" + d), ec);
++      CopyTree(P(ou + "Load/GraphicMods/" + d), P(nu + "Load/GraphicMods/" + d), false, &files);
++      fx = true;
++    }
++  std::vector<std::string> cfg = {"GCPadNew.ini", "Hotkeys.ini", "GCKeyNew.ini", "WiimoteNew.ini", "GFX.ini",
++                                  "er-quality.txt", "er-ghosts.txt", "er-updates.txt"};
++  if (fx)
++    for (const char* f : {"GraphicMods/GFZE01.json", "er-pack.json"})
++      cfg.push_back(f);
++  for (const std::string& f : cfg)
++    if (File::Exists(ou + "Config/" + f))
++    {
++      File::CreateFullPath(nu + "Config/" + f);
++      File::Copy(ou + "Config/" + f, nu + "Config/" + f);
++    }
++  // game folders and controller ports from Dolphin.ini
++  Common::IniFile oi, ni;
++  if (oi.Load(ou + "Config/Dolphin.ini"))
++  {
++    ni.Load(nu + "Config/Dolphin.ini");
++    for (const auto& [sec, keep] : std::vector<std::pair<std::string, std::function<bool(const std::string&)>>>{
++             {"General", [](const std::string& k) { return k.starts_with("ISOPath") || k == "RecursiveISOPaths"; }},
++             {"Core", [](const std::string& k) { return k.starts_with("SIDevice"); }}})
++    {
++      std::vector<std::string> keys;
++      oi.GetKeys(sec, &keys);
++      for (const std::string& k : keys)
++      {
++        if (!keep(k))
++          continue;
++        std::string v;
++        oi.GetOrCreateSection(sec)->Get(k, &v);
++        ni.GetOrCreateSection(sec)->Set(k, v);
++      }
++    }
++    ni.Save(nu + "Config/Dolphin.ini");
++  }
++  // what is installed (the effects only when they came along)
++  picojson::object oj = ReadJsonObject(ou + "Config/er-installed.json"), nj = ReadJsonObject(InstalledPath());
++  for (const char* k : {"hd", "hd_extra", "scenery", "updater", "effects"})
++    if (oj.count(k) && (std::string(k) != "effects" || fx))
++      nj[k] = oj[k];
++  WriteJson(InstalledPath(), nj);
++  Common::ERVersionChanged();
++  // packs the older folder downloaded for this Dolphin
++  CopyTree(P(ou + "ERUpdates/pending"), P(nu + "ERUpdates/pending"), false, nullptr);
++  WriteMetadata();
++  for (const char* line : {"Effects pack:", "HD textures:"})
++  {
++    std::string t;
++    if (File::ReadFileToString(ou + "Config/er-status.txt", t))
++      for (const std::string& l : SplitString(t, '\n'))
++        if (l.starts_with(line))
++          StatusLine(line, l);
++  }
++#ifdef _WIN32
++  File::CreateFullPath(ou + "ERUpdates/");
++  File::WriteStringToFile(ou + "ERUpdates/moved-to.txt", Strip(TopDir()) + "\n");
++  File::Delete(ou + "ERUpdates/pending-dolphin.json");
++#endif
++  File::Delete(marker);
++  File::Delete(Strip(TopDir()) + "/er-staged-by-updater.txt");
++  Log(fmt::format("imported from {}: {} files", old, files));
++  return fmt::format("brought over from the older folder: saves, settings, packs and the hub link ({} files)", files);
++}
++}  // namespace ERUpdates
+--- a/Source/Core/Core/ERUpdates.h
++++ b/Source/Core/Core/ERUpdates.h
+@@ -0,0 +1,108 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// The OPTIONAL updater of the Evolution Racing member Dolphin. Optional: it just makes updating easier (one click
++// instead of re-downloading); everything can still be downloaded by hand from the hub's Setup page.
++//
++// With the Dolphin linked to the member's hub account (the erd_ link code of Core/ERGhosts.h), it asks the hub what is
++// newer than what this Dolphin has: a newer Dolphin build, the effects pack (the member's own tier and effects), the HD
++// texture pack, the machine remasters and the HD textures / 3D scenery of the member's newest disc. Each download is
++// checked (size + sha256) before anything changes:
++//   - packs install in place, with a backup of what they replace, put back when anything fails;
++//   - a newer Dolphin goes into a NEW folder next to this one; its first start brings saves, settings, packs and the
++//     link over from this folder (what "Import old folder" does, plus the settings), and this folder then forwards to it.
++// Modes: Off, Notify (default: one small window lists what is new, "Update now" / "Later") or Auto (no window).
++// Play offline (ERGhosts::Settings::offline) stops every hub call, including this one.
++
++#pragma once
++
++#include <atomic>
++#include <functional>
++#include <string>
++#include <vector>
++
++#include "Common/CommonTypes.h"
++#include "Core/ERGhosts.h"
++
++namespace ERUpdates
++{
++enum class Mode
++{
++  Off,
++  Notify,
++  Auto
++};
++
++struct Settings
++{
++  Mode mode = Mode::Notify;  // "Check for updates when Dolphin starts": Notify / Auto; Off = only when asked
++  bool asked = false;        // the first-start question was answered
++};
++
++Settings Load();
++void Save(const Settings& s);
++std::string ModeName(Mode m);
++
++// The package folder (the parent of the user folder), the user folder, User/ERUpdates/
++std::string TopDir();
++std::string UserDir();
++std::string Dir();
++std::string Platform();  // "linux" / "windows"
++// Updates come only from the project's hub (or a hub on this computer, for tests): a link to another address may send
++// ghosts there, but never installs anything from it.
++bool UpdateHubAllowed(const std::string& hub);
++// does member Dolphin `own` include build `need` (lit17s35mvu includes lit17s35mv)
++bool BuildHas(const std::string& own, const std::string& need);
++
++struct Item
++{
++  std::string id, kind, title, detail, version, url, sha256, needs, note, blocked, file;
++  std::string er_version;  // its Evolution Racing X.Y.Z (the hub's versions.json; "" = none)
++  u64 size = 0;
++  bool required = false, preparing = false, after_dolphin = false;
++  bool Ready() const { return blocked.empty() && !preparing && !sha256.empty() && size > 0; }
++};
++
++struct CheckResult
++{
++  int status = 0;
++  std::string error;
++  bool relink = false;  // 401: the link ended
++  std::vector<Item> items;
++};
++
++// What is newer (POST /hub/api/erd/updates). Never called while Play offline is on (returns an error).
++CheckResult Check(const ERGhosts::Settings& s);
++
++using ProgressFn = std::function<bool(u64 done, u64 total)>;
++// Download one item into User/ERUpdates/dl/ (resumes a cut one), check size + sha256. *path = the checked file.
++bool Download(const ERGhosts::Settings& s, const Item& it, std::string* path, std::string* error, const ProgressFn& progress,
++              const std::atomic<bool>* cancel);
++
++// Install a checked pack now (no game running): backup, unpack, check, roll back on failure.
++bool InstallPack(const Item& it, const std::string& zip, std::string* message);
++// A pack for the newer Dolphin that is being installed: kept for that Dolphin's first start.
++void KeepForNewDolphin(const Item& it, const std::string& zip);
++// Packs kept by an older folder (imported): installed at this Dolphin's first start.
++std::vector<std::pair<Item, std::string>> PendingPacks();
++void PendingDone(const std::string& zip);
++
++// A checked newer Dolphin: Linux = the start script unpacks it next to this folder at the next start (run.sh);
++// Windows = unpacked next to this folder now (the next start, or Restart, switches to it).
++bool StageDolphin(const Item& it, const std::string& archive, std::string* message);
++bool DolphinStaged();
++// Windows: switch to the staged / moved-to folder (start its Dolphin.exe with these arguments). True = it was started.
++bool StartNewFolder(const std::vector<std::string>& args);
++// Linux: ask the desktop to run this folder's start script again (evoracing://restart, the registered link handler)
++void RestartViaLink();
++
++// The first start of a NEW folder: bring everything over from the older one (User/Config/er-import-from.txt).
++// "" = nothing to do; else what happened.
++std::string ImportIfAsked();
++
++// Config/er-installed.json (what the start scripts and the installer recorded) as JSON text
++std::string InstalledJson();
++// User/ERUpdates/updates.log
++void Log(const std::string& line);
++std::string Human(u64 bytes);
++}  // namespace ERUpdates
 --- a/Source/Core/Core/HW/SI/SI_DeviceGCController.cpp
 +++ b/Source/Core/Core/HW/SI/SI_DeviceGCController.cpp
 @@ -9,6 +9,7 @@
@@ -15100,26 +17918,1430 @@ HcmV?d00001
  )")
            .replace(QStringLiteral("%VERSION_STRING%"),
 -                   QString::fromUtf8(Common::GetScmDescStr().c_str()))
-+                   QString::fromUtf8((Common::GetERVersionStr() + " (Dolphin " + Common::GetScmDescStr() + ")").c_str()))
++                   QString::fromUtf8((Common::GetERVersionStr() + " (build " + Common::GetERBuildStr() + ", Dolphin " + Common::GetScmDescStr() + ")").c_str()))
            .replace(QStringLiteral("%BRANCH%"),
                     // i18n: "Branch" means the version control term, not a literal tree branch.
                     tr("Branch: %1").arg(branch_str))
+--- a/Source/Core/DolphinQt/CMakeLists.txt
++++ b/Source/Core/DolphinQt/CMakeLists.txt
+@@ -303,6 +303,8 @@
+   InfinityBase/InfinityBaseWindow.cpp
+   InfinityBase/InfinityBaseWindow.h
+   Main.cpp
++  ERGhostsUI.cpp
++  ERUpdatesUI.cpp
+   MainWindow.cpp
+   MainWindow.h
+   MenuBar.cpp
+--- a/Source/Core/DolphinQt/ERGhostsUI.cpp
++++ b/Source/Core/DolphinQt/ERGhostsUI.cpp
+@@ -0,0 +1,504 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Evolution Racing ghosts in the main window (Core/ERGhosts.h): the Tools > Evolution Racing ghosts dialog (Auto / Ask /
++// Off, the hub link), the watcher of the memory card folder, the Ask question, and evoracing://link / ghost links.
++
++#include "DolphinQt/MainWindow.h"
++
++#include <chrono>
++#include <thread>
++
++#include <fmt/format.h>
++
++#include <QButtonGroup>
++#include <QDesktopServices>
++#include <QDialog>
++#include <QDialogButtonBox>
++#include <QGroupBox>
++#include <QHBoxLayout>
++#include <QLabel>
++#include <QLineEdit>
++#include <QMessageBox>
++#include <QPushButton>
++#include <QRadioButton>
++#include <QTimer>
++#include <QUrl>
++#include <QVBoxLayout>
++
++#include "Common/FileUtil.h"
++#include "Common/IOFile.h"
++#include "Core/Core.h"
++#include "Core/System.h"
++#include "Core/ERGhosts.h"
++#include "Core/ERTest.h"
++#include "DolphinQt/QtUtils/ModalMessageBox.h"
++#include "DolphinQt/QtUtils/QueueOnObject.h"
++
++namespace
++{
++s64 NowS()
++{
++  return std::chrono::duration_cast<std::chrono::seconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++QString Q(const std::string& s)
++{
++  return QString::fromStdString(s);
++}
++
++std::string Host(const std::string& hub)
++{
++  std::string h = hub.substr(hub.find("://") == std::string::npos ? 0 : hub.find("://") + 3);
++  return h.substr(0, h.find('/'));
++}
++}  // namespace
++
++void MainWindow::ERNote(const std::string& text)
++{
++  if (const char* td = std::getenv("ER_UPDATES_TEST"); td && *td)  // the harness proofs only (ERUpdatesUI.cpp)
++  {
++    File::IOFile f(std::string(td) + "/notes.txt", "ab");
++    f.WriteString(text + "\n");
++  }
++  if (!Core::IsUninitialized(m_system))
++  {
++    Core::DisplayMessage("Ghosts: " + text, 9000);
++    return;
++  }
++  auto* box = new QMessageBox(QMessageBox::Information, tr("Evolution Racing ghosts"), Q(text),
++                              QMessageBox::Ok, this);
++  box->setAttribute(Qt::WA_DeleteOnClose);
++  box->setWindowModality(Qt::NonModal);
++  box->show();
++}
++
++void MainWindow::InitERGhosts(const std::string& arg)
++{
++  ERGhosts::ForwardIfRunning("");  // this Dolphin takes the user folder's lock: later evoracing:// links come here
++  m_er_ghost_timer = new QTimer(this);
++  connect(m_er_ghost_timer, &QTimer::timeout, this, &MainWindow::ERGhostTick);
++  m_er_ghost_timer->start(3000);
++  ERGhostProbe(false);
++  if (!arg.empty())
++    QTimer::singleShot(400, this, [this, arg] { ERGhostArg(arg); });
++}
++
++void MainWindow::ERGhostProbe(bool fetch)
++{
++  // the per-frame run telemetry reads what the hub's probe names; ghosts Off or no link: nothing is read
++  const ERGhosts::Settings s = ERGhosts::Load();
++  const bool on = s.mode != ERGhosts::Mode::Off && !s.token.empty() && !s.offline;  // Play offline: nothing read or sent
++  std::string text;
++  if (!ERGhosts::HasProbe() && File::ReadFileToString(ERGhosts::Dir() + "probe.json", text))
++    ERGhosts::LoadProbe(text);
++  ERGhosts::EnableRecording(on);
++  if (!on || (!fetch && ERGhosts::HasProbe() && !m_er_probe_fetched.empty()))
++    return;
++  if (m_er_probe_fetched == "busy")
++    return;
++  m_er_probe_fetched = "busy";
++  std::thread([this, s] {
++    ERGhosts::Reply r = ERGhosts::GetProbe(s);
++    QueueOnObject(this, [this, r] {
++      m_er_probe_fetched = "done";
++      if (r.ok() && ERGhosts::LoadProbe(r.text))
++        ERGhosts::EnableRecording(true);
++    });
++  }).detach();
++}
++
++void MainWindow::ERGhostBoot(const BootParameters& boot)
++{
++  ERGhostProbe(false);  // run telemetry on / off for this boot (ghosts on + linked)
++}
++
++void MainWindow::ERGhostExtras(const ERGhosts::Ghost& g)
++{
++  // the full-rate telemetry of the run this ghost came from (ERGhosts::OnFrame): the hub checks it and shows the replay
++  std::vector<u8> tele = ERGhosts::TakeRunFor(g.frames);
++  if (tele.empty())
++    return;
++  const ERGhosts::Settings s = ERGhosts::Load();
++  std::thread([this, s, sha = g.sha1, tele = std::move(tele)] {
++    ERGhosts::Reply r = ERGhosts::UploadExtra(s, sha, "tele", tele);
++    const std::string note = r.ok() ? "" : "the run's telemetry was not taken: " + r.error;
++    QueueOnObject(this, [this, note] {
++      if (!note.empty())
++        ERNote(note + ".");
++    });
++  }).detach();
++}
++
++void MainWindow::ERGhostTick()
++{
++  for (const std::string& a : ERGhosts::TakeForwarded())
++    ERGhostArg(a);
++  const s64 now = NowS();
++  if (!Core::IsUninitialized(m_system))
++    m_er_last_running = now;
++  // the game writes ghosts while it runs (and the card folder is flushed when it stops): look only then
++  if (m_er_last_running == 0 || now - m_er_last_running > 60)
++    return;
++  const ERGhosts::Settings s = ERGhosts::Load();
++  if (s.mode == ERGhosts::Mode::Off)
++    return;  // Off costs nothing: no folder is read
++  if (s.offline)
++  {
++    // Play offline: a ghost saved now stays on this PC; only "Upload saved ghosts now" sends it later
++    for (ERGhosts::Ghost& g : ERGhosts::TakeNew())
++    {
++      ERGhosts::MarkDone(g.sha1, "offline");
++      ERNote("ghost saved (" + g.machine_name + " " + g.time + "). Play offline is on: it stays on this PC.");
++    }
++    return;
++  }
++  for (ERGhosts::Ghost& g : ERGhosts::TakeNew())
++    m_er_queue.push_back(std::move(g));
++  ERGhostNext();
++}
++
++void MainWindow::ERGhostNext()
++{
++  if (m_er_ghost_busy || m_er_queue.empty())
++    return;
++  ERGhosts::Ghost g = std::move(m_er_queue.front());
++  m_er_queue.pop_front();
++  ERGhosts::Settings s = ERGhosts::Load();
++  if (s.offline || (s.mode == ERGhosts::Mode::Off && !m_er_force_send))
++  {
++    m_er_queue.clear();
++    m_er_force_send = false;
++    return;
++  }
++  if (ERTest::Active() || ERGhosts::BootedForTest())
++  {
++    ERGhosts::MarkDone(g.sha1, "test-in-game");
++    ERNote("a ghost saved in Test in game is not sent to the hub (the track may be a draft).");
++    return ERGhostNext();
++  }
++  if (s.token.empty())
++  {
++    if (s.mode == ERGhosts::Mode::Ask && !s.told_unlinked)
++    {
++      s.told_unlinked = true;
++      ERGhosts::Save(s);
++      m_er_ghost_busy = true;
++      auto* box = new QMessageBox(this);
++      box->setAttribute(Qt::WA_DeleteOnClose);
++      box->setWindowModality(Qt::NonModal);
++      box->setWindowTitle(tr("Evolution Racing ghosts"));
++      box->setText(Q(fmt::format("You saved a Time Attack ghost ({} {}).\n\nLink this Dolphin to your Evolution "
++                                 "Racing hub account and your ghosts go onto the tracks' leaderboards. Make a link "
++                                 "code on the hub's Ghosts page, then paste it in Tools > Evolution Racing ghosts.",
++                                 g.machine_name, g.time)));
++      QPushButton* open = box->addButton(tr("Open the Ghosts page"), QMessageBox::AcceptRole);
++      QPushButton* off = box->addButton(tr("Turn ghost upload off"), QMessageBox::DestructiveRole);
++      box->addButton(tr("Later"), QMessageBox::RejectRole);
++      connect(box, &QMessageBox::buttonClicked, this, [this, open, off, hub = s.hub](QAbstractButton* b) {
++        if (b == open)
++          QDesktopServices::openUrl(QUrl(Q(hub + "/hub/ghosts")));
++        if (b == off)
++        {
++          ERGhosts::Settings s2 = ERGhosts::Load();
++          s2.mode = ERGhosts::Mode::Off;
++          ERGhosts::Save(s2);
++        }
++        m_er_ghost_busy = false;
++        ERGhostNext();
++      });
++      box->show();
++      box->raise();
++    }
++    else
++    {
++      ERNote(fmt::format("ghost saved ({} {}). Link this Dolphin (Tools > Evolution Racing ghosts) to send "
++                         "your ghosts to the hub.",
++                         g.machine_name, g.time));
++    }
++    return;  // not marked: once linked, the next start offers it again
++  }
++  ERGhostSend(std::move(g), s.mode == ERGhosts::Mode::Ask && !m_er_force_send);  // "Upload saved ghosts now": no question
++  if (m_er_queue.empty())
++    m_er_force_send = false;
++}
++
++void MainWindow::ERGhostSend(ERGhosts::Ghost g, bool dry)
++{
++  m_er_ghost_busy = true;
++  const ERGhosts::Settings s = ERGhosts::Load();
++  std::thread([this, g = std::move(g), s, dry]() mutable {
++    const std::string coli = ERGhosts::CourseSha1(g.slot);
++    ERGhosts::Reply r = ERGhosts::Upload(s, g, coli, dry);
++    QueueOnObject(this, [this, g = std::move(g), r, dry]() mutable {
++      m_er_ghost_busy = false;
++      ERGhostReply(std::move(g), r, dry);
++      ERGhostNext();
++    });
++  }).detach();
++}
++
++void MainWindow::ERGhostReply(ERGhosts::Ghost g, const ERGhosts::Reply& r, bool dry)
++{
++  const std::string title = ERGhosts::Field(r.text, "title");
++  if (r.status == 401)
++  {
++    ERGhosts::Settings s = ERGhosts::Load();
++    s.token.clear();
++    s.username.clear();
++    ERGhosts::Save(s);
++    ERNote("this Dolphin's link to the hub ended. Make a new link code on the hub's Ghosts page and paste it in "
++           "Tools > Evolution Racing ghosts. Your ghost is kept and offered again then.");
++    return;
++  }
++  const bool final_answer = ERGhosts::Field(r.text, "final") == "true";
++  if (!r.ok() && !final_answer)
++  {
++    // no network, the hub busy or "slow down": try again in a minute (a few times)
++    const int n = ++m_er_retries[g.sha1];
++    if (n <= 5)
++    {
++      ERNote(fmt::format("could not send the ghost yet ({}); trying again in a minute.", r.error));
++      QTimer::singleShot(60000, this, [this, g = std::move(g)]() mutable {
++        m_er_queue.push_back(std::move(g));
++        ERGhostNext();
++      });
++    }
++    else
++    {
++      ERNote("could not send the ghost: " + r.error + ". It is offered again when Dolphin starts next time.");
++    }
++    return;
++  }
++  if (!r.ok())
++  {
++    ERGhosts::MarkDone(g.sha1, "refused");
++    ERNote("the hub did not take the ghost (" + g.machine_name + " " + g.time + "): " + r.error);
++    return;
++  }
++  if (!dry)
++  {
++    ERGhosts::MarkDone(g.sha1, "sent");
++    if (ERGhosts::Field(r.text, "kept") != "true")  // a slower ghost is not the entry: its run is not sent either
++      ERGhostExtras(g);
++    const std::string rank = ERGhosts::Field(r.text, "rank");
++    ERNote(fmt::format("sent to the hub: {} {} {}.{} {}", title, ERGhosts::Field(r.text, "time"), g.machine_name,
++                       rank.empty() ? "" : " Rank " + rank + ".", ERGhosts::Field(r.text, "message")));
++    return;
++  }
++  // Ask: the hub said what would happen; only a new or faster time is worth a question
++  const std::string would = ERGhosts::Field(r.text, "would"), best = ERGhosts::Field(r.text, "best");
++  if (would == "slower" || would == "removed")
++  {
++    ERGhosts::MarkDone(g.sha1, would);
++    ERNote(would == "slower" ?
++               fmt::format("{} {} on {} is not faster than your best ({}): not sent.", g.machine_name,
++                           g.time, title, best) :
++               fmt::format("Unreal took your time on {} off the leaderboard: not sent.", title));
++    return;
++  }
++  m_er_ghost_busy = true;
++  auto* box = new QMessageBox(this);
++  box->setAttribute(Qt::WA_DeleteOnClose);
++  box->setWindowModality(Qt::NonModal);
++  box->setWindowTitle(tr("Evolution Racing ghosts"));
++  box->setText(Q(fmt::format("Send this ghost to the hub's leaderboard?\n\n{}\n{} - {}\nYour best there: {}",
++                             title, ERGhosts::Field(r.text, "time"), g.machine_name,
++                             best.empty() ? "none yet" : best)));
++  QPushButton* send = box->addButton(tr("Send"), QMessageBox::AcceptRole);
++  QPushButton* always = box->addButton(tr("Always send (Auto)"), QMessageBox::AcceptRole);
++  QPushButton* no = box->addButton(tr("Not this one"), QMessageBox::RejectRole);
++  QPushButton* off = box->addButton(tr("Never (Off)"), QMessageBox::DestructiveRole);
++  connect(box, &QMessageBox::buttonClicked, this,
++          [this, send, always, no, off, g = std::move(g)](QAbstractButton* b) mutable {
++            m_er_ghost_busy = false;
++            if (b == always || b == off)
++            {
++              ERGhosts::Settings s = ERGhosts::Load();
++              s.mode = b == always ? ERGhosts::Mode::Auto : ERGhosts::Mode::Off;
++              ERGhosts::Save(s);
++            }
++            if (b == send || b == always)
++              return ERGhostSend(std::move(g), false);
++            ERGhosts::MarkDone(g.sha1, b == off ? "off" : "declined");
++            if (b == no || b == off)
++              ERGhostNext();
++          });
++  box->show();
++  box->raise();
++  if (!Core::IsUninitialized(m_system))
++    Core::DisplayMessage("Ghosts: send your ghost to the hub? Answer in the Dolphin window.", 8000);
++}
++
++void MainWindow::ERGhostArg(const std::string& arg)
++{
++  if (ERUpdateArg(arg))  // evoracing://update, link ...&then=update, restart; and nothing at all while Play offline is on
++    return;
++  raise();
++  activateWindow();
++  ERGhosts::Settings s = ERGhosts::Load();
++  std::string code, hub;
++  if (arg.find("link/") != std::string::npos && ERGhosts::ParseLink(arg, &code, &hub))
++  {
++    if (hub.empty())
++      hub = s.hub;
++    while (!hub.empty() && hub.back() == '/')
++      hub.pop_back();
++    if (!ERGhosts::HubAllowed(hub))
++      return ERNote("that link points to an address this Dolphin does not send ghosts to: " + hub);
++    if (ModalMessageBox::question(this, tr("Evolution Racing ghosts"),
++                                  Q(fmt::format("Link this Dolphin to your hub account on {}?\n\nYour Time Attack "
++                                                "ghosts will go to that hub's leaderboards.",
++                                                Host(hub)))) != QMessageBox::Yes)
++      return;
++    return ERGhostLink(code, hub);
++  }
++  std::string what;
++  if (arg.find("ghost/") != std::string::npos && ERGhosts::ParseGhost(arg, &what))
++  {
++    if (s.token.empty())
++      return ERNote("link this Dolphin first (Tools > Evolution Racing ghosts), then press Install ghost again.");
++    std::thread([this, s, what] {
++      std::vector<u8> bytes;
++      ERGhosts::Reply r = ERGhosts::Fetch(s, what, &bytes);
++      QueueOnObject(this, [this, r, bytes] {
++        std::string msg;
++        if (r.status != 200)
++          msg = "could not get the ghost: " + r.error;
++        else
++          ERGhosts::Install(bytes, &msg);
++        ERNote(msg);
++      });
++    }).detach();
++    return;
++  }
++  ERNote("this link is not one this Dolphin knows: " + arg.substr(0, 80));
++}
++
++void MainWindow::ERGhostLink(const std::string& code, const std::string& hub)
++{
++  ERGhosts::Settings s = ERGhosts::Load();
++  s.token = code;
++  s.hub = hub;
++  std::thread([this, s] {
++    ERGhosts::Reply r = ERGhosts::Hello(s);
++    QueueOnObject(this, [this, s, r]() mutable {
++      if (!r.ok())
++        return ERNote("linking did not work: " + r.error);
++      s.username = ERGhosts::Field(r.text, "username");
++      s.told_unlinked = false;
++      ERGhosts::Save(s);
++      ERGhostProbe(true);
++      ERNote(fmt::format("linked to the hub as {}. Ghosts you save in Time Attack: {} (change it in Tools > "
++                         "Evolution Racing ghosts).",
++                         s.username,
++                         s.mode == ERGhosts::Mode::Auto ? "sent automatically" :
++                         s.mode == ERGhosts::Mode::Ask  ? "Dolphin asks before it sends each one" :
++                                                          "not sent (Off)"));
++      emit ERGhostsChanged();
++    });
++  }).detach();
++}
++
++void MainWindow::ShowERGhosts()
++{
++  auto* dlg = new QDialog(this);
++  dlg->setAttribute(Qt::WA_DeleteOnClose);
++  dlg->setWindowTitle(tr("Evolution Racing ghosts"));
++  auto* lay = new QVBoxLayout(dlg);
++  auto* intro = new QLabel(tr("After a Time Attack run, Save Ghost writes a ghost to the memory card. This Dolphin "
++                              "can send each one to your Evolution Racing hub account: the hub checks it against "
++                              "the track and puts it on that track's leaderboard."));
++  intro->setWordWrap(true);
++  lay->addWidget(intro);
++
++  auto* modes = new QGroupBox(tr("Ghost upload"));
++  auto* ml = new QVBoxLayout(modes);
++  auto* r_auto = new QRadioButton(tr("Auto - send every new or faster ghost"));
++  auto* r_ask = new QRadioButton(tr("Ask - show the track and time, send when I say so (default)"));
++  auto* r_off = new QRadioButton(tr("Off - send nothing (the memory card folder is not even looked at)"));
++  ml->addWidget(r_auto);
++  ml->addWidget(r_ask);
++  ml->addWidget(r_off);
++  lay->addWidget(modes);
++
++  auto* link = new QGroupBox(tr("Hub link"));
++  auto* ll = new QVBoxLayout(link);
++  auto* status = new QLabel;
++  status->setWordWrap(true);
++  ll->addWidget(status);
++  auto* row = new QHBoxLayout;
++  auto* code = new QLineEdit;
++  code->setPlaceholderText(tr("Link code from the hub's Ghosts page (erd_...)"));
++  auto* do_link = new QPushButton(tr("Link"));
++  row->addWidget(code, 1);
++  row->addWidget(do_link);
++  ll->addLayout(row);
++  auto* row2 = new QHBoxLayout;
++  auto* open = new QPushButton(tr("Open the hub's Ghosts page"));
++  auto* unlink = new QPushButton(tr("Unlink"));
++  row2->addWidget(open);
++  row2->addWidget(unlink);
++  row2->addStretch(1);
++  ll->addLayout(row2);
++  lay->addWidget(link);
++  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
++  lay->addWidget(buttons);
++  connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::close);
++
++  auto refresh = [=] {
++    const ERGhosts::Settings s = ERGhosts::Load();
++    r_auto->setChecked(s.mode == ERGhosts::Mode::Auto);
++    r_ask->setChecked(s.mode == ERGhosts::Mode::Ask);
++    r_off->setChecked(s.mode == ERGhosts::Mode::Off);
++    status->setText(s.token.empty() ?
++                        tr("Not linked. Make a link code on the hub's Ghosts page (signed in) and paste it here.") :
++                        Q(fmt::format("Linked to {} as {}.", Host(s.hub),
++                                      s.username.empty() ? std::string("(checking...)") : s.username)));
++    unlink->setEnabled(!s.token.empty());
++  };
++  refresh();
++  connect(this, &MainWindow::ERGhostsChanged, dlg, refresh);
++  auto set_mode = [this](ERGhosts::Mode m) {
++    ERGhosts::Settings s = ERGhosts::Load();
++    s.mode = m;
++    ERGhosts::Save(s);
++    ERGhostProbe(false);
++  };
++
++  connect(r_auto, &QRadioButton::toggled, dlg, [=](bool on) { if (on) set_mode(ERGhosts::Mode::Auto); });
++  connect(r_ask, &QRadioButton::toggled, dlg, [=](bool on) { if (on) set_mode(ERGhosts::Mode::Ask); });
++  connect(r_off, &QRadioButton::toggled, dlg, [=](bool on) { if (on) set_mode(ERGhosts::Mode::Off); });
++  connect(do_link, &QPushButton::clicked, dlg, [=, this] {
++    std::string c = code->text().trimmed().toStdString(), hub;
++    const ERGhosts::Settings s = ERGhosts::Load();
++    if (c.starts_with("evoracing:"))
++    {
++      if (!ERGhosts::ParseLink(c, &c, &hub))
++        return ERNote("that is not a link code.");
++    }
++    if (!c.starts_with("erd_"))
++      return ERNote("a link code starts with erd_ (make one on the hub's Ghosts page).");
++    if (hub.empty())
++      hub = s.hub;
++    if (!ERGhosts::HubAllowed(hub))
++      return ERNote("that link points to an address this Dolphin does not send ghosts to: " + hub);
++    status->setText(tr("Linking..."));
++    ERGhostLink(c, hub);
++  });
++  connect(open, &QPushButton::clicked, dlg, [] {
++    QDesktopServices::openUrl(QUrl(Q(ERGhosts::Load().hub + "/hub/ghosts")));
++  });
++  connect(unlink, &QPushButton::clicked, dlg, [=, this] {
++    ERGhosts::Settings s = ERGhosts::Load();
++    s.token.clear();
++    s.username.clear();
++    ERGhosts::Save(s);
++    ERGhostProbe(false);
++    refresh();
++  });
++  dlg->resize(560, dlg->sizeHint().height());
++  dlg->show();
++}
+--- a/Source/Core/DolphinQt/ERUpdatesUI.cpp
++++ b/Source/Core/DolphinQt/ERUpdatesUI.cpp
+@@ -0,0 +1,857 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// The Evolution Racing settings panel (Tools > Evolution Racing settings: Play offline, the hub link, updates, ghost
++// uploads), Play offline (Tools menu, "Offline" in the title bar), and the OPTIONAL updater's window: one small popup that
++// lists what's new ("Update now" / "Later"), the downloads in the background with a small progress box in the corner,
++// packs installed when no game runs, and a note at the end. Core/ERUpdates.h does the work.
++
++#include "DolphinQt/MainWindow.h"
++
++#include <chrono>
++#include <mutex>
++#include <thread>
++
++#include <fmt/format.h>
++
++#include <QAction>
++#include <QCoreApplication>
++#include <QButtonGroup>
++#include <QCheckBox>
++#include <QDesktopServices>
++#include <QDialog>
++#include <QDialogButtonBox>
++#include <QFrame>
++#include <QGroupBox>
++#include <QHBoxLayout>
++#include <QLabel>
++#include <QLineEdit>
++#include <QMenuBar>
++#include <QMessageBox>
++#include <QProgressBar>
++#include <QPushButton>
++#include <QRadioButton>
++#include <QTimer>
++#include <QUrl>
++#include <QVBoxLayout>
++
++#include "Common/FileUtil.h"
++#include "Common/IOFile.h"
++#include "Common/StringUtil.h"
++#include "Common/Version.h"
++#include "Core/Core.h"
++#include "Core/ERGhosts.h"
++#include "Core/ERUpdates.h"
++#include "Core/System.h"
++#include "DolphinQt/MenuBar.h"
++#include "DolphinQt/QtUtils/QueueOnObject.h"
++
++namespace
++{
++QString Q(const std::string& s)
++{
++  return QString::fromStdString(s);
++}
++
++std::string HostOf(const std::string& hub)
++{
++  std::string h = hub.substr(hub.find("://") == std::string::npos ? 0 : hub.find("://") + 3);
++  return h.substr(0, h.find('/'));
++}
++
++const char* const LINKING_LINE =
++    "Linking is optional. You choose what connects, and you can play fully offline at any time.";
++const char* const OPTIONAL_LINE = "Optional. It just makes updating easier: one click instead of re-downloading. You "
++                                  "can still download everything manually from Setup.";
++const char* const GHOST_COST =
++    "Sharing your ghosts costs nothing noticeable: it reads about 20 numbers per frame (microseconds of CPU, no GPU) and "
++    "sends about 25 KB once after the race. It lets the community race each other's best runs, compare lines and "
++    "replays, and compete on the leaderboards while everyone plays their own version of the game.";
++// Test hook for the harness proofs (never set on a member's PC): ER_UPDATES_TEST=<folder> writes what the windows show
++// into that folder (popup.txt / popup.png, done.txt, notes.txt) and presses the buttons named by files there
++// (accept = "Update now", restart = "Restart now", firstrun = its answer: notify / auto / off).
++std::string TestDir()
++{
++  const char* d = std::getenv("ER_UPDATES_TEST");
++  return d && *d ? std::string(d) + "/" : std::string();
++}
++
++void TestWrite(const std::string& name, const std::string& text, bool append = true)
++{
++  const std::string d = TestDir();
++  if (d.empty())
++    return;
++  File::IOFile f(d + name, append ? "ab" : "wb");
++  f.WriteString(text + "\n");
++}
++
++bool TestHas(const std::string& name, std::string* content = nullptr)
++{
++  const std::string d = TestDir();
++  std::string c;
++  if (d.empty() || !File::ReadFileToString(d + name, c))
++    return false;
++  if (content)
++    *content = std::string(StripWhitespace(c));
++  return true;
++}
++}  // namespace
++
++// ---------------------------------------------------------------- the background run (downloads; installs on the UI thread)
++struct ERUpdateRun
++{
++  std::mutex mu;
++  std::atomic<u64> done{0}, total{0};
++  std::atomic<bool> cancel{false}, finished{false};
++  std::string current;
++  std::vector<std::pair<ERUpdates::Item, std::string>> ready;  // packs to install (when no game runs)
++  std::vector<std::string> errors, notes;
++  std::string dolphin;  // a new Dolphin was made ready (version)
++  int installed = 0;
++};
++
++void MainWindow::ERAboutLinking()
++{
++  QDesktopServices::openUrl(QUrl(Q(ERGhosts::Load().hub + "/hub/setup#linking")));
++}
++
++void MainWindow::ERUpdateTitle()
++{
++  if (Core::IsUninitialized(m_system) || !m_rendering_to_main)
++    setWindowTitle(Q(Common::GetERVersionStr() + (ERGhosts::Offline() ? " - Offline" : "")));
++  if (!TestDir().empty())
++    TestWrite("title.txt", Common::GetERVersionStr() + "\n", false);
++  if (Core::IsRunning(m_system))  // (not while a game is still starting: the CPU is not there yet)
++    Core::UpdateTitle(m_system);
++  if (auto* a = m_menu_bar->findChild<QAction*>(QStringLiteral("erOffline")))
++  {
++    a->blockSignals(true);
++    a->setChecked(ERGhosts::Offline());
++    a->blockSignals(false);
++  }
++}
++
++void MainWindow::SetEROffline(bool on)
++{
++  ERGhosts::Settings s = ERGhosts::Load();
++  s.offline = on;
++  ERGhosts::Save(s);  // (only the switch: the link, the modes and the queue of saved ghosts stay)
++  ERGhostProbe(false);  // run telemetry off while offline
++  if (on && m_er_run && !m_er_run->finished)
++    m_er_run->cancel = true;  // a download in progress stops (it resumes later)
++  ERUpdateTitle();
++  emit ERGhostsChanged();
++  ERNote(on ? "Play offline is on: this Dolphin makes no connections at all. Ghosts you save now stay on this PC "
++              "(Tools > Evolution Racing settings > Upload saved ghosts now sends them later, if you want)." :
++              "Play offline is off: what you switched on in Evolution Racing settings connects again.");
++}
++
++void MainWindow::InitERUpdates()
++{
++  ERUpdateTitle();
++  m_er_upd_timer = new QTimer(this);
++  connect(m_er_upd_timer, &QTimer::timeout, this, &MainWindow::ERUpdateTick);
++  // a new folder made by the updater: bring the older folder over first (it waits for that Dolphin to close)
++  const std::string imported = ERUpdates::ImportIfAsked();
++  if (!imported.empty())
++  {
++    ERGhostProbe(false);
++    ERUpdateTitle();
++    QTimer::singleShot(800, this, [this, imported] {
++      ERNote("Updated to " + Common::GetERVersionStr() + ": " + imported + ". The old folder can be deleted when you are happy.");
++    });
++  }
++  // packs an older folder downloaded for this Dolphin
++  auto pend = ERUpdates::PendingPacks();
++  if (!pend.empty())
++  {
++    m_er_run = std::make_shared<ERUpdateRun>();
++    for (auto& p : pend)
++      m_er_run->ready.push_back(p);
++    m_er_run->finished = true;
++    m_er_upd_timer->start(1000);
++  }
++  ERUpdates::Settings us = ERUpdates::Load();
++  if (!us.asked)
++  {
++    QTimer::singleShot(1500, this, [this] { ERFirstRun(); });
++    return;
++  }
++  const ERGhosts::Settings gs = ERGhosts::Load();
++  if (us.mode != ERUpdates::Mode::Off && !gs.offline && !gs.token.empty())
++    QTimer::singleShot(4000, this, [this] { ERUpdateCheck(false); });
++}
++
++void MainWindow::ERFirstRun()
++{
++  auto* box = new QMessageBox(this);
++  box->setAttribute(Qt::WA_DeleteOnClose);
++  box->setWindowModality(Qt::NonModal);
++  box->setWindowTitle(tr("Evolution Racing updates"));
++  box->setTextFormat(Qt::RichText);
++  box->setText(tr("<b>Check for updates automatically? (optional)</b><br><br>%1<br><br>When this Dolphin is linked to "
++                  "your hub account (Link my Dolphin on the hub's Setup page), it can tell you when a newer Dolphin or "
++                  "pack is out and install it with one click. When it starts, it sends only your Dolphin version and "
++                  "the versions of your packs.<br><br>%2 <a href=\"about\">About linking</a>")
++                   .arg(Q(OPTIONAL_LINE), Q(LINKING_LINE)));
++  if (auto* l = box->findChild<QLabel*>(QStringLiteral("qt_msgbox_label")))
++  {
++    l->setOpenExternalLinks(false);
++    l->setTextInteractionFlags(Qt::LinksAccessibleByMouse);
++    connect(l, &QLabel::linkActivated, this, [this](const QString&) { ERAboutLinking(); });
++  }
++  QPushButton* notify = box->addButton(tr("Yes, tell me (recommended)"), QMessageBox::AcceptRole);
++  QPushButton* autob = box->addButton(tr("Yes, install automatically"), QMessageBox::AcceptRole);
++  QPushButton* off = box->addButton(tr("No thanks"), QMessageBox::RejectRole);
++  box->setDefaultButton(notify);
++  std::string ans;
++  if (TestHas("firstrun", &ans))
++    QTimer::singleShot(1500, box, [box, ans, notify, autob, off] {
++      TestWrite("notes.txt", "first-run question shown");
++      (ans == "auto" ? autob : ans == "off" ? off : notify)->click();
++    });
++  connect(box, &QMessageBox::finished, this, [this, box, notify, autob, off](int) {
++    ERUpdates::Settings s = ERUpdates::Load();
++    QAbstractButton* b = box->clickedButton();
++    s.mode = b == autob ? ERUpdates::Mode::Auto : b == off ? ERUpdates::Mode::Off : ERUpdates::Mode::Notify;
++    s.asked = true;
++    ERUpdates::Save(s);
++    const ERGhosts::Settings gs = ERGhosts::Load();
++    if (s.mode != ERUpdates::Mode::Off && !gs.offline && !gs.token.empty())
++      ERUpdateCheck(false);
++    emit ERGhostsChanged();
++  });
++  box->show();
++  box->raise();
++}
++
++void MainWindow::ERUpdateCheck(bool manual)
++{
++  const ERGhosts::Settings s = ERGhosts::Load();
++  if (s.offline)
++  {
++    if (manual)
++      ERNote("Play offline is on: turn it off (Tools menu) to check for updates.");
++    return;
++  }
++  if (s.token.empty())
++  {
++    if (manual)
++      ERNote("link this Dolphin first: Link my Dolphin on the hub's Setup page (or a link code in Tools > Evolution "
++             "Racing settings).");
++    return;
++  }
++  if (m_er_run && !m_er_run->finished)
++  {
++    if (manual)
++      ERNote("an update is already being downloaded.");
++    return;
++  }
++  if (m_er_checking)
++    return;
++  m_er_checking = true;
++  std::thread([this, s, manual] {
++    ERUpdates::CheckResult r = ERUpdates::Check(s);
++    QueueOnObject(this, [this, r, manual] {
++      m_er_checking = false;
++      if (r.relink)
++        return ERNote("this Dolphin's link to the hub ended. Link it again with Link my Dolphin on the hub's Setup page.");
++      if (!r.error.empty())
++      {
++        ERUpdates::Log("check: " + r.error);
++        if (manual)
++          ERNote("could not check for updates: " + r.error);
++        return;
++      }
++      ERUpdates::Log(fmt::format("check: {} item(s){}", r.items.size(), manual ? " (asked)" : ""));
++      if (r.items.empty())
++      {
++        if (manual)
++          ERNote("Everything is up to date (" + Common::GetERVersionStr() + ").");
++        return;
++      }
++      bool preparing = false;
++      for (const auto& i : r.items)
++        preparing |= i.preparing;
++      if (preparing && m_er_rechecks < 6)  // the hub is still making the member's copy: look again in 3 minutes
++      {
++        ++m_er_rechecks;
++        QTimer::singleShot(180000, this, [this] {
++          if (ERUpdates::Load().mode != ERUpdates::Mode::Off || m_er_manual_pending)
++            ERUpdateCheck(false);
++        });
++      }
++      const bool autom = ERUpdates::Load().mode == ERUpdates::Mode::Auto && !manual;
++      if (autom)
++      {
++        std::vector<ERUpdates::Item> go;
++        for (const auto& i : r.items)
++          if (i.Ready())
++            go.push_back(i);
++        if (!go.empty())
++          ERUpdateStart(go);
++        return;
++      }
++      ERUpdatePopup(r.items);
++    });
++  }).detach();
++}
++
++void MainWindow::ERUpdatePopup(const std::vector<ERUpdates::Item>& items)
++{
++  if (m_er_popup)
++    m_er_popup->close();
++  auto* dlg = new QDialog(this);
++  m_er_popup = dlg;
++  dlg->setAttribute(Qt::WA_DeleteOnClose);
++  dlg->setWindowTitle(tr("Evolution Racing updates"));
++  auto* lay = new QVBoxLayout(dlg);
++  std::vector<ERUpdates::Item> go;
++  u64 total = 0;
++  std::string lines;
++  // "Evolution Racing 1.3 -> 1.4": this setup's version and the newest the items bring (the hub's versions.json)
++  std::string newest = Common::GetERSetupVersion();
++  for (const auto& i : items)
++    if (!i.er_version.empty() && Common::ERVersionCompare(i.er_version, newest) > 0)
++      newest = i.er_version;
++  const std::string heading = newest == Common::GetERSetupVersion() ? std::string() :
++                              "Evolution Racing " + Common::GetERSetupVersion() + " \u2192 " + newest;
++  if (!heading.empty())
++    lines += "<h3>" + heading + "</h3>";
++  for (const auto& i : items)
++  {
++    std::string line = "<b>" + i.title + "</b>";
++    if (i.Ready())
++    {
++      line += " (" + ERUpdates::Human(i.size) + ")";
++      go.push_back(i);
++      total += i.size;
++    }
++    if (!i.detail.empty())
++      line += "<br><span style='color:gray'>" + i.detail + "</span>";
++    if (!i.note.empty())
++      line += "<br><i>" + i.note + "</i>";
++    lines += "<p>" + line + "</p>";
++  }
++  auto* text = new QLabel(Q(lines));
++  text->setTextFormat(Qt::RichText);
++  text->setWordWrap(true);
++  lay->addWidget(text);
++  auto* small = new QLabel(tr("It downloads in the background: keep playing. %1").arg(Q(OPTIONAL_LINE)));
++  small->setWordWrap(true);
++  small->setStyleSheet(QStringLiteral("color:gray;font-size:small"));
++  lay->addWidget(small);
++  auto* row = new QHBoxLayout;
++  auto* later = new QPushButton(tr("Later"));
++  auto* now = new QPushButton(go.empty() ? tr("Nothing to download yet") : tr("Update now (%1)").arg(Q(ERUpdates::Human(total))));
++  now->setEnabled(!go.empty());
++  now->setDefault(true);
++  QFont f = now->font();
++  f.setBold(true);
++  f.setPointSizeF(f.pointSizeF() * 1.2);
++  now->setFont(f);
++  now->setMinimumHeight(now->sizeHint().height() * 3 / 2);
++  row->addWidget(later);
++  row->addStretch(1);
++  row->addWidget(now);
++  lay->addLayout(row);
++  connect(later, &QPushButton::clicked, dlg, &QDialog::close);
++  connect(now, &QPushButton::clicked, dlg, [this, dlg, go] {
++    dlg->close();
++    ERUpdateStart(go);
++  });
++  dlg->setMinimumWidth(460);
++  dlg->show();
++  dlg->raise();
++  dlg->activateWindow();
++  if (!TestDir().empty())
++  {
++    std::string list;
++    for (const auto& i : items)
++      list += fmt::format("{} | {} | {} | {} | ready={}\n", i.kind, i.title, i.version, ERUpdates::Human(i.size), i.Ready() ? 1 : 0);
++    TestWrite("popup.txt", (heading.empty() ? std::string() : "heading | " + heading + "\n") + list, false);
++    QTimer::singleShot(700, dlg, [dlg, now] {
++      dlg->grab().save(QString::fromStdString(TestDir() + "popup.png"));
++      if (TestHas("accept"))
++        now->click();
++    });
++  }
++  if (!Core::IsUninitialized(m_system))
++    Core::DisplayMessage("Evolution Racing: updates are ready - see the Dolphin window.", 8000);
++}
++
++void MainWindow::ERUpdateStart(std::vector<ERUpdates::Item> items)
++{
++  // the Dolphin first (a pack that needs it waits for it), then the packs, small ones first
++  std::stable_sort(items.begin(), items.end(), [](const ERUpdates::Item& a, const ERUpdates::Item& b) {
++    if ((a.kind == "dolphin") != (b.kind == "dolphin"))
++      return a.kind == "dolphin";
++    return a.size < b.size;
++  });
++  auto run = std::make_shared<ERUpdateRun>();
++  m_er_run = run;
++  m_er_manual_pending = false;
++  ERUpdateOverlay(true);
++  m_er_upd_timer->start(500);
++  const ERGhosts::Settings s = ERGhosts::Load();
++  ERUpdates::Log(fmt::format("update started: {} item(s)", items.size()));
++  std::thread([run, s, items] {
++    for (const ERUpdates::Item& it : items)
++    {
++      if (run->cancel)
++        break;
++      {
++        std::lock_guard lk(run->mu);
++        run->current = it.title;
++      }
++      run->done = 0;
++      run->total = it.size;
++      std::string path, err;
++      const bool ok = ERUpdates::Download(s, it, &path, &err,
++                                          [run](u64 d, u64 t) {
++                                            run->done = d;
++                                            if (t)
++                                              run->total = t;
++                                            return !run->cancel;
++                                          },
++                                          &run->cancel);
++      std::lock_guard lk(run->mu);
++      if (!ok)
++      {
++        run->errors.push_back(it.title + ": " + err);
++        continue;
++      }
++      if (it.kind == "dolphin")
++      {
++        std::string msg;
++        run->current = "Unpacking the new Dolphin";
++        if (ERUpdates::StageDolphin(it, path, &msg))
++          run->dolphin = it.er_version.empty() ? "Evolution Racing Dolphin " + it.version : "Evolution Racing " + it.er_version;
++        else
++          run->errors.push_back(it.title + ": " + msg);
++      }
++      else if (it.after_dolphin || !ERUpdates::BuildHas(Common::GetERBuildStr(), it.needs))
++      {
++        ERUpdates::KeepForNewDolphin(it, path);
++        run->notes.push_back(it.title + ": installs with the new Dolphin");
++      }
++      else
++      {
++        run->ready.emplace_back(it, path);
++      }
++    }
++    run->finished = true;
++  }).detach();
++}
++
++void MainWindow::ERUpdateOverlay(bool show)
++{
++  if (!m_er_overlay)
++  {
++    m_er_overlay = new QFrame(this);
++    m_er_overlay->setFrameShape(QFrame::StyledPanel);
++    m_er_overlay->setAutoFillBackground(true);
++    auto* l = new QVBoxLayout(m_er_overlay);
++    l->setContentsMargins(8, 6, 8, 6);
++    m_er_overlay_text = new QLabel;
++    m_er_overlay_bar = new QProgressBar;
++    m_er_overlay_bar->setRange(0, 1000);
++    m_er_overlay_bar->setMaximumHeight(12);
++    m_er_overlay_bar->setTextVisible(false);
++    l->addWidget(m_er_overlay_text);
++    l->addWidget(m_er_overlay_bar);
++    m_er_overlay->setFixedWidth(300);
++  }
++  m_er_overlay->setVisible(show);
++  if (show)
++  {
++    m_er_overlay->adjustSize();
++    m_er_overlay->move(width() - m_er_overlay->width() - 12, height() - m_er_overlay->height() - 12);
++    m_er_overlay->raise();
++  }
++}
++
++void MainWindow::ERUpdateTick()
++{
++  auto run = m_er_run;
++  if (!run)
++  {
++    m_er_upd_timer->stop();
++    return;
++  }
++  const u64 d = run->done, t = run->total;
++  std::string cur;
++  {
++    std::lock_guard lk(run->mu);
++    cur = run->current;
++  }
++  if (!run->finished)
++  {
++    const int pct = t ? static_cast<int>(d * 100 / t) : 0;
++    ERUpdateOverlay(true);  // (before the texts: it makes them)
++    m_er_overlay_text->setText(tr("Updating: %1 %2%").arg(Q(cur)).arg(pct));
++    m_er_overlay_bar->setValue(t ? static_cast<int>(d * 1000 / t) : 0);
++    if (!Core::IsUninitialized(m_system) && pct / 25 != m_er_osd_step)  // a line in game every 25 %
++    {
++      m_er_osd_step = pct / 25;
++      Core::DisplayMessage(fmt::format("Evolution Racing update: {} {}%", cur, pct), 4000);
++    }
++    return;
++  }
++  // downloads done: packs install when no game runs (the graphics mods and textures load at the next game start)
++  std::vector<std::pair<ERUpdates::Item, std::string>> ready;
++  {
++    std::lock_guard lk(run->mu);
++    if (!run->ready.empty() && Core::IsUninitialized(m_system))
++      ready.swap(run->ready);
++  }
++  if (!ready.empty())
++  {
++    ERUpdateOverlay(true);  // (makes the box the first time: packs kept by an older folder install at the first start)
++    m_er_overlay_text->setText(tr("Installing..."));
++    m_er_overlay_bar->setRange(0, 0);
++    for (auto& [it, path] : ready)
++    {
++      std::string msg;
++      if (ERUpdates::InstallPack(it, path, &msg))
++        ++run->installed;
++      else
++        run->errors.push_back(it.title + ": " + msg);
++      ERUpdates::PendingDone(path);  // installed, or refused (a damaged file is downloaded again at the next check)
++    }
++    m_er_overlay_bar->setRange(0, 1000);
++  }
++  {
++    std::lock_guard lk(run->mu);
++    if (!run->ready.empty())
++    {
++      ERUpdateOverlay(true);
++      m_er_overlay_text->setText(tr("Downloaded: installs when you stop the game"));
++      m_er_overlay_bar->setValue(1000);
++      return;
++    }
++  }
++  m_er_upd_timer->stop();
++  ERUpdateOverlay(false);
++  m_er_osd_step = -1;
++  ERUpdateDone(run);
++}
++
++void MainWindow::ERUpdateDone(std::shared_ptr<ERUpdateRun> run)
++{
++  ERUpdateTitle();  // (Evolution Racing X.Y.Z: an installed pack can add the .Z)
++  std::string text;
++  if (!run->dolphin.empty())
++    text += "Updated: " + run->dolphin +
++            " is ready. Restart Dolphin to use the new version (your saves, settings and packs come along).\n";
++  if (run->installed)
++    text += fmt::format("{} updated: active from the next race.\n",
++                        run->installed == 1 ? std::string("The pack is") : fmt::format("{} packs are", run->installed));
++  for (const auto& n : run->notes)
++    text += n + "\n";
++  for (const auto& e : run->errors)
++    text += "Not updated: " + e + "\n";
++  if (run->cancel && run->errors.empty())
++    text += "The download stopped; it continues next time.\n";
++  if (text.empty())
++    return;
++  ERUpdates::Log("update finished: " + text);
++  TestWrite("done.txt", text, false);
++  if (!Core::IsUninitialized(m_system))
++    Core::DisplayMessage(run->dolphin.empty() ? "Evolution Racing: effects updated, active next race." :
++                                                "Evolution Racing: updated, restart Dolphin to use the new version.",
++                         8000);
++  auto* box = new QMessageBox(this);
++  box->setAttribute(Qt::WA_DeleteOnClose);
++  box->setWindowModality(Qt::NonModal);
++  box->setWindowTitle(tr("Evolution Racing updates"));
++  box->setText(Q(text));
++  QPushButton* restart = nullptr;
++  if (!run->dolphin.empty())
++    restart = box->addButton(tr("Restart now"), QMessageBox::AcceptRole);
++  box->addButton(run->dolphin.empty() ? tr("OK") : tr("Later"), QMessageBox::RejectRole);
++  connect(box, &QMessageBox::buttonClicked, this, [this, restart](QAbstractButton* b) {
++    if (b && b == restart)
++      ERRestart();
++  });
++  box->show();
++  box->raise();
++  if (restart && TestHas("restart"))
++    QTimer::singleShot(1500, box, [restart] { restart->click(); });
++}
++
++void MainWindow::ERRestart()
++{
++  if (!Core::IsUninitialized(m_system) && !RequestStop())
++    return;
++  // the game is stopped (memory card and states written): let go of this folder's lock, so the newer folder can copy
++  // it at once, whatever the rest of this Dolphin's shutdown takes
++  ERGhosts::ReleaseLock();
++#ifdef _WIN32
++  if (!ERUpdates::StartNewFolder({}))
++    return ERNote("could not start the new Dolphin: start it from its folder.");
++#else
++  // the start script (run.sh, registered for evoracing:// links) moves to the new folder and starts it
++  ERUpdates::RestartViaLink();
++  QDesktopServices::openUrl(QUrl(QStringLiteral("evoracing://restart")));
++#endif
++  QTimer::singleShot(300, this, [this] {
++    close();
++    QCoreApplication::quit();
++  });
++}
++
++bool MainWindow::ERUpdateArg(const std::string& arg)
++{
++  // evoracing://update (the hub's Update in Dolphin), evoracing://link/<code>?hub=...[&then=update] (Link my Dolphin /
++  // Update in Dolphin), evoracing://restart. Links to the project's hub (or a test hub on this computer) link at once:
++  // the member clicked the hub's button; a link to any other address goes to ERGhosts, which asks first (ghosts only).
++  const bool upd = arg.starts_with("evoracing://update") || arg.starts_with("evoracing:update");
++  const bool restart = arg.starts_with("evoracing://restart") || arg.starts_with("evoracing:restart");
++  const bool is_link = arg.find("link/") != std::string::npos;
++  const bool then_update = is_link && arg.find("then=update") != std::string::npos;
++  if (restart)
++    return true;  // (run.sh handles it; a running Dolphin ignores it)
++  ERGhosts::Settings s = ERGhosts::Load();
++  if (s.offline && (upd || is_link || arg.find("ghost/") != std::string::npos))
++  {
++    raise();
++    ERNote("Play offline is on: this Dolphin makes no connections. Turn it off (Tools > Play offline) and click the "
++           "button on the hub again.");
++    return true;
++  }
++  if (upd)
++  {
++    raise();
++    activateWindow();
++    m_er_manual_pending = true;
++    ERUpdateCheck(true);
++    return true;
++  }
++  if (!is_link)
++    return false;  // evoracing://ghost/...: ERGhosts installs it as before
++  std::string code, hub;
++  if (!ERGhosts::ParseLink(arg, &code, &hub))
++    return false;
++  while (!hub.empty() && hub.back() == '/')
++    hub.pop_back();
++  if (hub.empty())
++    hub = s.hub;
++  if (!ERUpdates::UpdateHubAllowed(hub))
++    return false;
++  raise();
++  activateWindow();
++  if (then_update && !s.token.empty() && s.hub == hub)
++  {
++    // linked already: the new code is not needed (it ends by itself on the hub)
++    m_er_manual_pending = true;
++    ERUpdateCheck(true);
++    return true;
++  }
++  s.token = code;
++  s.hub = hub;
++  std::thread([this, s, then_update] {
++    ERGhosts::Reply r = ERGhosts::Hello(s);
++    QueueOnObject(this, [this, s, r, then_update]() mutable {
++      if (!r.ok())
++        return ERNote("linking did not work: " + r.error);
++      s.username = ERGhosts::Field(r.text, "username");
++      s.told_unlinked = false;
++      ERGhosts::Save(s);
++      ERGhostProbe(true);
++      emit ERGhostsChanged();
++      if (!then_update)
++        return ERNote("linked to the hub as " + s.username +
++                      ". What connects is up to you: Tools > Evolution Racing settings (or Play offline).");
++      ERNote("linked to the hub as " + s.username + ". Checking for updates...");
++      m_er_manual_pending = true;
++      ERUpdateCheck(true);
++    });
++  }).detach();
++  return true;
++}
++
++void MainWindow::ERUploadSavedGhosts()
++{
++  const ERGhosts::Settings s = ERGhosts::Load();
++  if (s.offline)
++    return ERNote("Play offline is on: turn it off first, then press Upload saved ghosts now.");
++  if (s.token.empty())
++    return ERNote("link this Dolphin first (Link my Dolphin on the hub's Setup page).");
++  std::vector<ERGhosts::Ghost> gs = ERGhosts::TakeOffline();
++  if (gs.empty())
++    return ERNote("no ghosts saved while offline are waiting.");
++  for (auto& g : gs)
++    m_er_queue.push_back(std::move(g));
++  m_er_force_send = true;
++  ERNote(fmt::format("sending {} ghost(s) saved while offline.", m_er_queue.size()));
++  ERGhostNext();
++}
++
++void MainWindow::ShowERSettings()
++{
++  if (m_er_settings)
++  {
++    m_er_settings->raise();
++    m_er_settings->activateWindow();
++    return;
++  }
++  auto* dlg = new QDialog(this);
++  m_er_settings = dlg;
++  dlg->setAttribute(Qt::WA_DeleteOnClose);
++  dlg->setWindowTitle(tr("Evolution Racing settings"));
++  auto* lay = new QVBoxLayout(dlg);
++  auto* intro = new QLabel(tr("<b>%1</b> <a href=\"about\">About linking</a>").arg(Q(LINKING_LINE)));
++  intro->setWordWrap(true);
++  intro->setTextFormat(Qt::RichText);
++  connect(intro, &QLabel::linkActivated, this, [this](const QString&) { ERAboutLinking(); });
++  lay->addWidget(intro);
++
++  auto* offline = new QCheckBox(tr("Play offline: no connections at all, even while linked (also in the Tools menu)"));
++  lay->addWidget(offline);
++
++  // the hub link
++  auto* link = new QGroupBox(tr("Hub link"));
++  auto* ll = new QVBoxLayout(link);
++  auto* status = new QLabel;
++  status->setWordWrap(true);
++  ll->addWidget(status);
++  auto* row = new QHBoxLayout;
++  auto* code = new QLineEdit;
++  code->setPlaceholderText(tr("Link code (erd_...): or press Link my Dolphin on the hub's Setup page"));
++  auto* do_link = new QPushButton(tr("Link"));
++  row->addWidget(code, 1);
++  row->addWidget(do_link);
++  ll->addLayout(row);
++  auto* row2 = new QHBoxLayout;
++  auto* open = new QPushButton(tr("Open the hub's Setup page"));
++  auto* unlink = new QPushButton(tr("Unlink"));
++  row2->addWidget(open);
++  row2->addWidget(unlink);
++  row2->addStretch(1);
++  ll->addLayout(row2);
++  lay->addWidget(link);
++
++  // updates
++  auto* upd = new QGroupBox(tr("Updates"));
++  auto* ul = new QVBoxLayout(upd);
++  auto* uline = new QLabel(Q(OPTIONAL_LINE));
++  uline->setWordWrap(true);
++  ul->addWidget(uline);
++  auto* u_check = new QCheckBox(tr("Check for updates when Dolphin starts (sends your Dolphin and pack versions)"));
++  auto* u_auto = new QCheckBox(tr("Install them automatically (no question first)"));
++  ul->addWidget(u_check);
++  ul->addWidget(u_auto);
++  auto* urow = new QHBoxLayout;
++  auto* u_now = new QPushButton(tr("Check now"));
++  urow->addWidget(u_now);
++  urow->addStretch(1);
++  ul->addLayout(urow);
++  lay->addWidget(upd);
++
++  // ghosts
++  auto* gh = new QGroupBox(tr("Upload my Time Attack ghosts"));
++  auto* gl = new QVBoxLayout(gh);
++  auto* g_auto = new QRadioButton(tr("Auto - send every new or faster ghost"));
++  auto* g_ask = new QRadioButton(tr("Ask - show the track and time, send when I say so"));
++  auto* g_off = new QRadioButton(tr("Off - send nothing (the memory card folder is not even looked at)"));
++  gl->addWidget(g_auto);
++  gl->addWidget(g_ask);
++  gl->addWidget(g_off);
++  auto* gcost = new QLabel(tr("A ghost sent after the race includes its run data (position, speed, energy, laps) for "
++                              "the replays. %1")
++                               .arg(Q(GHOST_COST)));
++  gcost->setWordWrap(true);
++  gcost->setStyleSheet(QStringLiteral("color:gray"));
++  gl->addWidget(gcost);
++  auto* grow = new QHBoxLayout;
++  auto* g_saved = new QPushButton(tr("Upload saved ghosts now"));
++  g_saved->setToolTip(tr("Ghosts saved while Play offline was on are never sent unless you press this."));
++  grow->addWidget(g_saved);
++  grow->addStretch(1);
++  gl->addLayout(grow);
++  lay->addWidget(gh);
++
++  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
++  lay->addWidget(buttons);
++  connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::close);
++
++  auto refresh = [=] {
++    const ERGhosts::Settings s = ERGhosts::Load();
++    const ERUpdates::Settings us = ERUpdates::Load();
++    for (QAbstractButton* b : std::initializer_list<QAbstractButton*>{offline, g_auto, g_ask, g_off, u_check, u_auto})
++      b->blockSignals(true);
++    offline->setChecked(s.offline);
++    g_auto->setChecked(s.mode == ERGhosts::Mode::Auto);
++    g_ask->setChecked(s.mode == ERGhosts::Mode::Ask);
++    g_off->setChecked(s.mode == ERGhosts::Mode::Off);
++    u_check->setChecked(us.mode != ERUpdates::Mode::Off);
++    u_auto->setChecked(us.mode == ERUpdates::Mode::Auto);
++    u_auto->setEnabled(us.mode != ERUpdates::Mode::Off);
++    for (QAbstractButton* b : std::initializer_list<QAbstractButton*>{offline, g_auto, g_ask, g_off, u_check, u_auto})
++      b->blockSignals(false);
++    status->setText(s.token.empty() ?
++                        tr("Not linked. On the hub's Setup page press <b>Link my Dolphin</b> (one click), or paste a link code here.") :
++                        Q(fmt::format("Linked to {} as {}.{}", HostOf(s.hub), s.username.empty() ? "(checking...)" : s.username,
++                                      s.offline ? " Play offline is on: nothing connects." : "")));
++    unlink->setEnabled(!s.token.empty());
++    u_now->setEnabled(!s.offline);
++    g_saved->setEnabled(!s.offline && !s.token.empty());
++  };
++  refresh();
++  connect(this, &MainWindow::ERGhostsChanged, dlg, refresh);
++  connect(offline, &QCheckBox::toggled, dlg, [this](bool on) { SetEROffline(on); });
++  auto set_mode = [this](ERGhosts::Mode m) {
++    ERGhosts::Settings s = ERGhosts::Load();
++    s.mode = m;
++    ERGhosts::Save(s);
++    ERGhostProbe(false);
++  };
++  connect(g_auto, &QRadioButton::toggled, dlg, [=](bool on) { if (on) set_mode(ERGhosts::Mode::Auto); });
++  connect(g_ask, &QRadioButton::toggled, dlg, [=](bool on) { if (on) set_mode(ERGhosts::Mode::Ask); });
++  connect(g_off, &QRadioButton::toggled, dlg, [=](bool on) { if (on) set_mode(ERGhosts::Mode::Off); });
++  auto set_upd = [=] {
++    ERUpdates::Settings us = ERUpdates::Load();
++    us.mode = !u_check->isChecked() ? ERUpdates::Mode::Off : u_auto->isChecked() ? ERUpdates::Mode::Auto : ERUpdates::Mode::Notify;
++    us.asked = true;
++    ERUpdates::Save(us);
++    refresh();
++  };
++  connect(u_check, &QCheckBox::toggled, dlg, set_upd);
++  connect(u_auto, &QCheckBox::toggled, dlg, set_upd);
++  connect(u_now, &QPushButton::clicked, dlg, [this] {
++    m_er_manual_pending = true;
++    ERUpdateCheck(true);
++  });
++  connect(g_saved, &QPushButton::clicked, dlg, [this] { ERUploadSavedGhosts(); });
++  connect(do_link, &QPushButton::clicked, dlg, [=, this] {
++    std::string c = code->text().trimmed().toStdString(), hub;
++    const ERGhosts::Settings s = ERGhosts::Load();
++    if (s.offline)
++      return ERNote("Play offline is on: turn it off to link.");
++    if (c.starts_with("evoracing:") && !ERGhosts::ParseLink(c, &c, &hub))
++      return ERNote("that is not a link code.");
++    if (!c.starts_with("erd_"))
++      return ERNote("a link code starts with erd_ (Link my Dolphin on the hub's Setup page makes one).");
++    if (hub.empty())
++      hub = s.hub;
++    if (!ERGhosts::HubAllowed(hub))
++      return ERNote("that link points to an address this Dolphin does not connect to: " + hub);
++    status->setText(tr("Linking..."));
++    ERGhostLink(c, hub);
++  });
++  connect(open, &QPushButton::clicked, dlg, [] {
++    QDesktopServices::openUrl(QUrl(Q(ERGhosts::Load().hub + "/hub/setup#linking")));
++  });
++  connect(unlink, &QPushButton::clicked, dlg, [=, this] {
++    ERGhosts::Settings s = ERGhosts::Load();
++    s.token.clear();
++    s.username.clear();
++    ERGhosts::Save(s);
++    ERGhostProbe(false);
++    refresh();
++    ERNote("unlinked on this PC. To end the link on the hub too: Linked devices on the Setup page.");
++  });
++  dlg->resize(600, dlg->sizeHint().height());
++  dlg->show();
++}
 --- a/Source/Core/DolphinQt/Main.cpp
 +++ b/Source/Core/DolphinQt/Main.cpp
-@@ -28,6 +28,7 @@
+@@ -28,6 +28,9 @@
  #include "Core/Boot/Boot.h"
  #include "Core/Config/MainSettings.h"
  #include "Core/Core.h"
++#include "Core/ERGhosts.h"
++#include "Core/ERUpdates.h"
 +#include "Core/ERTest.h"
  #include "Core/DolphinAnalytics.h"
  #include "Core/System.h"
  
-@@ -214,6 +215,16 @@
+@@ -183,7 +186,7 @@
+ 
+   auto parser = CommandLineParse::CreateParser(CommandLineParse::ParserOptions::IncludeGUIOptions);
+   const optparse::Values& options = CommandLineParse::ParseArguments(parser.get(), argc, argv);
+-  const std::vector<std::string> args = parser->args();
++  std::vector<std::string> args = parser->args();
+ 
+ #ifdef _WIN32
+   QtUtils::InstallWindowDecorationFilter(&app);
+@@ -214,6 +217,31 @@
      save_state_path = static_cast<const char*>(options.get("save_state"));
    }
  
 +  // Evolution Racing Test in game: evoracing://test/<id> (from the builder) or a .ertest package
++#ifdef _WIN32
++  // an updated folder (Evolution Racing updater): its successor starts instead (saves, settings and packs went along)
++  if (ERUpdates::StartNewFolder(args))
++    return 0;
++#endif
 +  ERTest::RegisterHandlers();
++  // Evolution Racing ghosts: evoracing://link/<code> and evoracing://ghost/... (hub pages) go to the Dolphin already
++  // running for this user folder, else to this one (never to Test in game)
++  std::string er_ghost_arg;
++  if (!args.empty() && ERGhosts::IsArg(args.front()))
++  {
++    er_ghost_arg = args.front();
++    if (ERGhosts::ForwardIfRunning(er_ghost_arg))
++      return 0;
++    args.erase(args.begin());
++  }
 +  std::string er_test_arg;
 +  if (!args.empty() && ERTest::IsLaunchArg(args.front()))
 +  {
@@ -15131,7 +19353,7 @@ HcmV?d00001
    std::unique_ptr<BootParameters> boot;
    bool game_specified = false;
    if (options.is_set("exec"))
-@@ -239,7 +250,7 @@
+@@ -239,7 +267,7 @@
      }
      game_specified = true;
    }
@@ -15140,12 +19362,14 @@ HcmV?d00001
    {
      boot = BootParameters::GenerateFromFile(
          args.front(), BootSessionData(save_state_path, DeleteSavestateAfterBoot::No));
-@@ -277,6 +288,8 @@
+@@ -277,6 +305,10 @@
  
      MainWindow win{Core::System::GetInstance(), std::move(boot),
                     static_cast<const char*>(options.get("movie"))};
 +    if (!er_test_arg.empty())
 +      win.StartERTest(er_test_arg);
++    win.InitERGhosts(er_ghost_arg);
++    win.InitERUpdates();
  
  #if defined(USE_ANALYTICS) && USE_ANALYTICS
      if (!Config::Get(Config::MAIN_ANALYTICS_PERMISSION_ASKED))
@@ -15160,24 +19384,36 @@ HcmV?d00001
  #include <QStackedWidget>
  #include <QStyleHints>
  #include <QVBoxLayout>
-@@ -44,6 +46,7 @@
+@@ -44,6 +46,8 @@
  #include "Core/AchievementManager.h"
  #include "Core/Boot/Boot.h"
  #include "Core/BootManager.h"
++#include "Core/ERGhosts.h"
 +#include "Core/ERTest.h"
  #include "Core/CommonTitles.h"
  #include "Core/Config/AchievementSettings.h"
  #include "Core/Config/MainSettings.h"
-@@ -217,7 +220,7 @@
+@@ -217,7 +221,7 @@
                         const std::string& movie_path)
      : QMainWindow(nullptr), m_system(system)
  {
 -  setWindowTitle(QString::fromStdString(Common::GetScmRevStr()));
-+  setWindowTitle(QString::fromStdString(Common::GetERVersionStr()));
++  setWindowTitle(QString::fromStdString(Common::GetERVersionStr() + (ERGhosts::Offline() ? " - Offline" : "")));
    setWindowIcon(Resources::GetAppIcon());
    setUnifiedTitleAndToolBarOnMac(true);
    setAcceptDrops(true);
-@@ -1166,6 +1169,46 @@
+@@ -557,6 +561,10 @@
+ 
+   // Tools
+   connect(m_menu_bar, &MenuBar::ShowMemcardManager, this, &MainWindow::ShowMemcardManager);
++  connect(m_menu_bar, &MenuBar::ShowERGhosts, this, &MainWindow::ShowERGhosts);
++  connect(m_menu_bar, &MenuBar::ShowERSettings, this, &MainWindow::ShowERSettings);
++  connect(m_menu_bar, &MenuBar::SetEROffline, this, &MainWindow::SetEROffline);
++  connect(m_menu_bar, &MenuBar::CheckERUpdates, this, [this] { m_er_manual_pending = true; ERUpdateCheck(true); });
+   connect(m_menu_bar, &MenuBar::ShowResourcePackManager, this,
+           &MainWindow::ShowResourcePackManager);
+   connect(m_menu_bar, &MenuBar::ShowCheatsManager, this, &MainWindow::ShowCheatsManager);
+@@ -1166,10 +1174,53 @@
        paths, boot_session_data ? std::move(*boot_session_data) : BootSessionData()));
  }
  
@@ -15224,26 +19460,152 @@ HcmV?d00001
  void MainWindow::StartGame(std::unique_ptr<BootParameters>&& parameters)
  {
    if (parameters && std::holds_alternative<BootParameters::Disc>(parameters->parameters))
-@@ -1301,7 +1344,7 @@
+   {
++    // Evolution Racing ghosts: the disc whose course files name the track of a ghost saved now
++    ERGhosts::SetBootDisc(std::get<BootParameters::Disc>(parameters->parameters).path, ERTest::Active());
++    ERGhostBoot(*parameters);  // run telemetry on / off for this boot
+     if (std::get<BootParameters::Disc>(parameters->parameters).volume->IsNKit())
+     {
+       if (!NKitWarningDialog::ShowUnlessDisabled())
+@@ -1301,7 +1352,7 @@
      m_rendering_to_main = false;
      m_stack->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
      disconnect(Host::GetInstance(), &Host::RequestTitle, this, &MainWindow::setWindowTitle);
 -    setWindowTitle(QString::fromStdString(Common::GetScmRevStr()));
-+    setWindowTitle(QString::fromStdString(Common::GetERVersionStr()));
++    ERUpdateTitle();  // (+ " - Offline" while Play offline is on)
    }
  
    // The following code works around a driver bug that would lead to Dolphin crashing when changing
 --- a/Source/Core/DolphinQt/MainWindow.h
 +++ b/Source/Core/DolphinQt/MainWindow.h
-@@ -84,6 +84,8 @@
+@@ -7,6 +7,8 @@
+ #include <QStringList>
+ 
+ #include <array>
++#include <deque>
++#include <map>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -16,6 +18,9 @@
+ #endif  // USE_RETRO_ACHIEVEMENTS
+ 
+ #include "Core/Boot/Boot.h"
++#include "Core/ERGhosts.h"
++#include "Core/ERUpdates.h"
++#include <QPointer>
+ #include "DolphinQt/FIFO/FIFOPlayerWindow.h"
+ 
+ class QMenu;
+@@ -79,11 +84,26 @@
+ class XRRConfiguration;
+ }
+ 
++struct ERUpdateRun;  // ERUpdatesUI.cpp
++class QFrame;
++class QLabel;
++class QProgressBar;
++
+ class MainWindow final : public QMainWindow
+ {
    Q_OBJECT
  
  public:
 +  // Evolution Racing Test in game (Core/ERTest.h): wait for the builder's packages and boot each one
 +  void StartERTest(const std::string& arg);
++  // Evolution Racing ghosts (Core/ERGhosts.h, ERGhostsUI.cpp): the card-folder watcher, the hub link, evoracing:// links
++  void InitERGhosts(const std::string& arg);
++  void ShowERGhosts();
++  // Evolution Racing settings, Play offline and the OPTIONAL updater (Core/ERUpdates.h, ERUpdatesUI.cpp)
++  void InitERUpdates();
++  void ShowERSettings();
++  void SetEROffline(bool on);
++  void ERUpdateCheck(bool manual);
    explicit MainWindow(Core::System& system, std::unique_ptr<BootParameters> boot_parameters,
                        const std::string& movie_path);
    ~MainWindow() override;
+@@ -96,10 +116,51 @@
+   void ShowTriforceWindow();
+ 
+ signals:
++  void ERGhostsChanged();
+   void ReadOnlyModeChanged(bool read_only);
+   void RecordingStatusChanged(bool recording);
+ 
+ private:
++  void ERGhostTick();
++  void ERGhostNext();
++  void ERGhostSend(ERGhosts::Ghost g, bool dry);
++  void ERGhostReply(ERGhosts::Ghost g, const ERGhosts::Reply& r, bool dry);
++  void ERGhostArg(const std::string& arg);
++  void ERGhostLink(const std::string& code, const std::string& hub);
++  void ERNote(const std::string& text);
++  void ERGhostProbe(bool fetch);
++  void ERGhostBoot(const BootParameters& boot);
++  void ERGhostExtras(const ERGhosts::Ghost& g);
++  std::string m_er_probe_fetched;
++  QTimer* m_er_ghost_timer = nullptr;
++  std::deque<ERGhosts::Ghost> m_er_queue;
++  std::map<std::string, int> m_er_retries;
++  bool m_er_ghost_busy = false;
++  bool m_er_force_send = false;  // "Upload saved ghosts now"
++  bool ERUpdateArg(const std::string& arg);
++  void ERFirstRun();
++  void ERUpdatePopup(const std::vector<ERUpdates::Item>& items);
++  void ERUpdateStart(std::vector<ERUpdates::Item> items);
++  void ERUpdateOverlay(bool show);
++  void ERUpdateTick();
++  void ERUpdateDone(std::shared_ptr<ERUpdateRun> run);
++  void ERUpdateTitle();
++  void ERRestart();
++  void ERAboutLinking();
++  void ERUploadSavedGhosts();
++  std::shared_ptr<ERUpdateRun> m_er_run;
++  QTimer* m_er_upd_timer = nullptr;
++  QFrame* m_er_overlay = nullptr;
++  QLabel* m_er_overlay_text = nullptr;
++  QProgressBar* m_er_overlay_bar = nullptr;
++  QPointer<QDialog> m_er_popup;
++  QPointer<QDialog> m_er_settings;
++  bool m_er_checking = false;
++  bool m_er_manual_pending = false;
++  int m_er_rechecks = 0;
++  int m_er_osd_step = -1;
++  s64 m_er_last_running = 0;
++
+   void Open();
+   void RefreshGameList();
+   void Play(const std::optional<std::string>& savestate_path = {});
+--- a/Source/Core/DolphinQt/MenuBar.cpp
++++ b/Source/Core/DolphinQt/MenuBar.cpp
+@@ -277,6 +277,14 @@
+ {
+   QMenu* tools_menu = addMenu(tr("&Tools"));
+ 
++  tools_menu->addAction(tr("Evolution Racing &settings..."), this, [this] { emit ShowERSettings(); });
++  QAction* er_offline = tools_menu->addAction(tr("Play &offline (no connections)"));
++  er_offline->setObjectName(QStringLiteral("erOffline"));
++  er_offline->setCheckable(true);
++  connect(er_offline, &QAction::toggled, this, [this](bool on) { emit SetEROffline(on); });
++  tools_menu->addAction(tr("Check for Evolution Racing &updates"), this, [this] { emit CheckERUpdates(); });
++  tools_menu->addSeparator();
++
+   tools_menu->addAction(tr("&Resource Pack Manager"), this,
+                         [this] { emit ShowResourcePackManager(); });
+ 
+--- a/Source/Core/DolphinQt/MenuBar.h
++++ b/Source/Core/DolphinQt/MenuBar.h
+@@ -92,6 +92,10 @@
+ 
+   // Tools
+   void ShowMemcardManager();
++  void ShowERGhosts();  // Evolution Racing ghosts (ERGhostsUI.cpp)
++  void ShowERSettings();  // Evolution Racing settings (ERUpdatesUI.cpp)
++  void SetEROffline(bool on);
++  void CheckERUpdates();
+   void BootGameCubeIPL(DiscIO::Region region);
+   void ShowFIFOPlayer();
+   void ShowAboutDialog();
 --- a/Source/Core/VideoBackends/Vulkan/CommandBufferManager.cpp
 +++ b/Source/Core/VideoBackends/Vulkan/CommandBufferManager.cpp
 @@ -2,6 +2,96 @@
