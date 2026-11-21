@@ -13651,7 +13651,7 @@ HcmV?d00001
  
 +// Evolution Racing member build id (one id for the Linux and the Windows build of the same source)
 +#ifndef ER_BUILD_ID
-+#define ER_BUILD_ID "lit17s35mv"
++#define ER_BUILD_ID "lit17s35mvp"
 +#endif
 +const std::string& GetERBuildStr()
 +{
@@ -28869,6 +28869,78 @@ HcmV?d00001
  };
  
  struct CustomPixelShaderContents
+--- a/Source/Core/VideoCommon/Spirv.cpp
++++ b/Source/Core/VideoCommon/Spirv.cpp
+@@ -11,6 +11,9 @@
+ #include "Common/Logging/Log.h"
+ #include "Common/MsgHandler.h"
+ #include "Common/Version.h"
++#include "Common/IOFile.h"
++#include <xxh3.h>
++#include <fmt/format.h>
+ 
+ #include "VideoCommon/VideoBackendBase.h"
+ #include "VideoCommon/VideoConfig.h"
+@@ -157,10 +160,59 @@
+ }
+ 
+ std::optional<SPIRV::CodeVector>
++CompileShaderToSPVUncached(EShLanguage stage, APIType api_type,
++                           glslang::EShTargetLanguageVersion language_version, const char* stage_filename,
++                           std::string_view source, glslang::TShader::Includer* shader_includer);
++
++std::optional<SPIRV::CodeVector>
+ CompileShaderToSPV(EShLanguage stage, APIType api_type,
+                    glslang::EShTargetLanguageVersion language_version, const char* stage_filename,
+                    std::string_view source, glslang::TShader::Includer* shader_includer)
+ {
++  // Evolution Racing lit17s40p SPV cache: SPIR-V compiled from source, kept on disk by a hash of build + stage + source
++  std::string spv_cache_file;
++  if (!shader_includer && !g_ActiveConfig.bEnableValidationLayer)
++  {
++    XXH3_state_t hs;
++    XXH3_INITSTATE(&hs);
++    XXH3_64bits_reset_withSeed(&hs, 0x5090);
++    const std::string rev = Common::GetScmRevGitStr() + Common::GetScmDescStr();
++    const int key[3] = {static_cast<int>(stage), static_cast<int>(api_type), static_cast<int>(language_version)};
++    XXH3_64bits_update(&hs, rev.data(), rev.size());
++    XXH3_64bits_update(&hs, key, sizeof(key));
++    XXH3_64bits_update(&hs, source.data(), source.size());
++    const std::string dir = File::GetUserPath(D_SHADERCACHE_IDX) + "pc5090-spv/";
++    spv_cache_file = fmt::format("{}{:016x}.spv", dir, XXH3_64bits_digest(&hs));
++    File::IOFile f(spv_cache_file, "rb");
++    const u64 n = f.IsOpen() ? f.GetSize() : 0;
++    if (n >= 20 && n % sizeof(u32) == 0)
++    {
++      SPIRV::CodeVector cached(n / sizeof(u32));
++      if (f.ReadArray(cached.data(), cached.size()) && cached[0] == 0x07230203u)  // SPIR-V magic
++        return cached;
++    }
++    if (!File::IsDirectory(dir))
++      File::CreateFullPath(dir);
++  }
++  auto spv_result = CompileShaderToSPVUncached(stage, api_type, language_version, stage_filename, source, shader_includer);
++  if (spv_result && !spv_cache_file.empty())
++  {
++    const std::string tmp = spv_cache_file + ".tmp";
++    {
++      File::IOFile f(tmp, "wb");
++      if (f.IsOpen())
++        f.WriteArray(spv_result->data(), spv_result->size());
++    }
++    File::Rename(tmp, spv_cache_file);
++  }
++  return spv_result;
++}
++
++std::optional<SPIRV::CodeVector>
++CompileShaderToSPVUncached(EShLanguage stage, APIType api_type,
++                           glslang::EShTargetLanguageVersion language_version, const char* stage_filename,
++                           std::string_view source, glslang::TShader::Includer* shader_includer)
++{
+   if (!InitializeGlslang())
+     return std::nullopt;
+ 
 --- a/Source/Core/VideoCommon/TextureCacheBase.cpp
 +++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
 @@ -2,10 +2,13 @@
