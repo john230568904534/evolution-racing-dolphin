@@ -14931,7 +14931,7 @@ HcmV?d00001
  
 +// Evolution Racing member build id (one id for the Linux and the Windows build of the same source)
 +#ifndef ER_BUILD_ID
-+#define ER_BUILD_ID "lit17s41m"
++#define ER_BUILD_ID "lit17s41mg"
 +#endif
 +const std::string& GetERBuildStr()
 +{
@@ -14941,7 +14941,7 @@ HcmV?d00001
 +
 +// Evolution Racing X.Y (hub/server/versions.json; lighting_mod/updater/apply_version.py sets it)
 +#ifndef ER_VERSION
-+#define ER_VERSION "1.4"
++#define ER_VERSION "1.5"
 +#endif
 +// "ER_VERSION=1.3" stays in the binary (not const, read below): scripts/dolphinpack.py / winpack.py look for it
 +extern char er_version_marker[];
@@ -15156,7 +15156,7 @@ HcmV?d00001
      const std::string& title = SConfig::GetInstance().GetTitleDescription();
 --- a/Source/Core/Core/ERGhosts.cpp
 +++ b/Source/Core/Core/ERGhosts.cpp
-@@ -0,0 +1,1044 @@
+@@ -0,0 +1,1047 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -15496,9 +15496,12 @@ HcmV?d00001
 +    return "not a Time Attack ghost (missing marker)";
 +  const int mm = g[0x24], ss = g[0x25], ms = BE16(g + 0x26);
 +  const u32 total = static_cast<u32>((mm * 60 + ss) * 1000 + ms);
-+  if (ss >= 60 || ms >= 1000 || total == 0 || total >= 3600000)
++  if (ss >= 60 || ms >= 1000 || total == 0 || total >= 6000000)
 +    return "the time in the file is not a real race time";
-+  const int samples = BE16(g + 0x18), frames = BE16(g + 0x1E);
++  // race frames: a u32 at +0x1C (the upper half is 0 under 18:12, so older builds read the u16 at +0x1E); long ghosts
++  // (fzgx-custom scripts/ghostlong.py discs, up to 40 min) need all 32 bits
++  const u32 frames32 = (static_cast<u32>(BE16(g + 0x1C)) << 16) | BE16(g + 0x1E);
++  const int samples = BE16(g + 0x18), frames = frames32 > 0 && frames32 < 6000000 ? static_cast<int>(frames32) : BE16(g + 0x1E);
 +  if (samples <= 0 || samples > MAX_SAMPLES)
 +    return "the ghost has no usable race data";
 +  if (std::abs(frames - static_cast<double>(total) * 60 / 1000) > 2)
