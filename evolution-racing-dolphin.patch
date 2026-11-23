@@ -14931,7 +14931,7 @@ HcmV?d00001
  
 +// Evolution Racing member build id (one id for the Linux and the Windows build of the same source)
 +#ifndef ER_BUILD_ID
-+#define ER_BUILD_ID "lit17s41mg"
++#define ER_BUILD_ID "lit17s41mgr"
 +#endif
 +const std::string& GetERBuildStr()
 +{
@@ -14941,7 +14941,7 @@ HcmV?d00001
 +
 +// Evolution Racing X.Y (hub/server/versions.json; lighting_mod/updater/apply_version.py sets it)
 +#ifndef ER_VERSION
-+#define ER_VERSION "1.5"
++#define ER_VERSION "1.6"
 +#endif
 +// "ER_VERSION=1.3" stays in the binary (not const, read below): scripts/dolphinpack.py / winpack.py look for it
 +extern char er_version_marker[];
@@ -15156,7 +15156,7 @@ HcmV?d00001
      const std::string& title = SConfig::GetInstance().GetTitleDescription();
 --- a/Source/Core/Core/ERGhosts.cpp
 +++ b/Source/Core/Core/ERGhosts.cpp
-@@ -0,0 +1,1047 @@
+@@ -0,0 +1,1072 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -15593,6 +15593,31 @@ HcmV?d00001
 +{
 +  std::lock_guard lk(s_mutex);
 +  return s_boot_test;
++}
++
++std::vector<u8> ReadBootDiscFile(const std::string& disc_path, size_t max_bytes)
++{
++  std::string path;
++  {
++    std::lock_guard lk(s_mutex);
++    path = s_boot_disc;
++  }
++  if (path.empty())
++    return {};
++  const std::unique_ptr<DiscIO::Volume> vol = DiscIO::CreateVolume(path);
++  if (!vol)
++    return {};
++  const DiscIO::Partition part = vol->GetGamePartition();
++  const DiscIO::FileSystem* fs = vol->GetFileSystem(part);
++  if (!fs)
++    return {};
++  const auto info = fs->FindFileInfo(disc_path);
++  if (!info || info->GetSize() == 0 || info->GetSize() > max_bytes)
++    return {};
++  std::vector<u8> buf(info->GetSize());
++  if (DiscIO::ReadFile(*vol, part, info.get(), buf.data(), buf.size()) != buf.size())
++    return {};
++  return buf;
 +}
 +
 +std::string CourseSha1(int slot)
@@ -16206,7 +16231,7 @@ HcmV?d00001
 +}  // namespace ERGhosts
 --- a/Source/Core/Core/ERGhosts.h
 +++ b/Source/Core/Core/ERGhosts.h
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,140 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -16293,6 +16318,9 @@ HcmV?d00001
 +
 +// The disc this Dolphin booted (MainWindow::StartGame), for the course file hash. Test in game boots are marked.
 +void SetBootDisc(const std::string& path, bool er_test);
++// A file of the booted disc (e.g. "stage/rs03.json"): its bytes, or empty (no disc, no such file, over max_bytes).
++// Opens its own volume handle: safe from any thread.
++std::vector<u8> ReadBootDiscFile(const std::string& disc_path, size_t max_bytes = 64u << 20);
 +// sha1 (lowercase hex) of stage/COLI_COURSE<slot>.lz on the booted disc, "" when unknown
 +std::string CourseSha1(int slot);
 +bool BootedForTest();
@@ -23149,7 +23177,7 @@ HcmV?d00001
    std::shared_ptr<VideoCommon::CustomAssetLibrary> m_library;
 --- a/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.cpp
 +++ b/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.cpp
-@@ -0,0 +1,13729 @@
+@@ -0,0 +1,14352 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -23169,6 +23197,7 @@ HcmV?d00001
 +#include <future>
 +#include <span>
 +#include <thread>
++#include <tuple>
 +
 +#include <tinygltf/tiny_gltf.h>
 +#include <tinygltf/stb_image.h>
@@ -23181,6 +23210,9 @@ HcmV?d00001
 +#include "Common/Logging/Log.h"
 +
 +#include "Common/Swap.h"
++#include "Common/Crypto/SHA1.h"
++#include "Core/ERGhosts.h"
++#include "VideoCommon/TextureDecoder.h"
 +#include "Core/Config/GraphicsSettings.h"
 +#include "Core/HW/Memmap.h"
 +#include "Core/HW/PC5090SafeMem.h"
@@ -24714,6 +24746,7 @@ HcmV?d00001
 +  std::string file;
 +  std::vector<float> verts;  // 8 floats per vertex: pos xyz, normal xyz, uv; 3 vertices per triangle
 +  ScImage color, orm, emissive;
++  bool matcap = false;  // 1.6 roadside: "emissive" is a view-space sphere map (the GX view-specular layer), added
 +  std::array<float, 4> base{1.0f, 1.0f, 1.0f, 1.0f};
 +  std::array<float, 3> em{0.0f, 0.0f, 0.0f};
 +  std::array<float, 3> center{};
@@ -25576,6 +25609,631 @@ HcmV?d00001
 +  return true;
 +}
 +
++// ---- Evolution Racing 1.6: roadside scenery outside game memory (track.json "roadside": "dolphin") ----
++// A track built that way leaves its stock roadside objects (the venue's own buildings, signs and props the builder placed)
++// out of the course. They are on the member's disc in game format, next to the course files:
++//   stage/rsNN.json    {"version": 1, "st_sha1": sha1 of stage/stNN.gma.lz, "objects": [{"model", "lods", "m": 3x4}], "light"}
++//   stage/rsNN.gma.lz  those models (GMA), stage/rsNN.tpl.lz their textures (TPL, the course's slot numbers)
++// The game never loads these files. This Dolphin reads them from the booted disc when the course slot loads and turns
++// them into scenery meshes here, on the player's PC (models baked into world space, merged by texture + tint, split into
++// spatial chunks so they still cull). st_sha1 must match the disc's stNN.gma.lz (a disc whose slot got another track
++// since keeps a stale rsNN set: ignored).
++namespace Roadside
++{
++u32 B32(const std::vector<u8>& b, size_t o)
++{
++  return o + 4 <= b.size() ? (u32(b[o]) << 24) | (u32(b[o + 1]) << 16) | (u32(b[o + 2]) << 8) | b[o + 3] : 0;
++}
++u16 B16(const std::vector<u8>& b, size_t o)
++{
++  return o + 2 <= b.size() ? static_cast<u16>((b[o] << 8) | b[o + 1]) : 0;
++}
++float BF(const std::vector<u8>& b, size_t o)
++{
++  const u32 v = B32(b, o);
++  float f;
++  std::memcpy(&f, &v, 4);
++  return f;
++}
++size_t Align32(size_t x)
++{
++  return (x + 31) & ~size_t(31);
++}
++
++// Amusement Vision LZ (LZSS, 4 KiB ring, 18-byte matches): u32 LE packed size (with or without the 8-byte header),
++// u32 LE unpacked size, then the stream
++std::vector<u8> LzUnpack(const std::vector<u8>& in)
++{
++  if (in.size() < 8)
++    return {};
++  const u32 hsize = in[0] | (in[1] << 8) | (in[2] << 16) | (u32(in[3]) << 24);
++  const u32 usize = in[4] | (in[5] << 8) | (in[6] << 16) | (u32(in[7]) << 24);
++  size_t csize = hsize == in.size() ? hsize - 8 : hsize;
++  if (csize + 8 > in.size() || usize > (128u << 20))
++    return {};
++  std::vector<u8> out;
++  out.reserve(usize);
++  std::array<u8, 4096> ring{};
++  size_t rp = 4096 - 18, ip = 8;
++  const size_t end = 8 + csize;
++  u32 flags = 0;
++  while (ip < end)
++  {
++    if ((flags & 0xFF00) == 0)
++      flags = in[ip++] | 0x8000;
++    if (flags & 1)
++    {
++      if (ip >= end)
++        break;
++      const u8 c = in[ip++];
++      out.push_back(c);
++      ring[rp++ % 4096] = c;
++    }
++    else
++    {
++      if (ip + 1 >= end)
++        break;
++      const size_t idx = ((in[ip + 1] & 0xF0) << 4) | in[ip];
++      const int cnt = (in[ip + 1] & 0x0F) + 3;
++      ip += 2;
++      for (int k = 0; k < cnt; k++)
++      {
++        const u8 c = ring[(idx + k) % 4096];
++        out.push_back(c);
++        ring[rp++ % 4096] = c;
++      }
++    }
++    flags >>= 1;
++  }
++  if (out.size() != usize)
++    return {};
++  return out;
++}
++
++struct Vtx
++{
++  float p[3], n[3], uv[2];
++  u8 col[4];
++};
++struct Sub
++{
++  int tex = -1;                  // TPL slot of its colour layer (the first one that is neither specular nor a mask)
++  int spec = -1;                 // TPL slot of its view-specular layer (a sphere map, added), -1 = none
++  bool unlit = false;            // render flag bit 0: texture x white (no light, no vertex colour)
++  bool additive = false;         // render flag 0x40
++  std::array<float, 4> mat{1, 1, 1, 1};
++  bool has_col = false;
++  std::vector<Vtx> tris;         // 3 per triangle, model space
++};
++struct ModelGeo
++{
++  std::vector<Sub> subs;
++  bool ok = false;
++};
++
++// GX inline vertex data of a GCMF display list (GFZ VAT 0: f32; VAT 1: s16 with 13 / 14 fraction bits)
++bool ReadVertex(const std::vector<u8>& b, size_t* pos, u32 attrs, int vat, Vtx* v, bool* has_col)
++{
++  size_t o = *pos;
++  const auto fx16 = [&](size_t at, int frac) { return static_cast<float>(static_cast<s16>(B16(b, at))) / float(1 << frac); };
++  if (attrs & 1)  // PNMTXIDX
++    o += 1;
++  for (int k = 1; k <= 8; k++)
++    if (attrs & (1u << k))
++      return false;  // TEXnMTXIDX: not in GFZ stage models
++  if (attrs & (1u << 9))  // POS
++  {
++    for (int k = 0; k < 3; k++)
++      v->p[k] = vat == 0 ? BF(b, o + 4 * k) : fx16(o + 2 * k, 13);
++    o += vat == 0 ? 12 : 6;
++  }
++  v->n[0] = 0.0f;
++  v->n[1] = 1.0f;
++  v->n[2] = 0.0f;
++  if (attrs & (1u << 10))  // NRM
++  {
++    for (int k = 0; k < 3; k++)
++      v->n[k] = vat == 0 ? BF(b, o + 4 * k) : fx16(o + 2 * k, 14);
++    o += vat == 0 ? 12 : 6;
++  }
++  if (attrs & (1u << 25))  // NBT (normal, binormal, tangent)
++  {
++    if (vat != 0)
++      return false;
++    for (int k = 0; k < 3; k++)
++      v->n[k] = BF(b, o + 4 * k);
++    o += 36;
++  }
++  v->col[0] = v->col[1] = v->col[2] = v->col[3] = 255;
++  if (attrs & (1u << 11))  // CLR0 RGBA8
++  {
++    for (int k = 0; k < 4; k++)
++      v->col[k] = o + k < b.size() ? b[o + k] : 255;
++    o += 4;
++    *has_col = true;
++  }
++  if (attrs & (1u << 12))  // CLR1
++    o += 4;
++  v->uv[0] = v->uv[1] = 0.0f;
++  for (int t = 0; t < 8; t++)
++    if (attrs & (1u << (13 + t)))
++    {
++      const float u = vat == 0 ? BF(b, o) : fx16(o, 13), w = vat == 0 ? BF(b, o + 4) : fx16(o + 2, 13);
++      if (t == 0)
++      {
++        v->uv[0] = u;
++        v->uv[1] = w;
++      }
++      o += vat == 0 ? 8 : 4;
++    }
++  if (attrs & ((1u << 21) | (1u << 22) | (1u << 23) | (1u << 24)))
++    return false;
++  if (o > b.size())
++    return false;
++  *pos = o;
++  return true;
++}
++
++// one display-list region [pos, end): GX_NOP, then primitives until the end or FIFO padding (0)
++bool ReadDisplayLists(const std::vector<u8>& b, size_t pos, size_t end, u32 attrs, Sub* s)
++{
++  if (pos >= end || end > b.size())
++    return true;
++  pos++;  // GX_NOP
++  while (pos < end && b[pos] != 0)
++  {
++    const u8 cmd = b[pos];
++    const u16 n = B16(b, pos + 1);
++    pos += 3;
++    const int vat = cmd & 7;
++    if (vat > 1)
++      return false;
++    std::vector<Vtx> v(n);
++    for (u16 i = 0; i < n; i++)
++      if (!ReadVertex(b, &pos, attrs, vat, &v[i], &s->has_col))
++        return false;
++    switch (cmd & 0xF8)
++    {
++    case 0x90:  // triangles
++      for (u16 i = 0; i + 2 < n; i += 3)
++        s->tris.insert(s->tris.end(), {v[i], v[i + 1], v[i + 2]});
++      break;
++    case 0x98:  // strip (drawn double-sided: winding does not matter)
++      for (u16 i = 0; i + 2 < n; i++)
++        s->tris.insert(s->tris.end(), {v[i], v[i + 1], v[i + 2]});
++      break;
++    case 0xA0:  // fan
++      for (u16 i = 1; i + 1 < n; i++)
++        s->tris.insert(s->tris.end(), {v[0], v[i], v[i + 1]});
++      break;
++    case 0x80:  // quads
++      for (u16 i = 0; i + 3 < n; i += 4)
++        s->tris.insert(s->tris.end(), {v[i], v[i + 1], v[i + 2], v[i], v[i + 2], v[i + 3]});
++      break;
++    default:
++      return false;
++    }
++  }
++  return true;
++}
++
++// a GMA: model name -> geometry (static models only; skinned / effective ones are skipped)
++std::map<std::string, ModelGeo> ReadGma(const std::vector<u8>& b)
++{
++  std::map<std::string, ModelGeo> out;
++  const u32 count = B32(b, 0), base = B32(b, 4);
++  if (count == 0 || count > 4096 || 8 + size_t(count) * 8 > b.size())
++    return out;
++  const size_t names = 8 + size_t(count) * 8;
++  for (u32 i = 0; i < count; i++)
++  {
++    const s32 grel = static_cast<s32>(B32(b, 8 + i * 8));
++    const u32 nrel = B32(b, 12 + i * 8);
++    if (grel < 0)
++      continue;
++    std::string name;
++    for (size_t k = names + nrel; k < b.size() && b[k]; k++)
++      name.push_back(static_cast<char>(b[k]));
++    const size_t g = size_t(base) + size_t(grel);
++    if (g + 0x40 > b.size() || B32(b, g) != 0x47434D46)  // "GCMF"
++      continue;
++    const u32 gattr = B32(b, g + 4);
++    ModelGeo mg;
++    if (gattr & (0x08 | 0x10))  // skinned / effective (physics) models: not static
++    {
++      out[name] = std::move(mg);
++      continue;
++    }
++    const u16 ntex = B16(b, g + 0x18), nopq = B16(b, g + 0x1A), ntrn = B16(b, g + 0x1C);
++    const size_t sub0 = g + B32(b, g + 0x20);
++    std::vector<int> tev_tpl(ntex);
++    std::vector<u32> tev_flags(ntex);
++    for (u16 t = 0; t < ntex; t++)
++    {
++      tev_tpl[t] = B16(b, g + 0x40 + t * 0x20 + 4);
++      tev_flags[t] = B32(b, g + 0x40 + t * 0x20);
++    }
++    size_t s = sub0;
++    bool ok = true;
++    for (u32 k = 0; k < u32(nopq) + ntrn && ok; k++)
++    {
++      if (s + 0x60 > b.size())
++      {
++        ok = false;
++        break;
++      }
++      Sub sub;
++      const u32 mc = B32(b, s + 4);
++      sub.mat = {float(mc >> 24) / 255.0f, float((mc >> 16) & 0xFF) / 255.0f, float((mc >> 8) & 0xFF) / 255.0f,
++                 float(b[s + 0x11]) / 255.0f};
++      const u8 dlf = b[s + 0x13];
++      // TEV layers (as the builder's look, editor/static/featlook.js gxMaterial / tevOverlays): specular = flag bits 0, 15,
++      // 20, 22 (sphere maps), mask = bit 13; the colour map is the first other one
++      constexpr u32 kSpec = 1u | (1u << 15) | (1u << 20) | (1u << 22), kMask = 1u << 13;
++      const u32 render = B32(b, s);
++      sub.unlit = (render & 1) != 0;
++      sub.additive = (render & 0x40) != 0;
++      for (int li = 0; li < 3; li++)
++      {
++        const s16 ti = static_cast<s16>(B16(b, s + 0x16 + 2 * li));
++        if (ti < 0 || ti >= static_cast<int>(tev_tpl.size()))
++          continue;
++        const u32 f = tev_flags[ti];
++        if (f & kMask)
++          continue;
++        if (f & kSpec)
++        {
++          if (sub.spec < 0 && sub.tex >= 0)
++            sub.spec = tev_tpl[ti];
++        }
++        else if (sub.tex < 0)
++          sub.tex = tev_tpl[ti];
++      }
++      const u32 attrs = B32(b, s + 0x1C);
++      const s32 pf = static_cast<s32>(B32(b, s + 0x28)), pb = static_cast<s32>(B32(b, s + 0x2C));
++      size_t pos = s + 0x60;
++      if (dlf & 1)
++      {
++        ok = ok && ReadDisplayLists(b, pos, pos + size_t(std::max(pf, 0)), attrs, &sub);
++        pos += size_t(std::max(pf, 0));
++      }
++      if (dlf & 2)
++      {
++        ok = ok && ReadDisplayLists(b, pos, pos + size_t(std::max(pb, 0)), attrs, &sub);
++        pos += size_t(std::max(pb, 0));
++      }
++      if (dlf & (4 | 8))
++      {
++        const s32 sf = static_cast<s32>(B32(b, pos + 8)), sb = static_cast<s32>(B32(b, pos + 12));
++        pos = Align32(pos + 16);
++        if (dlf & 4)
++        {
++          ok = ok && ReadDisplayLists(b, pos, pos + size_t(std::max(sf, 0)), attrs, &sub);
++          pos += size_t(std::max(sf, 0));
++        }
++        if (dlf & 8)
++        {
++          ok = ok && ReadDisplayLists(b, pos, pos + size_t(std::max(sb, 0)), attrs, &sub);
++          pos += size_t(std::max(sb, 0));
++        }
++      }
++      s = Align32(pos);
++      if (!sub.tris.empty())
++        mg.subs.push_back(std::move(sub));
++    }
++    mg.ok = ok && !mg.subs.empty();
++    out[name] = std::move(mg);
++  }
++  return out;
++}
++
++// a GFZ TPL slot, level 0, as RGBA8 (CMPR / I4 / I8 / IA4 / IA8 / RGB565 / RGB5A3 / RGBA8)
++bool ReadTpl(const std::vector<u8>& b, int slot, ScImage* out)
++{
++  const u32 count = B32(b, 0);
++  if (slot < 0 || u32(slot) >= count || 4 + size_t(slot + 1) * 16 > b.size())
++    return false;
++  const size_t e = 4 + size_t(slot) * 16;
++  if (b[e + 2] != 0 || B16(b, e) != 0)  // null / garbage entry
++    return false;
++  const auto fmt = static_cast<TextureFormat>(b[e + 3]);
++  const u32 ptr = B32(b, e + 4), w = B16(b, e + 8), h = B16(b, e + 10);
++  if (w == 0 || h == 0 || w > 4096 || h > 4096 || fmt == TextureFormat::C4 || fmt == TextureFormat::C8 ||
++      fmt == TextureFormat::C14X2 || static_cast<int>(fmt) > 0xE)
++    return false;
++  const int bw = TexDecoder_GetBlockWidthInTexels(fmt), bh = TexDecoder_GetBlockHeightInTexels(fmt);
++  const u32 ew = (w + bw - 1) / bw * bw, eh = (h + bh - 1) / bh * bh;
++  const size_t bytes = TexDecoder_GetTextureSizeInBytes(ew, eh, fmt);
++  if (size_t(ptr) + bytes > b.size())
++    return false;
++  std::vector<u8> full(size_t(ew) * eh * 4);
++  TexDecoder_Decode(full.data(), b.data() + ptr, ew, eh, fmt, nullptr, TLUTFormat::IA8);
++  out->w = w;
++  out->h = h;
++  out->mips.clear();
++  std::vector<u8> lvl(size_t(w) * h * 4);
++  for (u32 y = 0; y < h; y++)
++    std::memcpy(&lvl[size_t(y) * w * 4], &full[size_t(y) * ew * 4], size_t(w) * 4);
++  out->mips.push_back(std::move(lvl));
++  BuildMips(out);
++  return true;
++}
++
++std::string Sha1Hex(const std::vector<u8>& b)
++{
++  const auto d = Common::SHA1::CalculateDigest(b);
++  static const char* hx = "0123456789abcdef";
++  std::string s;
++  for (u8 c : d)
++  {
++    s.push_back(hx[c >> 4]);
++    s.push_back(hx[c & 15]);
++  }
++  return s;
++}
++
++// adds the slot's roadside meshes (one instance each, identity) to sc; false = none on this disc / slot
++bool Append(int slot, ScScene* sc, bool* light_given)
++{
++  char nm[40];
++  std::snprintf(nm, sizeof(nm), "stage/rs%02d.json", slot);
++  const std::vector<u8> js = ERGhosts::ReadBootDiscFile(nm, 8u << 20);
++  if (js.empty())
++    return false;
++  picojson::value root;
++  const std::string perr = picojson::parse(root, std::string(js.begin(), js.end()));
++  if (!perr.empty() || !root.is<picojson::object>())
++  {
++    std::fprintf(stderr, "ROADSIDE %s: not JSON\n", nm);
++    return false;
++  }
++  const auto& o = root.get<picojson::object>();
++  std::snprintf(nm, sizeof(nm), "stage/st%02d.gma.lz", slot);
++  const std::string want = o.count("st_sha1") && o.at("st_sha1").is<std::string>() ? o.at("st_sha1").get<std::string>() : "";
++  if (want.empty() || Sha1Hex(ERGhosts::ReadBootDiscFile(nm)) != want)
++  {
++    std::fprintf(stderr, "ROADSIDE slot %d: rs%02d.json is for another stage file (a newer track in this slot): skipped\n",
++                 slot, slot);
++    return false;
++  }
++  // the model / texture files (default rsNN.gma.lz / rsNN.tpl.lz; any stage/ file the json names)
++  const auto file_of = [&](const char* key, const char* fmt) {
++    std::snprintf(nm, sizeof(nm), fmt, slot);
++    std::string f = nm;
++    if (o.count(key) && o.at(key).is<std::string>() && o.at(key).get<std::string>().starts_with("stage/") &&
++        o.at(key).get<std::string>().find("..") == std::string::npos)
++      f = o.at(key).get<std::string>();
++    return f;
++  };
++  const std::vector<u8> gma = LzUnpack(ERGhosts::ReadBootDiscFile(file_of("gma", "stage/rs%02d.gma.lz")));
++  const std::vector<u8> tpl = LzUnpack(ERGhosts::ReadBootDiscFile(file_of("tpl", "stage/rs%02d.tpl.lz")));
++  if (gma.empty() || tpl.empty())
++  {
++    std::fprintf(stderr, "ROADSIDE slot %d: rs%02d.gma / .tpl missing or unreadable\n", slot, slot);
++    return false;
++  }
++  if (const auto it = o.find("light"); it != o.end() && it->second.is<picojson::object>() && light_given && !*light_given)
++  {   // the venue's own light (main.rel table): GX lit = texture x (ambient + light colour x N.L) x vertex colour
++    const auto& l = it->second.get<picojson::object>();
++    JArr(l, "sun", &sc->light.sun);
++    JArr(l, "sun_colour", &sc->light.sun_col);
++    JArr(l, "ambient", &sc->light.amb);
++    sc->light.spec = 0.0f;
++    sc->light.reflect = 0.0f;
++    *light_given = true;
++  }
++  const auto models = ReadGma(gma);
++  // groups: (texture slot, tint in quarters) -> world-space triangles
++  struct Group
++  {
++    std::vector<float> v;
++    double tint[3] = {0, 0, 0};  // sum of tint x vertices
++  };
++  struct Key
++  {
++    int tex, spec;
++    bool unlit;
++    u32 tint;
++    bool operator<(const Key& k) const { return std::tie(tex, spec, unlit, tint) < std::tie(k.tex, k.spec, k.unlit, k.tint); }
++  };
++  std::map<Key, Group> groups;
++  size_t placed = 0, missing = 0;
++  if (const auto it = o.find("objects"); it != o.end() && it->second.is<picojson::array>())
++    for (const auto& e : it->second.get<picojson::array>())
++    {
++      if (!e.is<picojson::object>())
++        continue;
++      const auto& ob = e.get<picojson::object>();
++      std::string mname = ob.count("model") && ob.at("model").is<std::string>() ? ob.at("model").get<std::string>() : "";
++      if (ob.count("lods") && ob.at("lods").is<picojson::array>() && !ob.at("lods").get<picojson::array>().empty() &&
++          ob.at("lods").get<picojson::array>()[0].is<std::string>() &&
++          models.count(ob.at("lods").get<picojson::array>()[0].get<std::string>()))
++        mname = ob.at("lods").get<picojson::array>()[0].get<std::string>();
++      const auto mi = models.find(mname);
++      std::array<float, 12> M{};
++      if (!ob.count("m") || !ob.at("m").is<picojson::array>() || ob.at("m").get<picojson::array>().size() != 12 ||
++          mi == models.end() || !mi->second.ok)
++      {
++        missing++;
++        continue;
++      }
++      for (int k = 0; k < 12; k++)
++        M[k] = static_cast<float>(ob.at("m").get<picojson::array>()[k].get<double>());
++      placed++;
++      for (const Sub& s : mi->second.subs)
++      {
++        if (s.tex < 0 || s.additive)  // additive glows: left out (no blending in the scenery pass)
++          continue;
++        float vc[3] = {1, 1, 1};
++        if (s.has_col)
++        {
++          double acc[3] = {0, 0, 0};
++          for (const Vtx& v : s.tris)
++            for (int c = 0; c < 3; c++)
++              acc[c] += v.col[c] / 255.0;
++          for (int c = 0; c < 3; c++)
++            vc[c] = static_cast<float>(acc[c] / s.tris.size());
++        }
++        // lit: texture x the venue light (the scenery shader) x the baked vertex colours (their mean per submesh), in
++        // 1/16 steps; the GMA material colour never reaches the screen (featlook.js); unlit: texture x white
++        float tf[3];
++        u32 tint = 0;
++        for (int c = 0; c < 3; c++)
++        {
++          // the baked vertex colours: side by side with the in-game build (2026-11-22, Mute City) the game does not darken
++          // these models by them (with them the towers read black) - weight 0 by default; <user>/roadside-vc.txt overrides
++          static const float vcw = [] {
++            std::string t;
++            return File::ReadFileToString(File::GetUserPath(D_USER_IDX) + "roadside-vc.txt", t) ? static_cast<float>(std::atof(t.c_str())) : 0.0f;
++          }();
++          tf[c] = s.unlit ? 1.0f : std::min(1.0f, 1.0f + (vc[c] - 1.0f) * vcw);
++          tint = tint * 32 + static_cast<u32>(std::lround(tf[c] * 16.0f));
++        }
++        auto& G = groups[Key{s.tex, s.unlit ? -1 : s.spec, s.unlit, tint}];
++        for (int c = 0; c < 3; c++)
++          G.tint[c] += double(std::lround(tf[c] * 16.0f)) / 16.0 * s.tris.size();
++        auto& g = G.v;
++        for (const Vtx& v : s.tris)
++        {
++          float w[3], n[3];
++          for (int r = 0; r < 3; r++)
++          {
++            w[r] = M[r * 4] * v.p[0] + M[r * 4 + 1] * v.p[1] + M[r * 4 + 2] * v.p[2] + M[r * 4 + 3];
++            n[r] = M[r * 4] * v.n[0] + M[r * 4 + 1] * v.n[1] + M[r * 4 + 2] * v.n[2];
++          }
++          const float ln = std::max(std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]), 1e-6f);
++          g.insert(g.end(), {w[0], w[1], w[2], n[0] / ln, n[1] / ln, n[2] / ln, v.uv[0], v.uv[1]});
++        }
++      }
++    }
++  // mesh budget: big groups get spatial chunks (sorted along their longer world axis) so culling still helps
++  constexpr size_t kBudget = 96;
++  if (groups.size() > kBudget)  // too many tint classes: one group per texture (the tints averaged by vertex count)
++  {
++    std::map<Key, Group> merged;
++    for (auto& [k, G] : groups)
++    {
++      auto& M2 = merged[Key{k.tex, k.spec, k.unlit, 0}];
++      M2.v.insert(M2.v.end(), G.v.begin(), G.v.end());
++      for (int c = 0; c < 3; c++)
++        M2.tint[c] += G.tint[c];
++    }
++    groups = std::move(merged);
++  }
++  size_t total = 0;
++  for (const auto& [k, G] : groups)
++    total += G.v.size();
++  std::vector<std::pair<Key, Group*>> order;
++  for (auto& [k, G] : groups)
++    order.push_back({k, &G});
++  std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.second->v.size() > b.second->v.size(); });
++  if (order.size() > kBudget)
++    order.resize(kBudget);
++  const size_t spare = kBudget > order.size() ? kBudget - order.size() : 0;
++  std::map<int, ScImage> texcache;
++  size_t made = 0, tris_all = 0;
++  for (const auto& [key, gp] : order)
++  {
++    std::vector<float>& v = gp->v;
++    const double nv = std::max<double>(1.0, double(v.size() / 8));
++    const size_t ntri = v.size() / 24;
++    for (int t : {key.tex, key.spec})
++      if (t >= 0 && !texcache.count(t))
++      {
++        ScImage img;
++        if (ReadTpl(tpl, t, &img))
++          texcache[t] = std::move(img);
++      }
++    if (!texcache.count(key.tex))
++      continue;
++    const size_t nchunk = 1 + (total ? spare * v.size() / total : 0);
++    // sort triangles by their first vertex along the longer horizontal axis
++    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
++    for (size_t i = 0; i < v.size(); i += 8)
++      for (int k = 0; k < 3; k++)
++      {
++        lo[k] = std::min(lo[k], v[i + k]);
++        hi[k] = std::max(hi[k], v[i + k]);
++      }
++    const int ax = (hi[0] - lo[0]) >= (hi[2] - lo[2]) ? 0 : 2;
++    std::vector<size_t> idx(ntri);
++    for (size_t t = 0; t < ntri; t++)
++      idx[t] = t;
++    std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return v[a * 24 + ax] < v[b * 24 + ax]; });
++    const size_t per = (ntri + nchunk - 1) / std::max<size_t>(nchunk, 1);
++    for (size_t c = 0; c * per < ntri; c++)
++    {
++      ScMeshData md;
++      md.file = "roadside";
++      for (size_t t = c * per; t < std::min(ntri, (c + 1) * per); t++)
++        md.verts.insert(md.verts.end(), v.begin() + idx[t] * 24, v.begin() + idx[t] * 24 + 24);
++      md.color = texcache[key.tex];
++      for (int k = 0; k < 3; k++)
++        md.base[k] = key.unlit ? 0.0f : static_cast<float>(gp->tint[k] / nv);
++      md.base[3] = 1.0f;
++      if (key.unlit)
++      {   // texture x white: no light at all = the shader's emissive term with the same map
++        md.emissive = md.color;
++        md.em = {1.0f, 1.0f, 1.0f};
++      }
++      else if (key.spec >= 0 && texcache.count(key.spec))
++      {
++        md.emissive = texcache[key.spec];
++        md.em = {1.0f, 1.0f, 1.0f};
++        md.matcap = true;
++      }
++      float l2[3] = {1e30f, 1e30f, 1e30f}, h2[3] = {-1e30f, -1e30f, -1e30f};
++      for (size_t i = 0; i < md.verts.size(); i += 8)
++        for (int k = 0; k < 3; k++)
++        {
++          l2[k] = std::min(l2[k], md.verts[i + k]);
++          h2[k] = std::max(h2[k], md.verts[i + k]);
++        }
++      float r2 = 0.0f;
++      for (int k = 0; k < 3; k++)
++        md.center[k] = (l2[k] + h2[k]) * 0.5f;
++      for (size_t i = 0; i < md.verts.size(); i += 8)
++      {
++        const float dx = md.verts[i] - md.center[0], dy = md.verts[i + 1] - md.center[1], dz = md.verts[i + 2] - md.center[2];
++        r2 = std::max(r2, dx * dx + dy * dy + dz * dz);
++      }
++      md.radius = std::sqrt(r2);
++      md.ok = true;
++      tris_all += md.verts.size() / 24;
++      ScInstance in;
++      in.mesh = static_cast<int>(sc->meshes.size());
++      in.W = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
++      sc->meshes.push_back(std::move(md));
++      sc->inst.push_back(in);
++      made++;
++    }
++  }
++  std::fprintf(stderr, "ROADSIDE slot %d: %zu stock objects (%zu missing) -> %zu meshes, %zu triangles, %zu textures\n", slot,
++               placed, missing, made, tris_all, texcache.size());
++  return made > 0;
++}
++}  // namespace Roadside
++
++void FinishScene(ScScene* sc, int slot, std::chrono::steady_clock::time_point t0)
++{
++  // world bounding spheres
++  for (auto& in : sc->inst)
++  {
++    const auto& md = sc->meshes[in.mesh];
++    const auto& W = in.W;
++    for (int r = 0; r < 3; r++)
++      in.wc[r] = W[r * 4] * md.center[0] + W[r * 4 + 1] * md.center[1] + W[r * 4 + 2] * md.center[2] + W[r * 4 + 3];
++    const float s = std::sqrt(W[0] * W[0] + W[4] * W[4] + W[8] * W[8]);
++    in.wr = md.radius * s;
++  }
++  size_t tris = 0;
++  for (const auto& md : sc->meshes)
++    tris += md.verts.size() / 24;
++  std::fprintf(stderr, "SCENERY slot %d: %zu meshes (%zu triangles), %zu instances, loaded in %.2f s\n", slot,
++               sc->meshes.size(), tris, sc->inst.size(),
++               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
++}
++
 +// <dir>/slotNN.json (docs SCENERY-LIT17S10.md); legacy: one OBJ mesh at one spot
 +std::unique_ptr<ScScene> LoadScene(std::string dir, int slot, std::string legacy_mesh, std::array<float, 3> lpos,
 +                                   float lyaw, float lscale)
@@ -25600,8 +26258,14 @@ HcmV?d00001
 +    std::snprintf(name, sizeof(name), "/slot%02d.json", slot);
 +    const std::string file = dir + name;
 +    std::string text;
++    bool rs_light = false;
 +    if (!File::ReadFileToString(file, text))
-+      return sc;  // no scenery on this course
++    {
++      // no slot file: the course may still have roadside scenery on the disc (Evolution Racing 1.6)
++      if (Roadside::Append(slot, sc.get(), &rs_light))
++        FinishScene(sc.get(), slot, t0);
++      return sc;
++    }
 +    picojson::value root;
 +    const std::string perr = picojson::parse(root, text);
 +    if (!perr.empty() || !root.is<picojson::object>())
@@ -25612,6 +26276,7 @@ HcmV?d00001
 +    const auto& o = root.get<picojson::object>();
 +    if (const auto it = o.find("light"); it != o.end() && it->second.is<picojson::object>())
 +    {
++      rs_light = true;
 +      const auto& l = it->second.get<picojson::object>();
 +      JArr(l, "sun", &sc->light.sun);
 +      JArr(l, "sun_colour", &sc->light.sun_col);
@@ -25706,23 +26371,9 @@ HcmV?d00001
 +        }
 +        sc->inst.push_back(in);
 +      }
++    Roadside::Append(slot, sc.get(), &rs_light);   // the disc's roadside set for this slot (Evolution Racing 1.6)
 +  }
-+  // world bounding spheres
-+  for (auto& in : sc->inst)
-+  {
-+    const auto& md = sc->meshes[in.mesh];
-+    const auto& W = in.W;
-+    for (int r = 0; r < 3; r++)
-+      in.wc[r] = W[r * 4] * md.center[0] + W[r * 4 + 1] * md.center[1] + W[r * 4 + 2] * md.center[2] + W[r * 4 + 3];
-+    const float s = std::sqrt(W[0] * W[0] + W[4] * W[4] + W[8] * W[8]);
-+    in.wr = md.radius * s;
-+  }
-+  size_t tris = 0;
-+  for (const auto& md : sc->meshes)
-+    tris += md.verts.size() / 24;
-+  std::fprintf(stderr, "SCENERY slot %d: %zu meshes (%zu triangles), %zu instances, loaded in %.2f s\n", slot,
-+               sc->meshes.size(), tris, sc->inst.size(),
-+               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
++  FinishScene(sc.get(), slot, t0);
 +  return sc;
 +}
 +
@@ -26063,7 +26714,7 @@ HcmV?d00001
 +      }
 +    u.info = {target.time_ms, g.nverts, drawn, m_frame_counter};
 +    u.params = {sunv[0], sunv[1], sunv[2], in.glow, L.sun_col[0], L.sun_col[1], L.sun_col[2], L.spec,
-+                L.amb[0], L.amb[1], L.amb[2], g.orm ? 1.0f : 0.0f, upv[0], upv[1], upv[2], g.emissive ? 1.0f : 0.0f};
++                L.amb[0], L.amb[1], L.amb[2], g.orm ? 1.0f : 0.0f, upv[0], upv[1], upv[2], g.emissive ? (md.matcap ? 2.0f : 1.0f) : 0.0f};
 +    u.target = {md.base[0], md.base[1], md.base[2], md.base[3]};
 +    u.target_far = {md.em[0], md.em[1], md.em[2], NightLightLevel()};  // lit17s37r rails v3: night level (w, 0 day .. 1 night)
 +    g_vertex_manager->UploadUtilityUniforms(&u, sizeof(u));

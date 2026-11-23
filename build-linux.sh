@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the Evolution Racing Dolphin "lit17s41mg" (Linux x86-64) from source, the same way the distributed binary was built:
+# Build the Evolution Racing Dolphin "lit17s41mgr" (Linux x86-64) from source, the same way the distributed binary was built:
 # stock Dolphin 409881c34357d0f105fd473167d15ab0bd9c1628 + evolution-racing-dolphin.patch, compiled inside the Flathub KDE SDK org.kde.Sdk//6.11
 # (the distributed build runs in the matching runtime org.kde.Platform//6.11).
 #
@@ -18,6 +18,7 @@ git apply "$HERE/evolution-racing-dolphin.patch"
 W=$(pwd -P)
 flatpak run --filesystem="$W" --command=sh org.kde.Sdk//6.11 -c "cd '$W' && mkdir -p build && cd build && \
  cmake .. -G Ninja \
+  -DCMAKE_C_FLAGS='-ffile-prefix-map=$W=.' -DCMAKE_CXX_FLAGS='-ffile-prefix-map=$W=.' \
   -DCMAKE_BUILD_TYPE=Release \
   -DENABLE_EVDEV=OFF \
   -DENABLE_TESTS=OFF \
