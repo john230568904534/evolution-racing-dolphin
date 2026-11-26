@@ -15131,7 +15131,7 @@ HcmV?d00001
  
 +// Evolution Racing member build id (one id for the Linux and the Windows build of the same source)
 +#ifndef ER_BUILD_ID
-+#define ER_BUILD_ID "lit17s43erm"
++#define ER_BUILD_ID "lit17s43ermb"
 +#endif
 +const std::string& GetERBuildStr()
 +{
@@ -15141,7 +15141,7 @@ HcmV?d00001
 +
 +// Evolution Racing X.Y (hub/server/versions.json; lighting_mod/updater/apply_version.py sets it)
 +#ifndef ER_VERSION
-+#define ER_VERSION "1.7.2"
++#define ER_VERSION "1.7.3"
 +#endif
 +// "ER_VERSION=1.3" stays in the binary (not const, read below): scripts/dolphinpack.py / winpack.py look for it
 +extern char er_version_marker[];
@@ -18469,7 +18469,7 @@ HcmV?d00001
 +}  // namespace ERTest
 --- a/Source/Core/Core/ERUpdates.cpp
 +++ b/Source/Core/Core/ERUpdates.cpp
-@@ -0,0 +1,1156 @@
+@@ -0,0 +1,1169 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -19079,7 +19079,7 @@ HcmV?d00001
 +    i.preparing = Bool(io, "preparing");
 +    i.after_dolphin = Bool(io, "after_dolphin");
 +    i.er_version = Str(io, "er_version");
-+    static const std::set<std::string> kinds = {"dolphin", "effects", "hd", "machines", "track-hd", "scenery"};
++    static const std::set<std::string> kinds = {"dolphin", "effects", "hd", "machines", "track-hd", "scenery", "bgx"};
 +    if (!kinds.contains(i.kind) || !i.url.starts_with("/hub/api/erd/get/"))
 +      continue;
 +    r.items.push_back(std::move(i));
@@ -19269,6 +19269,12 @@ HcmV?d00001
 +      if (!n.ends_with("/") && ok(n))
 +        roots.push_back(tex + n);  // single files: each one set aside when it is there already
 +  }
++  else if (it.kind == "bgx")  // lit17s44: background offload sidecars (GFZE01-fx/bgx/slotNN/..., SIDECAR-SPEC.md)
++  {
++    roots.push_back(gm + "GFZE01-fx/bgx");
++    ok = [](const std::string& n) { return n.starts_with("GFZE01-fx/bgx/"); };
++    to = [gm](const std::string& n) { return gm + n; };
++  }
 +  else if (it.kind == "scenery")
 +  {
 +    roots.push_back(gm + "GFZE01-fx/scenery");
@@ -19347,6 +19353,13 @@ HcmV?d00001
 +    x["files"] = picojson::value(static_cast<double>(n));
 +    extra.push_back(picojson::value(x));
 +    inst["hd_extra"] = picojson::value(extra);
++  }
++  else if (it.kind == "bgx")
++  {
++    picojson::object bx;
++    bx["at"] = picojson::value(static_cast<double>(now));
++    bx["v"] = picojson::value(it.version);
++    inst["bgx"] = picojson::value(bx);
 +  }
 +  else if (it.kind == "scenery")
 +  {
@@ -19550,7 +19563,7 @@ HcmV?d00001
 +  if (!WaitLockFree(ou, 60))
 +    return {};  // the older Dolphin still runs: next start
 +  int files = 0;
-+  for (const char* d : {"GC", "Wii", "StateSaves", "Load/GraphicMods/GFZE01-fx/scenery", "ERGhosts"})
++  for (const char* d : {"GC", "Wii", "StateSaves", "Load/GraphicMods/GFZE01-fx/scenery", "Load/GraphicMods/GFZE01-fx/bgx", "ERGhosts"})
 +    CopyTree(P(ou + d), P(nu + d), false, &files);
 +  std::error_code ec;
 +  fs::remove(P(nu + "ERGhosts/running.lock"), ec);
@@ -19599,7 +19612,7 @@ HcmV?d00001
 +  }
 +  // what is installed (the effects only when they came along)
 +  picojson::object oj = ReadJsonObject(ou + "Config/er-installed.json"), nj = ReadJsonObject(InstalledPath());
-+  for (const char* k : {"hd", "hd_extra", "scenery", "updater", "effects"})
++  for (const char* k : {"hd", "hd_extra", "scenery", "bgx", "updater", "effects"})
 +    if (oj.count(k) && (std::string(k) != "effects" || fx))
 +      nj[k] = oj[k];
 +  WriteJson(InstalledPath(), nj);
@@ -19764,6 +19777,91 @@ HcmV?d00001
  
      // Debug/OS Support
      {"OSPanic",                      HLE_OS::HLE_OSPanic,                   HookType::Replace, HookFlag::Debug},
+--- a/Source/Core/Core/HW/DVD/DVDThread.cpp
++++ b/Source/Core/Core/HW/DVD/DVDThread.cpp
+@@ -3,6 +3,10 @@
+ 
+ #include "Core/HW/DVD/DVDThread.h"
+ 
++#include <atomic>
++#include <mutex>
++#include <cstdio>
++
+ #include <map>
+ #include <memory>
+ #include <optional>
+@@ -27,6 +31,7 @@
+ #include "Core/System.h"
+ 
+ #include "DiscIO/Enums.h"
++#include "DiscIO/Filesystem.h"
+ #include "DiscIO/Volume.h"
+ 
+ namespace DVD
+@@ -293,9 +298,53 @@
+   dvd_interface.FinishExecutingCommand(request.reply_type, interrupt, cycles_late, buffer);
+ }
+ 
++namespace
++{
++std::atomic<int> s_er_coli_stage{-1};
++std::atomic<u32> s_er_coli_seq{0};
++std::mutex s_er_coli_mx;
++std::vector<int> s_er_coli_recent;  // newest first, unique
++}  // namespace
++
++// lit17s45: the stage number of the last stage/COLI_COURSEnn.lz the game read from the disc (BGX picks the sidecar
++// folder by it; ERTrackLib-served library tracks have their own folder override)
++std::vector<int> ERRecentColiStages()
++{
++  std::lock_guard lk(s_er_coli_mx);
++  return s_er_coli_recent;
++}
++
++int ERLastColiStage(u32* seq)
++{
++  if (seq)
++    *seq = s_er_coli_seq.load();
++  return s_er_coli_stage.load();
++}
++
+ void DVDThread::ProcessReadRequest(ReadRequest&& request)
+ {
+   m_file_logger.Log(*m_disc, request.partition, request.dvd_offset);
++  {
++    static u64 last_file = ~0ull;
++    if (const DiscIO::FileSystem* fs = m_disc->GetFileSystem(request.partition))
++      if (const auto fi = fs->FindFileInfo(request.dvd_offset); fi && fi->GetOffset() != last_file)
++      {
++        last_file = fi->GetOffset();
++        const std::string path = fi->GetPath();
++        int st = -1;
++        if (std::sscanf(path.c_str(), "stage/COLI_COURSE%d.lz", &st) == 1 && st >= 0 && st < 100)
++        {
++          s_er_coli_stage = st;
++          s_er_coli_seq++;
++          std::lock_guard lk(s_er_coli_mx);
++          std::erase(s_er_coli_recent, st);
++          s_er_coli_recent.insert(s_er_coli_recent.begin(), st);
++          if (s_er_coli_recent.size() > 12)
++            s_er_coli_recent.pop_back();
++        }
++      }
++  }
++
+ 
+   std::vector<u8> buffer(request.length);
+   if (!m_disc->Read(request.dvd_offset, request.length, buffer.data(), request.partition))
+--- a/Source/Core/Core/HW/DVD/DVDThread.h
++++ b/Source/Core/Core/HW/DVD/DVDThread.h
+@@ -137,4 +137,7 @@
+ 
+   Core::System& m_system;
+ };
++// lit17s45: stage number of the last stage/COLI_COURSEnn.lz read from the disc (-1 none); seq counts those reads
++int ERLastColiStage(u32* seq);
++std::vector<int> ERRecentColiStages();  // the stage numbers of the COLI files read, newest first
+ }  // namespace DVD
 --- a/Source/Core/Core/HW/PC5090SafeMem.h
 +++ b/Source/Core/Core/HW/PC5090SafeMem.h
 @@ -0,0 +1,63 @@
@@ -21823,18 +21921,22 @@ HcmV?d00001
      const CmdBufferResources& cmd_buffer_resources = m_command_buffers[m_current_cmd_buffer];
 --- a/Source/Core/VideoBackends/Vulkan/ObjectCache.cpp
 +++ b/Source/Core/VideoBackends/Vulkan/ObjectCache.cpp
-@@ -145,8 +145,10 @@
+@@ -145,9 +145,13 @@
    }};
  
    // Utility samplers aren't dynamically indexed.
 +  // Evolution Racing dolphin-lit17s9: utility sampler 0 also in the vertex stage (emit_quads scenery reads its mesh there)
    static const std::array<VkDescriptorSetLayoutBinding, 9> utility_sampler_bindings{{
 -      {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT},
+-      {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT},
 +      {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
 +       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT},
-       {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT},
++      // Evolution Racing lit17s44: sampler 1 too (background offload: the visible instances' matrices)
++      {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
++       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT},
        {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT},
        {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT},
+       {4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT},
 --- a/Source/Core/VideoBackends/Vulkan/VKGfx.cpp
 +++ b/Source/Core/VideoBackends/Vulkan/VKGfx.cpp
 @@ -21,6 +21,7 @@
@@ -21943,7 +22045,15 @@ HcmV?d00001
    }
 --- a/Source/Core/VideoCommon/BPStructs.cpp
 +++ b/Source/Core/VideoCommon/BPStructs.cpp
-@@ -20,6 +20,9 @@
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "VideoCommon/BPStructs.h"
++#include "VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.h"
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -20,6 +21,9 @@
  #include "Core/HW/VideoInterface.h"
  #include "Core/System.h"
  
@@ -21953,7 +22063,7 @@ HcmV?d00001
  #include "VideoCommon/BPFunctions.h"
  #include "VideoCommon/BPMemory.h"
  #include "VideoCommon/BoundingBox.h"
-@@ -335,6 +338,22 @@
+@@ -335,6 +339,22 @@
                        destAddr, srcRect.left, srcRect.top, srcRect.right, srcRect.bottom,
                        bpmem.copyTexSrcWH.x + 1, destStride, height, yScale);
  
@@ -21976,6 +22086,15 @@ HcmV?d00001
          bool is_depth_copy = bpmem.zcontrol.pixel_format == PixelFormat::Z24;
          g_texture_cache->CopyRenderTargetToTexture(
              destAddr, EFBCopyFormat::XFB, copy_width, height, destStride, is_depth_copy, srcRect,
+@@ -374,6 +394,8 @@
+       }
+     }
+ 
++    // lit17s45: render-to-texture passes end in an EFB copy + clear: the host background draws after the last one
++    EmitQuadsNoteEfbCopy(PE_copy.copy_to_xfb != 0, PE_copy.clear != 0);
+     // Clear the rectangular region after copying it.
+     if (PE_copy.clear)
+     {
 --- a/Source/Core/VideoCommon/CMakeLists.txt
 +++ b/Source/Core/VideoCommon/CMakeLists.txt
 @@ -89,6 +89,8 @@
@@ -28765,9 +28884,1621 @@ HcmV?d00001
  
  private:
    std::shared_ptr<VideoCommon::CustomAssetLibrary> m_library;
+--- a/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/ERBgx.inc
++++ b/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/ERBgx.inc
+@@ -0,0 +1,1609 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++//
++// Evolution Racing lit17s44 BACKGROUND OFFLOAD (included by EmitQuadsAction.cpp; format: SIDECAR-SPEC.md v1).
++// A course slot's <dir>/slotNN/bgx.json lists its background scene objects (no collision, no animation). While this
++// action draws them, every frame they are hidden from the game: zone mask (ObjectRenderFlags0x04) = 0 in the COLI the
++// game loaded, so the emulated CPU never sets them up (Port Town Swap Middle, 30 racers: 59 % -> 100 % speed). Here
++// they are drawn instanced per GCMF submesh: one draw per submesh for all its visible instances, the game's view
++// matrix, per-vertex GX lighting from the frame's captured light registers, the game's GX fog, EFB depth.
++// Visibility follows the game's rules as far as known: cull-zone masks against the trigger boxes the camera is in,
++// LOD-flagged objects only within their largest LOD distance, frustum.
++
++namespace PC5090Bgx
++{
++// the harness does not keep Dolphin's stderr: everything also goes to <user>/Logs/bgx.log
++void BLog(const char* fmt, ...)
++{
++  static std::FILE* f = std::fopen((File::GetUserPath(D_LOGS_IDX) + "bgx.log").c_str(), "w");
++  char buf[1024];
++  va_list ap;
++  va_start(ap, fmt);
++  std::vsnprintf(buf, sizeof(buf), fmt, ap);
++  va_end(ap);
++  std::fputs(buf, stderr);
++  if (f)
++  {
++    std::fputs(buf, f);
++    std::fflush(f);
++  }
++}
++struct BTex
++{
++  u32 w = 0, h = 0;
++  std::vector<std::vector<u8>> mips;  // RGBA8 (or the HD file's block format)
++  // lit17s45 sky/ground: an HD pack replacement (the game's own draw would use it): format + per-level size / row length
++  AbstractTextureFormat fmt = AbstractTextureFormat::RGBA8;
++  std::vector<std::array<u32, 3>> dims;  // empty = RGBA8 levels of w x h halved
++  bool hd = false;
++};
++struct BSub
++{
++  u32 first = 0, count = 0;  // vertices in the vertex texture (BG_STRIDE floats each)
++  int tex = -1;
++  bool translucent = false;
++  int cull = 0;         // 0 none, 1 GX_CULL_FRONT, 2 GX_CULL_BACK
++  int scroll_slot = -1;  // the instance's scroll slot moving layer scroll_layer (-1 = none)
++  int scroll_layer = -1;
++  std::array<float, 4> mat{1.0f, 1.0f, 1.0f, 1.0f}, amb{0.0f, 0.0f, 0.0f, 1.0f};
++  u32 render = 0;
++  // GX material (editor featlook.js gxMaterial, measured against the game): up to 3 TEV stages, specular overlays left out
++  struct Layer
++  {
++    int tex = -1;
++    int stage = 0;  // 0 x texture, 1 + texture (combiner bit 0), 2 greyscale alpha mask (TextureFlags bit 13)
++    int uv = 0;     // texture coordinate set
++    int wrap_s = 1, wrap_t = 1;  // 0 clamp, 1 repeat, 2 mirror
++  };
++  std::vector<Layer> layers;
++  bool texA = true, add = false;
++  bool vcol = false;  // the submesh carries vertex colours (attrs "c"): GX lights them in (the material source is the vertex)
++  float cut = 0.0f;
++};
++struct BInst
++{
++  u32 dyn = 0;
++  std::string name;
++  std::array<float, 12> m{};
++  int model = -1;
++  std::array<float, 3> c{};
++  float r = 0.0f, maxd = 0.0f;
++  u32 zone = 0xFFFFFFFFu;
++  bool billboard = false;
++  std::vector<std::array<float, 2>> scroll;  // per scroll slot: texture repeats per second (u, v)
++  int ok = -1;  // name checked against RAM: -1 not yet, 0 mismatch (never hidden / drawn), 1 ok
++  int kind = 0;  // lit17s45: 0 background (booster trigger), 1 sky / backdrop (infinite depth), 2 ground (detail)
++};
++// lit17s45 SKY / GROUND (bgx/skyground.json): which sidecar objects are sky / backdrop or ground, drawn at the frame's
++// first world draw (before any of the game's translucency); kill switch <user>/Config/er-skyground.txt "0"
++struct SgConfig
++{
++  bool on = false;
++  bool hd = true;
++  std::vector<std::pair<std::string, int>> names;  // LOD-0 name prefix -> kind (1 sky, 2 ground)
++  std::array<float, 4> detail{1.0f, 24.0f, 0.35f, 2500.0f};  // on, tile metres, strength, fade-out distance
++  std::array<float, 4> sky{1.0f, 0.0f, 0.0f, 0.0f};          // procedural sky detail: on, strength, ...
++  float spec = 0.3f;    // weight of a sphere-mapped specular stage (featlook konst 0.3 guess)
++  bool matc = false;    // material colour / ambient on every lit submesh (not only render bit 3)
++  int logged = 0;       // one-time draw logs
++  bool venue_light = false;  // "venuelight": light 0 = the sidecar's venue light instead of the captured one
++  bool early = true;    // all background drawn at the frame's first world draw (Config/er-bgx-late.txt = the old booster-time draw)
++  int Kind(const std::string& n) const
++  {
++    for (const auto& [p, k] : names)
++      if (n.compare(0, p.size(), p) == 0)
++        return k;
++    return 0;
++  }
++};
++SgConfig s_sg;
++struct BZone
++{
++  std::array<float, 3> pos{}, half{};
++  u32 bits = 0;
++};
++struct BScene
++{
++  int slot = -1;
++  std::vector<float> verts;
++  std::vector<BTex> tex;
++  std::vector<std::vector<BSub>> subs;  // per model
++  std::vector<BInst> inst;
++  std::vector<std::vector<int>> by_model;
++  std::vector<std::vector<int>> sg_by_model;  // lit17s45: sky / ground instances per model
++  size_t sg_count = 0;
++  std::vector<BZone> zones;
++  std::vector<u8> sig;
++  u32 dyn_count = 0, dyn_off = 0;
++  bool have_amb = false;
++  std::array<float, 3> amb{};  // the venue's ambient (sidecar "light": "amb"), else the captured XF ambient
++  bool have_light = false;      // lit17s45: the venue's light 0 (sidecar "light": col + dir)
++  std::array<float, 3> lcol{}, ldir{};
++  size_t tris = 0;
++};
++constexpr u32 BG_STRIDE = 13;  // pos xyz, normal xyz, colour (RGBA8 bits), uv0, uv1, uv2
++constexpr u32 BG_ROW = 4096;
++constexpr u32 BG_ISTRIDE = 24;  // instance: model -> world rows (12), billboard, 3 pad, scroll slots 0..3 (u, v) x 4
++
++float JF(const picojson::value& v, float d = 0.0f)
++{
++  return v.is<double>() ? static_cast<float>(v.get<double>()) : d;
++}
++
++// lit17s45: the user's HD pack (Load/Textures/<GFZE01 dirs>, every file named tex1_*): name -> path, built once
++const std::unordered_map<std::string, std::string>& HdMap()
++{
++  static std::unordered_map<std::string, std::string> map;
++  static std::once_flag once;
++  std::call_once(once, [] {
++    for (const auto& dir : GetTextureDirectoriesWithGameId(File::GetUserPath(D_HIRESTEXTURES_IDX), "GFZE01"))
++    {
++      std::error_code ec;
++      for (auto it = std::filesystem::recursive_directory_iterator(
++               dir, std::filesystem::directory_options::follow_directory_symlink, ec);
++           !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
++      {
++        const auto& p = it->path();
++        const std::string ext = p.extension().string();
++        if (ext != ".png" && ext != ".dds")
++          continue;
++        const std::string stem = p.stem().string();
++        if (stem.rfind("tex1_", 0) == 0 && (ext == ".dds" || !map.contains(stem)))
++          map[stem] = p.string();  // DDS first (Dolphin's order), PNG otherwise
++      }
++    }
++    BLog("BGX: HD pack index: %zu textures\n", map.size());
++  });
++  return map;
++}
++
++// the HD file for raw GX level-0 bytes (Dolphin's own name: XXH64 of level 0, _m_ when mipmapped)
++bool LoadHd(const u8* lvl0, size_t size, u32 w, u32 h, u32 fmt, bool mips, BTex* out)
++{
++  const auto& map = HdMap();
++  if (map.empty())
++    return false;
++  const u64 hash = XXH64(lvl0, size, 0);
++  std::string path;
++  for (const bool m : {mips, !mips})
++  {
++    const std::string n = fmt::format("tex1_{}x{}{}_{:016x}_{}", w, h, m ? "_m" : "", hash, fmt);
++    if (const auto it = map.find(n); it != map.end())
++    {
++      path = it->second;
++      break;
++    }
++  }
++  if (path.empty())
++    return false;
++  VideoCommon::CustomTextureData data;
++  if (path.ends_with(".dds"))
++  {
++    if (!VideoCommon::LoadDDSTexture(&data, path) || data.m_slices.empty() || data.m_slices[0].m_levels.empty())
++      return false;
++    const auto& lv = data.m_slices[0].m_levels;
++    out->fmt = lv[0].format;
++    out->w = lv[0].width;
++    out->h = lv[0].height;
++    for (const auto& l : lv)
++    {
++      out->mips.emplace_back(l.data.data(), l.data.data() + l.data.size());
++      out->dims.push_back({l.width, l.height, l.row_length});
++    }
++  }
++  else
++  {
++    VideoCommon::CustomTextureData::ArraySlice::Level l;
++    if (!VideoCommon::LoadPNGTexture(&l, path) || l.width == 0 || l.height == 0)
++      return false;
++    out->fmt = AbstractTextureFormat::RGBA8;
++    out->w = l.width;
++    out->h = l.height;
++    std::vector<u8> cur(l.data.data(), l.data.data() + static_cast<size_t>(l.width) * l.height * 4);
++    u32 cw = l.width, ch = l.height;
++    // box-filtered mip chain
++    while (true)
++    {
++      out->dims.push_back({cw, ch, cw});
++      out->mips.push_back(cur);
++      if (cw == 1 && ch == 1)
++        break;
++      const u32 nw = std::max(cw / 2, 1u), nh = std::max(ch / 2, 1u);
++      std::vector<u8> nx(static_cast<size_t>(nw) * nh * 4);
++      for (u32 y = 0; y < nh; y++)
++        for (u32 x = 0; x < nw; x++)
++          for (u32 c = 0; c < 4; c++)
++          {
++            const u32 x0 = std::min(x * 2, cw - 1), x1 = std::min(x * 2 + 1, cw - 1);
++            const u32 y0 = std::min(y * 2, ch - 1), y1 = std::min(y * 2 + 1, ch - 1);
++            const u32 sum = cur[(static_cast<size_t>(y0) * cw + x0) * 4 + c] + cur[(static_cast<size_t>(y0) * cw + x1) * 4 + c] +
++                            cur[(static_cast<size_t>(y1) * cw + x0) * 4 + c] + cur[(static_cast<size_t>(y1) * cw + x1) * 4 + c];
++            nx[(static_cast<size_t>(y) * nw + x) * 4 + c] = static_cast<u8>((sum + 2) / 4);
++          }
++      cur.swap(nx);
++      cw = nw;
++      ch = nh;
++    }
++  }
++  out->hd = true;
++  return !out->mips.empty();
++}
++
++bool LoadTex(const std::string& file, BTex* out, bool hd)
++{
++  std::string raw;
++  if (!File::ReadFileToString(file, raw) || raw.size() < 32)
++    return false;
++  const u8* b = reinterpret_cast<const u8*>(raw.data());
++  u32 w = 0, h = 0, fmt = 0, mips = 1;
++  if (std::memcmp(b, "GXT1", 4) == 0)
++  {
++    std::memcpy(&fmt, b + 4, 4);  // the converter writes the header little-endian
++    u16 w16, h16;
++    std::memcpy(&w16, b + 8, 2);
++    std::memcpy(&h16, b + 10, 2);
++    w = w16;
++    h = h16;
++    std::memcpy(&mips, b + 12, 4);
++  }
++  else if (std::memcmp(b, "GXTX", 4) == 0)  // gfz-cli / loopgen .gxtex (dev fixtures)
++  {
++    w = Common::swap16(b + 4);
++    h = Common::swap16(b + 6);
++    fmt = b[8];
++    mips = b[9];
++  }
++  else
++    return false;
++  const auto tf = static_cast<TextureFormat>(fmt);
++  if (w == 0 || h == 0 || w > 4096 || h > 4096 || TexDecoder_GetPaletteSize(tf) > 0)
++    return false;  // paletted textures: not in v1
++  mips = std::clamp(mips, 1u, 12u);
++  size_t off = 32;
++  if (hd)
++  {
++    const u32 bw = TexDecoder_GetBlockWidthInTexels(tf), bh = TexDecoder_GetBlockHeightInTexels(tf);
++    const size_t sz0 = TexDecoder_GetTextureSizeInBytes((w + bw - 1) / bw * bw, (h + bh - 1) / bh * bh, tf);
++    if (off + sz0 <= raw.size() && LoadHd(b + off, sz0, w, h, fmt, mips > 1, out))
++      return true;
++  }
++  out->w = w;
++  out->h = h;
++  for (u32 l = 0; l < mips; l++)
++  {
++    const u32 lw = std::max(w >> l, 1u), lh = std::max(h >> l, 1u);
++    const u32 bw = TexDecoder_GetBlockWidthInTexels(tf), bh = TexDecoder_GetBlockHeightInTexels(tf);
++    const u32 ew = (lw + bw - 1) / bw * bw, eh = (lh + bh - 1) / bh * bh;
++    const size_t sz = TexDecoder_GetTextureSizeInBytes(ew, eh, tf);
++    if (off + sz > raw.size())
++      break;
++    std::vector<u8> full(static_cast<size_t>(ew) * eh * 4);
++    TexDecoder_Decode(full.data(), b + off, ew, eh, tf, nullptr, TLUTFormat::IA8);
++    std::vector<u8> lv(static_cast<size_t>(lw) * lh * 4);
++    for (u32 y = 0; y < lh; y++)
++      std::memcpy(&lv[static_cast<size_t>(y) * lw * 4], &full[static_cast<size_t>(y) * ew * 4], lw * 4);
++    out->mips.push_back(std::move(lv));
++    off += sz;
++  }
++  return !out->mips.empty();
++}
++
++EmitQuadsBgxDirFn s_dir_override = nullptr;
++u64 s_sg_frame = ~0ull;  // lit17s45: the frame the sky / ground was drawn
++// texture EFB copies with clear per frame (shadow / reflection passes): the early draw waits until as many happened as
++// in the previous frame, so it lands in the main pass, not in a render-to-texture pass that is copied and cleared
++u64 s_tc_frame = ~0ull;
++u32 s_tc_cur = 0, s_tc_prev = 0;
++
++// dir: the bgx folder holding slotNN/ folders, or (exact = true) one sidecar folder itself
++std::unique_ptr<BScene> LoadBgx(std::string dir, int slot, bool exact)
++{
++  const auto t0 = std::chrono::steady_clock::now();
++  auto sc = std::make_unique<BScene>();
++  sc->slot = slot;
++  char sub[32];
++  std::snprintf(sub, sizeof(sub), "/slot%02d/", slot);
++  dir += exact ? std::string("/") : std::string(sub);
++  std::string text, bin;
++  if (!File::ReadFileToString(dir + "bgx.json", text))
++    return sc;
++  if (!File::ReadFileToString(dir + "models.bin", bin))
++  {
++    BLog("BGX slot %d: no models.bin\n", slot);
++    return sc;
++  }
++  picojson::value root;
++  if (!picojson::parse(root, text).empty() || !root.is<picojson::object>())
++  {
++    BLog("BGX slot %d: bgx.json is not JSON\n", slot);
++    return sc;
++  }
++  const auto& o = root.get<picojson::object>();
++  const auto arr = [&](const picojson::object& ob, const char* k) -> const picojson::array* {
++    const auto it = ob.find(k);
++    return it != ob.end() && it->second.is<picojson::array>() ? &it->second.get<picojson::array>() : nullptr;
++  };
++  const auto num = [&](const picojson::object& ob, const char* k, float d) {
++    const auto it = ob.find(k);
++    return it != ob.end() ? JF(it->second, d) : d;
++  };
++  // raw u32 words (masks, flags, offsets) must not go through float: 0x21800077 became 0x21800080 (c35 POLIBASE's
++  // zone mask lost its low bits -> the station was hidden from the game and never drawn here)
++  const auto u32of = [&](const picojson::object& ob, const char* k, u32 d) -> u32 {
++    const auto it = ob.find(k);
++    return it != ob.end() && it->second.is<double>() ? static_cast<u32>(static_cast<long long>(it->second.get<double>())) : d;
++  };
++  if (num(o, "version", 0.0f) != 1.0f)
++  {
++    BLog("BGX slot %d: version not 1\n", slot);
++    return sc;
++  }
++  if (const auto it = o.find("coli_sig"); it != o.end() && it->second.is<std::string>())
++  {
++    const std::string& h = it->second.get<std::string>();
++    for (size_t i = 0; i + 1 < h.size(); i += 2)
++      sc->sig.push_back(static_cast<u8>(std::strtoul(h.substr(i, 2).c_str(), nullptr, 16)));
++  }
++  sc->dyn_count = u32of(o, "coli_dyn_count", 0);
++  if (const auto li = o.find("light"); li != o.end() && li->second.is<picojson::object>())
++  {
++    if (const auto* am = arr(li->second.get<picojson::object>(), "amb"); am && am->size() >= 3)
++    {
++      sc->have_amb = true;
++      for (int k = 0; k < 3; k++)
++        sc->amb[k] = JF((*am)[k]) > 1.0f ? JF((*am)[k]) / 255.0f : JF((*am)[k]);
++    }
++    const auto* lc = arr(li->second.get<picojson::object>(), "col");
++    const auto* ld = arr(li->second.get<picojson::object>(), "dir");
++    if (lc && ld && lc->size() >= 3 && ld->size() >= 3)
++    {
++      sc->have_light = true;
++      for (int k = 0; k < 3; k++)
++      {
++        sc->lcol[k] = JF((*lc)[k]) > 1.0f ? JF((*lc)[k]) / 255.0f : JF((*lc)[k]);
++        sc->ldir[k] = JF((*ld)[k]);
++      }
++    }
++  }
++  sc->dyn_off = u32of(o, "coli_dyn_offset", 0);
++  if (sc->sig.size() != 12 || sc->dyn_count == 0 || sc->dyn_off == 0)
++  {
++    BLog("BGX slot %d: no COLI signature\n", slot);
++    return sc;
++  }
++  // textures
++  if (const auto* ta = arr(o, "textures"))
++  {
++    sc->tex.resize(ta->size());
++    std::vector<std::thread> th;
++    const size_t nt = std::max<size_t>(std::thread::hardware_concurrency() / 2, 1);
++    for (size_t w = 0; w < nt; w++)
++      th.emplace_back([&, w] {
++        for (size_t i = w; i < ta->size(); i += nt)
++        {
++          if (!(*ta)[i].is<picojson::object>())
++            continue;
++          const auto& to = (*ta)[i].get<picojson::object>();
++          const auto f = to.find("file");
++          if (f == to.end() || !f->second.is<std::string>() || f->second.get<std::string>().find("..") != std::string::npos)
++            continue;
++          if (!LoadTex(dir + f->second.get<std::string>(), &sc->tex[i], s_sg.hd && g_ActiveConfig.bHiresTextures))
++            BLog("BGX slot %d: texture %zu not loaded\n", slot, i);
++        }
++      });
++    for (auto& t : th)
++      t.join();
++  }
++  // models -> vertex texture
++  const u8* vb = reinterpret_cast<const u8*>(bin.data());
++  if (const auto* ma = arr(o, "models"))
++    for (const auto& mv : *ma)
++    {
++      std::vector<BSub> subs;
++      if (mv.is<picojson::object>())
++        if (const auto* sa = arr(mv.get<picojson::object>(), "subs"))
++          for (const auto& sv : *sa)
++          {
++            if (!sv.is<picojson::object>())
++              continue;
++            const auto& so = sv.get<picojson::object>();
++            const auto* vbuf = arr(so, "vbuf");
++            const auto at = so.find("attrs");
++            if (!vbuf || vbuf->size() < 2 || at == so.end() || !at->second.is<std::string>())
++              continue;
++            const std::string attrs = at->second.get<std::string>();
++            u32 stride = 0;
++            for (char c : attrs)
++              stride += c == 'p' || c == 'n' ? 12 : c == 'c' ? 4 : 8;
++            const size_t off = static_cast<size_t>(JF((*vbuf)[0])), cnt = static_cast<size_t>(JF((*vbuf)[1]));
++            if (stride == 0 || off + cnt * stride > bin.size() || cnt % 3 != 0 || cnt == 0)
++              continue;
++            BSub s;
++            s.vcol = attrs.find('c') != std::string::npos;
++            s.first = static_cast<u32>(sc->verts.size() / BG_STRIDE);
++            s.count = static_cast<u32>(cnt);
++            for (size_t v = 0; v < cnt; v++)
++            {
++              float p[3]{}, n[3]{0.0f, 1.0f, 0.0f}, uv[2]{}, uv1[2]{}, uv2[2]{};
++              bool have1 = false, have2 = false;
++              u32 col = 0xFFFFFFFFu;
++              const u8* q = vb + off + v * stride;
++              for (char c : attrs)
++              {
++                if (c == 'p')
++                  std::memcpy(p, q, 12), q += 12;
++                else if (c == 'n')
++                  std::memcpy(n, q, 12), q += 12;
++                else if (c == 'c')
++                  std::memcpy(&col, q, 4), q += 4;  // R G B A bytes, read as the little-endian u32 the shader unpacks
++                else if (c == 'u')
++                  std::memcpy(uv, q, 8), q += 8;
++                else if (c == 'v')
++                  std::memcpy(uv1, q, 8), q += 8, have1 = true;
++                else if (c == 'w')
++                  std::memcpy(uv2, q, 8), q += 8, have2 = true;
++                else
++                  q += 8;
++              }
++              float cf;
++              std::memcpy(&cf, &col, 4);
++              if (!have1)
++                uv1[0] = uv[0], uv1[1] = uv[1];
++              if (!have2)
++                uv2[0] = uv1[0], uv2[1] = uv1[1];
++              sc->verts.insert(sc->verts.end(), {p[0], p[1], p[2], n[0], n[1], n[2], cf, uv[0], uv[1], uv1[0], uv1[1],
++                                                 uv2[0], uv2[1]});
++            }
++            sc->tris += cnt / 3;
++            const auto pass = so.find("pass");
++            s.render = u32of(so, "render", 0);
++            s.translucent = (pass != so.end() && pass->second.is<std::string>() && pass->second.get<std::string>() == "translucent") ||
++                            (s.render & 0x40u) != 0;  // additive (featlook: render 0x40); alpha < 0.99 added below
++            const auto cu = so.find("cull");
++            const std::string cs = cu != so.end() && cu->second.is<std::string>() ? cu->second.get<std::string>() : "none";
++            s.cull = cs == "front" ? 1 : cs == "back" ? 2 : 0;
++
++            if (const auto* mc = arr(so, "mat_color"))
++              for (size_t k = 0; k < 4 && k < mc->size(); k++)
++                s.mat[k] = JF((*mc)[k], 1.0f);
++            if (const auto* ac = arr(so, "amb_color"))
++              for (size_t k = 0; k < 4 && k < ac->size(); k++)
++                s.amb[k] = JF((*ac)[k], 0.0f);
++            s.mat[3] *= num(so, "unk_alpha", 255.0f) / 255.0f;
++            if (s.mat[3] < 0.99f)
++              s.translucent = true;
++            s.scroll_layer = static_cast<int>(num(so, "scroll_layer", -1.0f));
++            s.scroll_slot = static_cast<int>(num(so, "scroll_slot", -1.0f));
++            int comb0 = 0x30;
++            if (const auto* la = arr(so, "layers"))
++              for (size_t li = 0; li < la->size(); li++)
++              {
++                if (!(*la)[li].is<picojson::object>())
++                  continue;
++                const auto& lo = (*la)[li].get<picojson::object>();
++                const u32 tf = u32of(lo, "tflags", 0);
++                const u32 cb = u32of(lo, "comb", 0);
++                const bool spec = (tf & (1u | (1u << 15) | (1u << 20) | (1u << 22))) != 0;
++                if (s.layers.size() >= 3 || (spec && (s.render & 0x40u)))
++                {
++                  if (s.scroll_layer == static_cast<int>(li))
++                    s.scroll_layer = -1;
++                  continue;  // a specular layer needs a colour layer before it (featlook tevOverlays), none on additive
++                }
++                BSub::Layer L;
++                L.tex = static_cast<int>(num(lo, "tex", -1.0f));
++                // 3 = view-space specular / reflection: sphere-mapped by the view normal and added (featlook matcap)
++                L.stage = spec ? 3 : (tf & (1u << 13)) ? 2 : (cb & 1u) ? 1 : 0;
++                L.uv = std::clamp(static_cast<int>(num(lo, "uv", static_cast<float>(s.layers.size()))), 0, 2);
++                const float ws = num(lo, "wrap_s", -1.0f), wt = num(lo, "wrap_t", -1.0f);
++                L.wrap_s = ws >= 0.0f ? static_cast<int>(ws) : (tf & 8u) ? 2 : (tf & 4u) ? 1 : 0;
++                L.wrap_t = wt >= 0.0f ? static_cast<int>(wt) : (tf & 32u) ? 2 : (tf & 16u) ? 1 : 0;
++                if (s.layers.empty())
++                  comb0 = static_cast<int>(cb);
++                if (s.scroll_layer == static_cast<int>(li))
++                  s.scroll_layer = static_cast<int>(s.layers.size());  // index among the kept layers
++                s.layers.push_back(L);
++              }
++            s.tex = s.layers.empty() ? -1 : s.layers[0].tex;
++            const bool mask0 = !s.layers.empty() && s.layers[0].stage == 2;
++            bool has_mask = false;
++            for (const auto& L : s.layers)
++              has_mask |= L.stage == 2;
++            s.texA = mask0 || !(comb0 & 0x30);
++            s.add = (s.render & 0x40u) != 0;
++            s.cut = !s.add && (s.texA || has_mask) ? 0.5f : 0.0f;
++            subs.push_back(s);
++          }
++      sc->subs.push_back(std::move(subs));
++    }
++  // model bounds (for culling): centre + radius over all its vertices
++  std::vector<std::array<float, 4>> bound(sc->subs.size(), {0.0f, 0.0f, 0.0f, 0.0f});
++  for (size_t m = 0; m < sc->subs.size(); m++)
++  {
++    float mn[3]{1e30f, 1e30f, 1e30f}, mx[3]{-1e30f, -1e30f, -1e30f};
++    for (const auto& s : sc->subs[m])
++      for (u32 v = s.first; v < s.first + s.count; v++)
++        for (int k = 0; k < 3; k++)
++        {
++          mn[k] = std::min(mn[k], sc->verts[v * BG_STRIDE + k]);
++          mx[k] = std::max(mx[k], sc->verts[v * BG_STRIDE + k]);
++        }
++    if (mn[0] > mx[0])
++      continue;
++    float r = 0.0f;
++    for (int k = 0; k < 3; k++)
++    {
++      bound[m][k] = 0.5f * (mn[k] + mx[k]);
++      r += (mx[k] - mn[k]) * (mx[k] - mn[k]);
++    }
++    bound[m][3] = 0.5f * std::sqrt(r);
++  }
++  sc->by_model.resize(sc->subs.size());
++  for (const char* list : {"instances", "instances_ext"})
++  {
++  const auto* ia = arr(o, list);
++  if (!ia)
++    continue;
++  for (const auto& iv : *ia)
++    {
++      if (!iv.is<picojson::object>())
++        continue;
++      const auto& io = iv.get<picojson::object>();
++      BInst in;
++      // v1.1 "needs": draw (and hide) only what this reader supports
++      bool supported = true;
++      if (const auto* nd = arr(io, "needs"))
++        for (const auto& n : *nd)
++        {
++          const std::string ns = n.is<std::string>() ? n.get<std::string>() : "";
++          if (ns == "billboard")
++            in.billboard = true;
++          else if (ns != "texscroll")
++            supported = false;
++        }
++      if (!supported)
++        continue;
++      if (const auto* sc2 = arr(io, "scroll"))
++        for (const auto& e : *sc2)
++          if (e.is<picojson::array>() && e.get<picojson::array>().size() >= 3)
++          {
++            const auto& t = e.get<picojson::array>();
++            const size_t slot_i = static_cast<size_t>(std::max(JF(t[0]), 0.0f));
++            if (slot_i < 16)
++            {
++              if (in.scroll.size() <= slot_i)
++                in.scroll.resize(slot_i + 1, {0.0f, 0.0f});
++              in.scroll[slot_i] = {JF(t[1]), JF(t[2])};
++            }
++          }
++      in.dyn = static_cast<u32>(num(io, "dyn", -1.0f));
++      if (const auto nm = io.find("name"); nm != io.end() && nm->second.is<std::string>())
++        in.name = nm->second.get<std::string>();
++      const auto* mm = arr(io, "m");
++      const auto* lods = arr(io, "lods");
++      if (!mm || mm->size() != 12 || !lods || lods->empty() || in.dyn >= sc->dyn_count)
++        continue;
++      for (size_t k = 0; k < 12; k++)
++        in.m[k] = JF((*mm)[k]);
++      float maxd = 0.0f;
++      for (const auto& l : *lods)
++        if (l.is<picojson::object>())
++          maxd = std::max(maxd, num(l.get<picojson::object>(), "dist", 0.0f));
++      if ((*lods)[0].is<picojson::object>())
++        in.model = static_cast<int>(num((*lods)[0].get<picojson::object>(), "model", -1.0f));
++      if (in.model < 0 || in.model >= static_cast<int>(sc->subs.size()) || sc->subs[in.model].empty())
++        continue;
++      // LOD distances are not plain metres (L_SHIP_L1_LOD [130, 40, 50] is drawn by the game 1 km away; frame-diff
++      // 2026-11-24): until their unit is known, the LOD-0 model is drawn at any distance, as the frames show
++      (void)maxd;
++      in.maxd = 0.0f;
++      // LOD-flagged objects stay on the game for now: drawn here they lost the big station on Port Town Swap Middle
++      // (exact-view frames 2026-11-24: hiding L_SHIP / SHIP_BAY / HOTEL L1_LOD removes a mask-0 SHIP_STATION the
++      // game draws through them); with them kept, c24 still runs 100 % and the frame matches
++      if (num(io, "lod_flags", 0.0f) != 0.0f)
++        continue;
++      in.zone = u32of(io, "zone", 0xFFFFFFFFu);
++      const auto& b = bound[in.model];
++      for (int r = 0; r < 3; r++)
++        in.c[r] = in.m[r * 4] * b[0] + in.m[r * 4 + 1] * b[1] + in.m[r * 4 + 2] * b[2] + in.m[r * 4 + 3];
++      float s = 0.0f;
++      for (int c = 0; c < 3; c++)
++        s = std::max(s, std::sqrt(in.m[c] * in.m[c] + in.m[4 + c] * in.m[4 + c] + in.m[8 + c] * in.m[8 + c]));
++      in.r = b[3] * s;
++      // lit17s45: sky / backdrop / ground objects named in skyground.json are drawn at the frame's first world draw
++      in.kind = s_sg.on ? s_sg.Kind(in.name) : 0;
++      if (in.kind > 0)
++      {
++        sc->sg_by_model.resize(sc->subs.size());
++        sc->sg_by_model[in.model].push_back(static_cast<int>(sc->inst.size()));
++        sc->sg_count++;
++        sc->inst.push_back(std::move(in));
++        continue;
++      }
++      // sky-sized models (Mute City's MUT_STARS_A, 12-15 km) stay on the game: it draws them past our far plane
++      if (in.r > 5000.0f)
++        continue;
++      sc->by_model[in.model].push_back(static_cast<int>(sc->inst.size()));
++      sc->inst.push_back(std::move(in));
++    }
++  }
++  if (const auto* za = arr(o, "zones"))
++    for (const auto& zv : *za)
++    {
++      if (!zv.is<picojson::object>())
++        continue;
++      const auto& zo = zv.get<picojson::object>();
++      BZone z;
++      const auto* p = arr(zo, "pos");
++      const auto* s = arr(zo, "scale");
++      if (!p || !s || p->size() < 3 || s->size() < 3)
++        continue;
++      for (int k = 0; k < 3; k++)
++      {
++        z.pos[k] = JF((*p)[k]);
++        z.half[k] = 5.0f * std::abs(JF((*s)[k]));  // a 10-unit cube scaled, centred on pos (KB file-formats)
++      }
++      z.bits = u32of(zo, "bits", 0);
++      sc->zones.push_back(z);
++    }
++  BLog("BGX slot %d: %zu sky/ground instances\n", slot, sc->sg_count);
++  BLog("BGX slot %d: %zu instances, %zu models, %zu textures, %zu triangles, %zu zones, loaded in %.2f s\n",
++               slot, sc->inst.size(), sc->subs.size(), sc->tex.size(), sc->tris, sc->zones.size(),
++               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
++  return sc;
++}
++}  // namespace PC5090Bgx
++
++EmitQuadsAction* s_bgx_owner = nullptr;  // lit17s45: the action running the background offload
++
++void EmitQuadsSetBgxDirOverride(EmitQuadsBgxDirFn fn)
++{
++  PC5090Bgx::s_dir_override = fn;
++}
++
++struct BgxState
++{
++  int slot = -2;
++  std::future<std::unique_ptr<PC5090Bgx::BScene>> pending;
++  std::unique_ptr<PC5090Bgx::BScene> scene;
++  std::unique_ptr<AbstractTexture> verts, inst, white;
++  u32 inst_rows = 0;
++  std::vector<std::unique_ptr<AbstractTexture>> tex;
++  size_t step = 0;
++  bool ready = false;
++  u32 coli = 0;          // the COLI's address in RAM (0 = not found)
++  bool coli_virtual = false;  // found through an instance matrix: no header check per frame
++  u64 next_scan = 0;
++  // lit17s45 sky / ground: their instance rows, the last frame the background ran (hidden + zones known), zone bits
++  std::unique_ptr<AbstractTexture> sginst;
++  u64 live_frame = ~0ull;
++  u32 active = 0xFFFFFFFFu;
++  u64 early_frame = ~0ull;
++  bool by_read = false;          // the folder came from a disc COLI read (rejected when no object matches)
++  std::vector<int> rejected;     // read candidates whose objects were not in RAM  // the frame the early (first main-pass world draw) background draw happened
++  u64 frames = 0;
++  u32 trace = 0;
++  int stage = -1;          // the sidecar folder (stage file number) of the loaded course, found in RAM
++  u64 next_resolve = 0;
++  int resolve_tries = 0;  // each RAM scan costs ~20-40 ms on the CPU thread: a few tries per course, then give up
++  int coli_tries = 0;
++  u32 res_coli = 0;  // the COLI the folder was resolved from (no second scan)
++  std::vector<std::array<u32, 3>> index;  // bgx/index.json: stage, coli_dyn_offset, coli_dyn_count
++  std::vector<std::vector<std::pair<u32, std::string>>> probes;  // per index entry: (dyn, LOD-0 name) samples
++  bool index_read = false;
++};
++
++const AbstractPipeline* EmitQuadsAction::GetBgxPipeline(const EmitQuadsAnchor& target, bool translucent, bool cull, bool sky)
++{
++  static const bool dbg_nodepth = File::Exists(File::GetUserPath(D_CONFIG_IDX) + "er-bgx-nodepth.txt");
++  DepthState depth = target.depth_state;
++  depth.test_enable = true;
++  if (dbg_nodepth)
++    depth = RenderState::GetNoDepthTestingDepthState();
++  depth.func = target.depth_state.test_enable ? target.depth_state.func.Value() : CompareMode::LEqual;
++  depth.update_enable = !translucent;
++  if (sky)
++  {
++    // lit17s45: the sky sits at the far plane (clear depth): drawn only where nothing is yet, never writes depth
++    depth.test_enable = true;
++    depth.func = CompareMode::LEqual;
++    depth.update_enable = false;
++  }
++  BlendingState blend = MakeBlend(false);
++  if (!translucent)
++  {
++    blend.blend_enable = false;
++    blend.color_update = true;
++    blend.alpha_update = false;
++  }
++  else
++  {
++    blend.alpha_update = false;
++    if (cull)  // here: additive (render 0x40)
++    {
++      blend.src_factor = SrcBlendFactor::One;
++      blend.dst_factor = DstBlendFactor::One;
++    }
++  }
++  const FramebufferState fb = g_framebuffer_manager->GetEFBFramebufferState();
++  const u32 key = (fb.hex & 0xFFFFFFu) << 8 | (translucent ? 1u : 0u) | (cull ? 2u : 0u) | ((depth.hex & 0x1Fu) << 2) |
++                  (sky ? 0x80u : 0u);
++  if (const auto it = m_bgx_pipes.find(key); it != m_bgx_pipes.end())
++    return it->second.get();
++  AbstractPipelineConfig config;
++  config.vertex_format = nullptr;
++  config.vertex_shader = m_vertex_shader.get();
++  config.geometry_shader = nullptr;
++  config.pixel_shader = m_pixel_shader.get();
++  config.rasterization_state = RenderState::GetNoCullRasterizationState(PrimitiveType::Triangles);
++  config.depth_state = depth;
++  config.blending_state = blend;
++  config.framebuffer_state = fb;
++  config.usage = AbstractPipelineUsage::Utility;
++  auto p = g_gfx->CreatePipeline(config);
++  const AbstractPipeline* r = p.get();
++  m_bgx_pipes.emplace(key, std::move(p));
++  return r;
++}
++
++
++// lit17s45: one draw per GCMF submesh for the visible instances of each model (range[m] = first row + count in inst_tex);
++// mode 0 = background (booster trigger), 1 = sky / backdrop (far-plane depth, no depth write, no fog), 2 = ground
++u32 EmitQuadsAction::DrawBgxSubs(const EmitQuadsAnchor& target, const float* V, const std::array<float, 8>& fog8,
++                                  const std::array<float, 4>& fogcol, const std::vector<std::pair<u32, u32>>& range,
++                                  const AbstractTexture* inst_tex, int mode, const float* cam)
++{
++  using namespace PC5090Bgx;
++  BgxState& S = *m_bgxs;
++  BScene& sc = *S.scene;
++  if (g_framebuffer_manager->IsEFBStereo())
++    return 0;
++  if (!EnsureResources(target))
++  {
++    if (S.trace)
++      S.trace--, BLog("BGX: shaders / resources not ready (compile error?)\n");
++    return 0;
++  }
++  // the frame's GX lights (view space), at most two
++  int ln = 0;
++  std::array<std::array<float, 3>, 2> lpos{}, lcol{};
++  // (sky / ground draw at the frame's first world draw: the last captured lights)
++  if (s_bgxl.have && (s_bgxl.frame + 2 >= s_global_frame || mode > 0 || s_sg.early))
++    for (int i = 0; i < 8 && ln < 2; i++)
++      if (s_bgxl.mask & (1u << i))
++      {
++        for (int k = 0; k < 3; k++)
++        {
++          lpos[ln][k] = s_bgxl.pos[i][k];
++          lcol[ln][k] = s_bgxl.col[i][k];
++        }
++        ln++;
++      }
++  if (s_sg.venue_light && sc.have_light)
++  {
++    // a directional light: placed far against its direction, in view space
++    ln = 1;
++    for (int r = 0; r < 3; r++)
++    {
++      lpos[0][r] = -(V[r * 4] * sc.ldir[0] + V[r * 4 + 1] * sc.ldir[1] + V[r * 4 + 2] * sc.ldir[2]) * 1.0e7f;
++      lcol[0][r] = sc.lcol[r];
++    }
++  }
++  EmitQuadsUniforms u{};
++  u.projection = target.projection_rows;
++  u.pixel_center = target.pixel_center;
++  const float vw = std::max(target.viewport[0], 1.0f), vh = std::max(target.viewport[1], 1.0f);
++  u.viewport = {vw, vh, 1.0f / vw, 1.0f / vh};
++  {
++    const auto& vs = g_gfx->GetStoredViewportAndScissor();
++    u.depth_range = {vs.viewport_near_depth, vs.viewport_far_depth, 0.0f, 0.0f};
++  }
++  for (int r = 0; r < 3; r++)
++    for (int k = 0; k < 4; k++)
++      u.matrix[r][k] = V[r * 4 + k];
++  u.ram = fog8;
++  u.player = fogcol;
++  // texture scroll clock: the game's frame counter (u32 0x80183600, 60 / s), wrapped to keep float precision
++  u32 gfr = 0;
++  const float scroll_t = ReadU32(0x80183600, &gfr) ? static_cast<float>(gfr % (60u * 3600u)) / 60.0f : 0.0f;
++  const auto sampler = [](int ws, int wt) {
++    SamplerState ss = RenderState::GetLinearSamplerState();
++    const auto wm = [](int w) { return w == 2 ? WrapMode::Mirror : w == 1 ? WrapMode::Repeat : WrapMode::Clamp; };
++    ss.tm0.wrap_u = wm(ws);
++    ss.tm0.wrap_v = wm(wt);
++    ss.tm0.anisotropic_filtering = 3;
++    return ss;
++  };
++  const std::array<float, 3> gamb = sc.have_amb ? sc.amb : std::array<float, 3>{s_bgxl.amb[0], s_bgxl.amb[1], s_bgxl.amb[2]};
++  u32 draws = 0;
++  for (int pass = 0; pass < 2; pass++)
++    for (size_t m = 0; m < sc.subs.size(); m++)
++    {
++      if (range[m].second == 0)
++        continue;
++      for (const BSub& s : sc.subs[m])
++      {
++        if (s.translucent != (pass == 1))
++          continue;
++        const AbstractPipeline* pipe = GetBgxPipeline(target, s.translucent, s.add, mode == 1);
++        if (!pipe)
++          continue;
++        u.info = {target.time_ms, s.count, range[m].first, s.first};
++        const bool lit = (s.render & 1u) == 0 && ln > 0;
++        const bool own = (s.render & 8u) != 0 || s_sg.matc;  // render bit 3: the submesh's own material / ambient colour
++        const int nl = static_cast<int>(s.layers.size());
++        const auto st = [&](int i) { return i < nl ? static_cast<float>(s.layers[i].stage) : 0.0f; };
++        u.params = {lpos[0][0], lpos[0][1], lpos[0][2], ln > 0 ? 1.0f : 0.0f, lcol[0][0], lcol[0][1], lcol[0][2],
++                    lit ? 1.0f : 0.0f, gamb[0], gamb[1], gamb[2], s.translucent ? 1.0f : 0.0f, st(0), st(1), st(2),
++                    static_cast<float>(nl)};
++        u.model_min = {own ? s.amb[0] : 1.0f, own ? s.amb[1] : 1.0f, own ? s.amb[2] : 1.0f, static_cast<float>(s.scroll_slot)};
++        u.model_max = {own ? s.mat[0] : 1.0f, own ? s.mat[1] : 1.0f, own ? s.mat[2] : 1.0f, s.mat[3]};
++        u.target = {s.texA ? 1.0f : 0.0f, (lit && (s.vcol || (s.render & 0x100u))) ? 1.0f : 0.0f, (s.render & 4u) ? 1.0f : 0.0f,
++                    static_cast<float>(s.cull)};
++        u.target_far = {scroll_t, s.cut, s.add ? 1.0f : 0.0f, static_cast<float>(s.scroll_layer)};
++        u.anchor = {nl > 0 ? static_cast<float>(s.layers[0].uv) : 0.0f, nl > 1 ? static_cast<float>(s.layers[1].uv) : 1.0f,
++                    nl > 2 ? static_cast<float>(s.layers[2].uv) : 2.0f, static_cast<float>(mode)};
++        // lit17s45 sky / ground: detail settings (ground) and procedural sky settings
++        u.prev_anchor = mode == 2 ? s_sg.detail : s_sg.sky;
++        u.gate = {cam[0], cam[1], cam[2], s_sg.spec};
++        g_vertex_manager->UploadUtilityUniforms(&u, sizeof(u));
++        g_gfx->SetPipeline(pipe);
++        g_gfx->SetTexture(0, S.verts.get());
++        g_gfx->SetSamplerState(0, RenderState::GetPointSamplerState());
++        g_gfx->SetTexture(1, inst_tex);
++        g_gfx->SetSamplerState(1, RenderState::GetPointSamplerState());
++        for (int li = 0; li < 3; li++)
++        {
++          const AbstractTexture* t = S.white.get();
++          SamplerState ss = sampler(1, 1);
++          if (li < nl)
++          {
++            const int ti = s.layers[li].tex;
++            if (ti >= 0 && ti < static_cast<int>(S.tex.size()) && S.tex[ti])
++              t = S.tex[ti].get();
++            ss = sampler(s.layers[li].wrap_s, s.layers[li].wrap_t);
++          }
++          g_gfx->SetTexture(2 + li, t);
++          g_gfx->SetSamplerState(2 + li, ss);
++        }
++        PC5090Prof::BumpBoth();
++        g_gfx->Draw(0, s.count * range[m].second);
++        draws++;
++      }
++    }
++  return draws;
++}
++void EmitQuadsAction::EmitBgx(const EmitQuadsAnchor& target, int slot, const float* V,
++                              const std::array<float, 8>& fog8, const std::array<float, 4>& fogcol)
++{
++  using namespace PC5090Bgx;
++  if (!m_bgxs)
++  {
++    m_bgxs = std::make_unique<BgxState>();
++    m_bgxs->trace = m_sc_trace;
++  }
++  BgxState& S = *m_bgxs;
++  S.frames++;
++  // the course id (Practice / cup id, REL + 0x18B5AC) is not the stage file on every disc (his MusicRand disc: course
++  // 26 loads COLI_COURSE03): the folder is chosen by the COLI the game loaded - bgx/index.json lists each folder's
++  // dyn object array offset + count, the header in RAM holds that count (+0x48) and the relocated pointer (+0x54)
++  auto& bmem = Core::System::GetInstance().GetMemory();
++  if (!S.index_read)
++  {
++    S.index_read = true;
++    std::string t;
++    picojson::value root;
++    if (File::ReadFileToString(m_sc_dir + "/index.json", t) && picojson::parse(root, t).empty() && root.is<picojson::object>())
++    {
++      const auto& ro = root.get<picojson::object>();
++      if (const auto it = ro.find("slots"); it != ro.end() && it->second.is<picojson::object>())
++        for (const auto& [k, v] : it->second.get<picojson::object>())
++        {
++          if (!v.is<picojson::object>())
++            continue;
++          const auto& vo = v.get<picojson::object>();
++          const auto off = vo.find("coli_dyn_offset"), cnt = vo.find("coli_dyn_count");
++          if (off != vo.end() && cnt != vo.end() && off->second.is<double>() && cnt->second.is<double>())
++          {
++            S.index.push_back({static_cast<u32>(std::atoi(k.c_str())), static_cast<u32>(off->second.get<double>()),
++                               static_cast<u32>(cnt->second.get<double>())});
++            std::vector<std::pair<u32, std::string>> pr;
++            if (const auto pi = vo.find("probe"); pi != vo.end() && pi->second.is<picojson::array>())
++              for (const auto& e : pi->second.get<picojson::array>())
++                if (e.is<picojson::array>() && e.get<picojson::array>().size() == 2 &&
++                    e.get<picojson::array>()[0].is<double>() && e.get<picojson::array>()[1].is<std::string>())
++                  pr.emplace_back(static_cast<u32>(e.get<picojson::array>()[0].get<double>()),
++                                  e.get<picojson::array>()[1].get<std::string>());
++            S.probes.push_back(std::move(pr));
++          }
++        }
++    }
++    BLog("BGX: index of %zu sidecar folders (%s)\n", S.index.size(), m_sc_dir.c_str());
++    // lit17s45 sky / ground: bgx/skyground.json (+ kill switch Config/er-skyground.txt starting with "0")
++    {
++      std::string ks;
++      const bool killed = File::ReadFileToString(File::GetUserPath(D_CONFIG_IDX) + "er-skyground.txt", ks) &&
++                          !ks.empty() && ks[0] == '0';
++      std::string sj;
++      picojson::value sr;
++      if (!killed && File::ReadFileToString(m_sc_dir + "/skyground.json", sj) && picojson::parse(sr, sj).empty() &&
++          sr.is<picojson::object>())
++      {
++        const auto& so = sr.get<picojson::object>();
++        s_sg.on = true;
++        if (const auto it = so.find("hd"); it != so.end() && it->second.is<bool>())
++          s_sg.hd = it->second.get<bool>();
++        if (const auto it = so.find("spec"); it != so.end() && it->second.is<double>())
++          s_sg.spec = static_cast<float>(it->second.get<double>());
++        if (const auto it = so.find("matc"); it != so.end() && it->second.is<bool>())
++          s_sg.matc = it->second.get<bool>();
++        if (const auto it = so.find("venuelight"); it != so.end() && it->second.is<bool>())
++          s_sg.venue_light = it->second.get<bool>();
++        for (const auto& [key, kind] : {std::pair<const char*, int>{"sky", 1}, {"ground", 2}})
++          if (const auto it = so.find(key); it != so.end() && it->second.is<picojson::array>())
++            for (const auto& e : it->second.get<picojson::array>())
++              if (e.is<std::string>())
++                s_sg.names.emplace_back(e.get<std::string>(), kind);
++        for (const auto& [key, dst] : {std::pair<const char*, std::array<float, 4>*>{"detail", &s_sg.detail}, {"skydetail", &s_sg.sky}})
++          if (const auto it = so.find(key); it != so.end() && it->second.is<picojson::array>())
++            for (size_t k = 0; k < 4 && k < it->second.get<picojson::array>().size(); k++)
++              (*dst)[k] = JF(it->second.get<picojson::array>()[k], (*dst)[k]);
++      }
++      s_sg.early = !File::Exists(File::GetUserPath(D_CONFIG_IDX) + "er-bgx-late.txt");
++      BLog("BGX: sky/ground %s (%zu names, hd %d)\n", s_sg.on ? "on" : killed ? "killed" : "off (no skyground.json)",
++           s_sg.names.size(), s_sg.hd ? 1 : 0);
++    }
++  }
++  if (slot != S.slot)
++  {
++    S.slot = slot;
++    S.stage = -1;
++    S.next_resolve = 0;
++    S.resolve_tries = 0;
++    S.coli_tries = 0;
++    S.res_coli = 0;
++    S.by_read = false;
++    S.rejected.clear();
++    S.scene.reset();
++    S.ready = false;
++    S.coli = 0;
++    S.coli_virtual = false;
++  }
++  if (S.stage < 0)
++  {
++    // a library track served in this slot (ERTrackLib) brings its own sidecar folder: use it directly (the COLI and
++    // the object names are still checked before anything is hidden)
++    if (PC5090Bgx::s_dir_override)
++      if (const std::string od = PC5090Bgx::s_dir_override(slot); !od.empty())
++      {
++        S.stage = slot;
++        BLog("BGX: course %d uses the library folder %s\n", slot, od.c_str());
++        S.pending = std::async(std::launch::async, LoadBgx, od, slot, true);
++        return;
++      }
++    // lit17s45: the COLI file the game read from the disc names the folder (courses whose COLI header is not kept in
++    // RAM never matched the scan below: 9 / 10 / 11 / 14 / 26 ... on his MusicRand disc); the object names are still
++    // checked before anything is hidden
++    // only after the RAM header scan found nothing (3 tries): the COLI files read from the disc, newest first, each
++    // tried until one's objects are found in RAM (the newest read is not always the race's: Practice course 24 read
++    // COLI_COURSE07 last; a candidate with 0 matching objects is rejected after its scan)
++    int cst = -1;
++    bool by_read = false;
++    // OFF by default (Config/er-bgx-readfallback.txt turns it on): on c26 the candidates' object scans cost more than
++    // the scenery saved (79 -> 73 %) and none matched
++    static const bool read_fallback = File::Exists(File::GetUserPath(D_CONFIG_IDX) + "er-bgx-readfallback.txt");
++    if (read_fallback && S.resolve_tries >= 3)
++      for (const int st : DVD::ERRecentColiStages())
++      {
++        if (std::find(S.rejected.begin(), S.rejected.end(), st) != S.rejected.end())
++          continue;
++        for (const auto& e : S.index)
++          if (static_cast<int>(e[0]) == st)
++            by_read = true;
++        if (by_read)
++        {
++          cst = st;
++          break;
++        }
++      }
++    if (by_read)
++    {
++      S.stage = cst;
++      S.by_read = true;
++      BLog("BGX: course %d runs stage %02d (the disc's COLI_COURSE%02d read)\n", slot, cst, cst);
++    }
++    else if (S.index.empty())
++      S.stage = slot;  // no index: the course id names the folder
++    else if (S.frames >= S.next_resolve && S.resolve_tries < 6)
++    {
++      S.resolve_tries++;
++      S.next_resolve = S.frames + 90;
++      const u32 size = bmem.GetRamSizeReal();
++      const u8* ram = PC5090TryPointer(bmem, 0x80000000u, size);
++      for (u32 off = 0x54; ram && off + 4 < size && S.stage < 0; off += 4)
++      {
++        const u32 w = Common::swap32(ram + off);
++        if (w < 0x80000000u || w >= 0x80000000u + size)
++          continue;
++        const u32 a = 0x80000000u + off - 0x54;
++        for (size_t ei = 0; ei < S.index.size(); ei++)
++        {
++          const auto& e = S.index[ei];
++          // the pointer decides; the count (+0x48) is not required (some courses' headers differ in RAM), the probe
++          // names below confirm
++          if (w != a + e[1] || Common::swap32(ram + off - 0x0C) != e[2])
++            continue;
++          // a stale COLI of another course can still sit in RAM (every course matched stage 45 at 80c3d314): the
++          // candidate must also carry the folder's sample objects (LOD-0 names through the objects' own pointers)
++          bool named = !S.probes[ei].empty();
++          for (const auto& [dyn, name] : S.probes[ei])
++          {
++            const u32 d = a + e[1] + dyn * 0x40;
++            const auto rd = [&](u32 x) -> u32 {
++              const u8* q = PC5090TryPointer(bmem, x, 4);
++              return q ? Common::swap32(q) : 0;
++            };
++            const u32 so = rd(d + 8), lods = so ? rd(so + 8) : 0, np = lods ? rd(lods + 4) : 0;
++            const u8* nm = np ? PC5090TryPointer(bmem, np, name.size() + 1) : nullptr;
++            if (!nm || std::memcmp(nm, name.c_str(), name.size() + 1) != 0)
++            {
++              named = false;
++              break;
++            }
++          }
++          BLog("BGX: course %d candidate stage %02d at %08x: %s\n", slot, static_cast<int>(e[0]), a,
++               named ? "names match" : "names differ");
++          if (named)
++          {
++            S.stage = static_cast<int>(e[0]);
++            S.res_coli = a;
++            break;
++          }
++        }
++      }
++    }
++    if (S.stage < 0)
++      return;
++    S.pending = std::async(std::launch::async, LoadBgx, m_sc_dir, S.stage, false);
++    return;
++  }
++  if (S.pending.valid() && S.pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
++  {
++    auto sc = S.pending.get();
++    if (sc && sc->slot == S.stage)
++    {
++      S.scene = std::move(sc);
++      S.tex.clear();
++      S.tex.resize(S.scene->tex.size());
++      S.step = 0;
++      S.ready = false;
++      S.coli = 0;
++      S.coli_virtual = false;
++      S.verts.reset();
++    }
++  }
++  if (!S.scene || S.scene->inst.empty())
++    return;
++  BScene& sc = *S.scene;
++  // upload: the vertex texture, then 8 textures a frame
++  if (!S.ready)
++  {
++    if (!S.white)
++    {
++      const u32 w = 0xFFFFFFFFu;
++      S.white = g_gfx->CreateTexture(
++          TextureConfig(1, 1, 1, 1, 1, AbstractTextureFormat::RGBA8, 0, AbstractTextureType::Texture_2DArray), "bgx 1x1");
++      if (S.white)
++        S.white->Load(0, 1, 1, 1, reinterpret_cast<const u8*>(&w), 4);
++    }
++    if (!S.verts)
++    {
++      const u32 n = static_cast<u32>(sc.verts.size());
++      const u32 h = std::max((n + BG_ROW - 1) / BG_ROW, 1u);
++      if (h > 16384)
++      {
++        BLog("BGX slot %d: too many vertices (%u rows)\n", slot, h);
++        S.scene.reset();
++        return;
++      }
++      sc.verts.resize(static_cast<size_t>(h) * BG_ROW, 0.0f);
++      S.verts = g_gfx->CreateTexture(TextureConfig(BG_ROW, h, 1, 1, 1, AbstractTextureFormat::R32F, 0,
++                                                   AbstractTextureType::Texture_2DArray), "bgx vertices");
++      if (!S.verts)
++        return;
++      S.verts->Load(0, BG_ROW, h, BG_ROW, reinterpret_cast<const u8*>(sc.verts.data()), sc.verts.size() * 4);
++      std::vector<float>().swap(sc.verts);
++      const u32 ih = std::max((static_cast<u32>(sc.inst.size()) * BG_ISTRIDE + BG_ROW - 1) / BG_ROW, 1u);
++      S.inst = g_gfx->CreateTexture(TextureConfig(BG_ROW, ih, 1, 1, 1, AbstractTextureFormat::R32F, 0,
++                                                  AbstractTextureType::Texture_2DArray), "bgx instances");
++      S.inst_rows = ih;
++      return;
++    }
++    for (int k = 0; k < 8 && S.step < sc.tex.size(); k++, S.step++)
++    {
++      BTex& t = sc.tex[S.step];
++      if (t.mips.empty())
++        continue;
++      auto g = g_gfx->CreateTexture(TextureConfig(t.w, t.h, static_cast<u32>(t.mips.size()), 1, 1, t.fmt, 0,
++                                                  AbstractTextureType::Texture_2DArray),
++                                    t.hd ? "bgx hd texture" : "bgx texture");
++      if (g)
++        for (u32 l = 0; l < t.mips.size(); l++)
++        {
++          const u32 w = l < t.dims.size() ? t.dims[l][0] : std::max(t.w >> l, 1u);
++          const u32 h = l < t.dims.size() ? t.dims[l][1] : std::max(t.h >> l, 1u);
++          const u32 rl = l < t.dims.size() ? t.dims[l][2] : w;
++          g->Load(l, w, h, rl, t.mips[l].data(), t.mips[l].size());
++        }
++      S.tex[S.step] = std::move(g);
++      t.mips.clear();
++    }
++    if (S.step < sc.tex.size())
++      return;
++    S.ready = true;
++  }
++
++  // hide them from the game: find the loaded COLI (header words 0-2, word 21 = base + dyn array), check names
++  auto& memory = Core::System::GetInstance().GetMemory();
++  const auto r32 = [&](u32 a) -> u32 {
++    const u8* p = PC5090TryPointer(memory, a, 4);
++    return p ? Common::swap32(p) : 0;
++  };
++  if (S.coli && !S.coli_virtual && r32(S.coli + 0x54) != S.coli + sc.dyn_off)
++    S.coli = 0;
++  if (S.coli && S.coli_virtual && S.frames % 120 == 0)
++    for (const auto& in : sc.inst)
++      if (in.ok == 1)
++      {
++        const u32 d = S.coli + sc.dyn_off + in.dyn * 0x40;
++        const u32 so = r32(d + 8), lods = so ? r32(so + 8) : 0, np = lods ? r32(lods + 4) : 0;
++        const u8* nm = np ? PC5090TryPointer(memory, np, in.name.size() + 1) : nullptr;
++        if (!nm || std::memcmp(nm, in.name.c_str(), in.name.size() + 1) != 0)
++          S.coli = 0, S.coli_virtual = false;
++        break;
++      }
++  if (!S.coli && S.frames >= S.next_scan && S.coli_tries < 6)
++  {
++    S.coli_tries++;
++    S.next_scan = S.frames + 90;
++    const u32 size = memory.GetRamSizeReal();
++    const u8* ram = PC5090TryPointer(memory, 0x80000000u, size);
++    if (S.trace)
++      BLog("BGX slot %d: scanning %u bytes of RAM (%s)\n", slot, size, ram ? "ok" : "no pointer");
++    if (S.res_coli)
++    {
++      S.coli = S.res_coli;  // found (and name-checked) while choosing the folder
++      S.coli_tries = 6;
++    }
++    else if (ram)
++    {
++      // the relocated pointer to the dyn object array (+0x54 = base + dyn offset) decides
++      for (u32 off = 0x54; off + 4 < size; off += 4)
++      {
++        const u32 a = 0x80000000u + off - 0x54;
++        if (Common::swap32(ram + off) == a + sc.dyn_off)
++        {
++          S.coli = a;
++          break;
++        }
++      }
++      // else (Sand Ocean Deck Wrap: no such header in RAM): find an instance's model -> world matrix (the sidecar's
++      // "m", big-endian floats) and the dyn object that points at it (+0x3C); its array index gives the array
++      if (!S.coli)
++        for (size_t k = 0; k < sc.inst.size() && k < 8 && !S.coli; k++)
++        {
++          u8 pat[48];
++          for (int e = 0; e < 12; e++)
++          {
++            u32 w;
++            std::memcpy(&w, &sc.inst[k].m[e], 4);
++            w = Common::swap32(w);
++            std::memcpy(pat + 4 * e, &w, 4);
++          }
++          for (u32 off = 0; off + 48 <= size && !S.coli; off += 4)
++          {
++            if (std::memcmp(ram + off, pat, 48) != 0)
++              continue;
++            const u32 mat_be = Common::swap32(0x80000000u + off);
++            for (u32 o2 = 0x3C; o2 + 4 < size; o2 += 4)
++            {
++              if (std::memcmp(ram + o2, &mat_be, 4) != 0)
++                continue;
++              const u32 dyn = 0x80000000u + o2 - 0x3C;
++              const u32 arr0 = dyn - sc.inst[k].dyn * 0x40;
++              S.coli = arr0 - sc.dyn_off;  // a virtual header: dyn objects at coli + dyn_off as everywhere below
++              S.coli_virtual = true;
++              break;
++            }
++          }
++        }
++      // else: an instance's position (the matrix translation = the dyn object's TRXS position at +0x0C), checked by
++      // its LOD-0 name through the object's own pointers
++      if (!S.coli)
++        for (size_t k = 0; k < sc.inst.size() && k < 8 && !S.coli; k++)
++        {
++          const BInst& in = sc.inst[k];
++          u8 pat[12];
++          for (int e = 0; e < 3; e++)
++          {
++            u32 w;
++            std::memcpy(&w, &in.m[e * 4 + 3], 4);
++            w = Common::swap32(w);
++            std::memcpy(pat + 4 * e, &w, 4);
++          }
++          for (u32 off = 0x0C; off + 12 <= size && !S.coli; off += 4)
++          {
++            if (std::memcmp(ram + off, pat, 12) != 0)
++              continue;
++            const u32 dyn = 0x80000000u + off - 0x0C;
++            const u32 so = r32(dyn + 8), lods = so ? r32(so + 8) : 0, np = lods ? r32(lods + 4) : 0;
++            const u8* nm = np ? PC5090TryPointer(memory, np, in.name.size() + 1) : nullptr;
++            if (!nm || std::memcmp(nm, in.name.c_str(), in.name.size() + 1) != 0)
++              continue;
++            S.coli = dyn - in.dyn * 0x40 - sc.dyn_off;
++            S.coli_virtual = true;
++          }
++        }
++      if (S.trace)
++        BLog("BGX slot %d: COLI %s %08x\n", slot, S.coli_virtual ? "(by object)" : "header", S.coli);
++    }
++    if (S.coli)
++    {
++      u32 good = 0;
++      for (auto& in : sc.inst)
++      {
++        const u32 d = S.coli + sc.dyn_off + in.dyn * 0x40;
++        const u32 so = r32(d + 8), lods = so ? r32(so + 8) : 0, np = lods ? r32(lods + 4) : 0;
++        const u8* s = np ? PC5090TryPointer(memory, np, in.name.size() + 1) : nullptr;
++        in.ok = s && std::memcmp(s, in.name.c_str(), in.name.size() + 1) == 0 ? 1 : 0;
++        good += in.ok;
++      }
++      BLog("BGX slot %d: COLI at %08x, %u of %zu objects match\n", slot, S.coli, good, sc.inst.size());
++      if (good == 0 && S.by_read)
++      {
++        BLog("BGX: stage %02d rejected (no object in RAM), next candidate\n", S.stage);
++        S.rejected.push_back(S.stage);
++        S.stage = -1;
++        S.by_read = false;
++        S.scene.reset();
++        S.ready = false;
++        S.coli = 0;
++        S.coli_virtual = false;
++        S.coli_tries = 0;
++        S.res_coli = 0;
++        S.next_resolve = 0;
++        return;
++      }
++    }
++  }
++  if (!S.coli && S.coli_tries >= 6 && S.by_read)
++  {
++    BLog("BGX: stage %02d rejected (its objects not found in RAM), next candidate\n", S.stage);
++    S.rejected.push_back(S.stage);
++    S.stage = -1;
++    S.by_read = false;
++    S.scene.reset();
++    S.ready = false;
++    S.coli_tries = 0;
++    S.next_resolve = 0;
++    return;
++  }
++  if (!S.coli)
++    return;  // nothing hidden, nothing drawn: the game draws its own scenery
++  for (const auto& in : sc.inst)
++    if (in.ok == 1)
++    {
++      u8* p = PC5090TryPointer(memory, S.coli + sc.dyn_off + in.dyn * 0x40 + 4, 4);
++      if (p)
++        std::memset(p, 0, 4);
++    }
++
++  // the camera (world) and the active cull-zone bits
++  float cam[3];
++  for (int k = 0; k < 3; k++)
++    cam[k] = -(V[0 * 4 + k] * V[3] + V[1 * 4 + k] * V[7] + V[2 * 4 + k] * V[11]);
++  // the game tests its cull boxes against the player's machine (racer 0, +0x7C), not the camera
++  float zp[3] = {cam[0], cam[1], cam[2]};
++  {
++    const u32 rel = r32(0x800030C8), rb = rel ? r32(rel + 0x227878) : 0;
++    if (rb >= 0x80000000u)
++      for (int k = 0; k < 3; k++)
++      {
++        const u32 w = r32(rb + 0x7C + 4 * k);
++        float x;
++        std::memcpy(&x, &w, 4);
++        if (std::isfinite(x))
++          zp[k] = x;
++      }
++  }
++  u32 active = 0;
++  for (const auto& z : sc.zones)
++    if (std::abs(zp[0] - z.pos[0]) <= z.half[0] && std::abs(zp[1] - z.pos[1]) <= z.half[1] &&
++        std::abs(zp[2] - z.pos[2]) <= z.half[2])
++      active |= z.bits;
++  static const bool all_zones = File::Exists(File::GetUserPath(D_CONFIG_IDX) + "er-bgx-allzones.txt");
++  if (all_zones)
++    active = 0xFFFFFFFFu;
++  // bit 31 = "outside the boxes"; stock objects carry it with their zone bits and the game draws them inside boxes
++  // too (Mute City frames 2026-11-24: honouring only the box bits lost a station building) - so it stays on
++  active |= 0x80000000u;
++  S.active = active;
++  S.live_frame = s_global_frame;
++  s_bgx_owner = this;
++  // lit17s45: the background is drawn at the frame's first world draw (EmitSkyGround), before the game's translucent
++  // passes (c35: the game's additive city-glow layers drawn after this booster-time draw showed through the station)
++  if (s_sg.early && S.early_frame == s_global_frame)
++    return;
++  // frustum planes (view space)
++  const auto& P = target.projection_rows;
++  std::array<std::array<float, 4>, 4> planes;
++  for (int k = 0; k < 4; k++)
++  {
++    const int row = k / 2;
++    const float sg = (k % 2) ? -1.0f : 1.0f;
++    for (int c = 0; c < 4; c++)
++      planes[k][c] = P[3][c] + sg * P[row][c];
++    const float l = std::sqrt(planes[k][0] * planes[k][0] + planes[k][1] * planes[k][1] + planes[k][2] * planes[k][2]);
++    if (l > 1e-12f)
++      for (float& x : planes[k])
++        x /= l;
++  }
++  // visible instances, grouped by model: their model -> world rows in the instance texture
++  std::vector<float> idata;
++  idata.reserve(sc.inst.size() * BG_ISTRIDE);
++  std::vector<std::pair<u32, u32>> range(sc.subs.size(), {0, 0});
++  u32 nvis = 0;
++  for (size_t m = 0; m < sc.by_model.size(); m++)
++  {
++    range[m].first = static_cast<u32>(idata.size() / BG_ISTRIDE);
++    for (int i : sc.by_model[m])
++    {
++      const BInst& in = sc.inst[i];
++      if (in.ok != 1 || (in.zone & active) == 0)
++        continue;
++      float c[3];
++      for (int r = 0; r < 3; r++)
++        c[r] = V[r * 4] * in.c[0] + V[r * 4 + 1] * in.c[1] + V[r * 4 + 2] * in.c[2] + V[r * 4 + 3];
++      bool vis = c[2] - in.r < 0.0f;
++      if (vis && in.maxd > 0.0f)
++        vis = std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]) < in.maxd + in.r;
++      for (int k = 0; k < 4 && vis; k++)
++        vis = planes[k][0] * c[0] + planes[k][1] * c[1] + planes[k][2] * c[2] + planes[k][3] > -in.r;
++      // harness debug: Config/er-bgx-debug.txt = an object name: its visibility decisions (first 30)
++      {
++        static std::string dbg_name = [] {
++          std::string t;
++          File::ReadFileToString(File::GetUserPath(D_CONFIG_IDX) + "er-bgx-debug.txt", t);
++          while (!t.empty() && (t.back() == '\n' || t.back() == ' '))
++            t.pop_back();
++          return t;
++        }();
++        static int dbg_n = 0;
++        if (!dbg_name.empty() && in.name == dbg_name && dbg_n < 30)
++        {
++          dbg_n++;
++          BLog("BGXDBG %s dyn %u view c [%.0f %.0f %.0f] r %.0f vis %d model %d subs %zu zone %08x active %08x\n",
++               in.name.c_str(), in.dyn, c[0], c[1], c[2], in.r, vis ? 1 : 0, in.model, sc.subs[in.model].size(), in.zone,
++               active);
++        }
++      }
++      if (!vis)
++        continue;
++      idata.insert(idata.end(), in.m.begin(), in.m.end());
++      idata.insert(idata.end(), {in.billboard ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f});
++      for (size_t k = 0; k < 4; k++)
++      {
++        idata.push_back(k < in.scroll.size() ? in.scroll[k][0] : 0.0f);
++        idata.push_back(k < in.scroll.size() ? in.scroll[k][1] : 0.0f);
++      }
++    }
++    range[m].second = static_cast<u32>(idata.size() / BG_ISTRIDE) - range[m].first;
++    nvis += range[m].second;
++  }
++  if (nvis == 0 || !S.inst)
++    return;
++  idata.resize(static_cast<size_t>(S.inst_rows) * BG_ROW, 0.0f);
++  S.inst->Load(0, BG_ROW, S.inst_rows, BG_ROW, reinterpret_cast<const u8*>(idata.data()), idata.size() * 4);
++
++  const u32 draws = DrawBgxSubs(target, V, fog8, fogcol, range, S.inst.get(), 0, cam);
++  m_emits_this_frame++;
++  if (S.trace)
++  {
++    S.trace--;
++    if (!idata.empty())
++    {
++      const float* M = idata.data();
++      float vp[3], cl[4];
++      for (int r = 0; r < 3; r++)
++        vp[r] = V[r * 4] * M[3] + V[r * 4 + 1] * M[7] + V[r * 4 + 2] * M[11] + V[r * 4 + 3];
++      for (int r = 0; r < 4; r++)
++        cl[r] = P[r][0] * vp[0] + P[r][1] * vp[1] + P[r][2] * vp[2] + P[r][3];
++      BLog("BGX  first visible origin view [%.1f %.1f %.1f] clip [%.2f %.2f %.2f %.2f] depth func %u test %u\n", vp[0], vp[1],
++           vp[2], cl[0], cl[1], cl[2], cl[3], static_cast<u32>(target.depth_state.func.Value()),
++           static_cast<u32>(target.depth_state.test_enable.Value()));
++    }
++    BLog("BGX f=%llu slot %d visible %u of %zu draws %u zone bits %08x lights %d cam [%.0f %.0f %.0f]\n",
++                 static_cast<unsigned long long>(s_global_frame), slot, nvis, sc.inst.size(), draws, active, 0,
++                 cam[0], cam[1], cam[2]);
++  }
++}
++
++// lit17s45 SKY / GROUND: drawn at the frame's first world draw (VertexManagerBase), before any of the game's
++// translucency, with that draw's camera (its position matrix = the view) and fog. Sky / backdrop objects keep their
++// stock mesh, UVs and textures (HD pack) but sit at the far plane: the weather passes see real sky there (no dome at
++// 3-15 km cutting storms / meteors, no half-sky blend), and every later draw lands in front. Ground objects keep
++// their depth and get world-space detail (bgx.ps.glsl). Hidden from the game like the rest of the background.
++void EmitQuadsAction::EmitSkyGround(const EmitQuadsAnchor& target, const float* V, const std::array<float, 8>& fog8,
++                                    const std::array<float, 4>& fogcol)
++{
++  using namespace PC5090Bgx;
++  if (!m_bgxs || !m_bgxs->scene || !m_bgxs->ready || !m_bgxs->coli)
++    return;
++  BgxState& S = *m_bgxs;
++  // only while the background offload runs (races): menus / other scenes never get a sky
++  if (S.live_frame == ~0ull || s_global_frame > S.live_frame + 2)
++    return;
++  BScene& sc = *S.scene;
++  float cam[3];
++  for (int k = 0; k < 3; k++)
++    cam[k] = -(V[0 * 4 + k] * V[3] + V[1 * 4 + k] * V[7] + V[2 * 4 + k] * V[11]);
++  const auto& P = target.projection_rows;
++  std::array<std::array<float, 4>, 4> planes;
++  for (int k = 0; k < 4; k++)
++  {
++    const int row = k / 2;
++    const float sg = (k % 2) ? -1.0f : 1.0f;
++    for (int c = 0; c < 4; c++)
++      planes[k][c] = P[3][c] + sg * P[row][c];
++    const float l = std::sqrt(planes[k][0] * planes[k][0] + planes[k][1] * planes[k][1] + planes[k][2] * planes[k][2]);
++    if (l > 1e-12f)
++      for (float& x : planes[k])
++        x /= l;
++  }
++  // the background objects (kind 0): same visibility as EmitBgx, with this draw's view
++  u32 d0 = 0;
++  if (s_sg.early && S.inst)
++  {
++    std::vector<float> bdata;
++    bdata.reserve(sc.inst.size() * BG_ISTRIDE);
++    std::vector<std::pair<u32, u32>> brange(sc.subs.size(), {0, 0});
++    u32 bvis = 0;
++    for (size_t m = 0; m < sc.by_model.size(); m++)
++    {
++      brange[m].first = static_cast<u32>(bdata.size() / BG_ISTRIDE);
++      for (int i : sc.by_model[m])
++      {
++        const BInst& in = sc.inst[i];
++        if (in.ok != 1 || (in.zone & S.active) == 0)
++          continue;
++        float c[3];
++        for (int r = 0; r < 3; r++)
++          c[r] = V[r * 4] * in.c[0] + V[r * 4 + 1] * in.c[1] + V[r * 4 + 2] * in.c[2] + V[r * 4 + 3];
++        bool vis = c[2] - in.r < 0.0f;
++        for (int k = 0; k < 4 && vis; k++)
++          vis = planes[k][0] * c[0] + planes[k][1] * c[1] + planes[k][2] * c[2] + planes[k][3] > -in.r;
++        if (!vis)
++          continue;
++        bdata.insert(bdata.end(), in.m.begin(), in.m.end());
++        bdata.insert(bdata.end(), {in.billboard ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f});
++        for (size_t k = 0; k < 4; k++)
++        {
++          bdata.push_back(k < in.scroll.size() ? in.scroll[k][0] : 0.0f);
++          bdata.push_back(k < in.scroll.size() ? in.scroll[k][1] : 0.0f);
++        }
++      }
++      brange[m].second = static_cast<u32>(bdata.size() / BG_ISTRIDE) - brange[m].first;
++      bvis += brange[m].second;
++    }
++    if (bvis > 0)
++    {
++      bdata.resize(static_cast<size_t>(S.inst_rows) * BG_ROW, 0.0f);
++      S.inst->Load(0, BG_ROW, S.inst_rows, BG_ROW, reinterpret_cast<const u8*>(bdata.data()), bdata.size() * 4);
++      d0 = DrawBgxSubs(target, V, fog8, fogcol, brange, S.inst.get(), 0, cam);
++    }
++    S.early_frame = s_global_frame;
++    if (S.trace)
++    {
++      S.trace--;
++      BLog("BGX early f=%llu: %u of %zu visible, %u draws\n", static_cast<unsigned long long>(s_global_frame), bvis,
++           sc.inst.size(), d0);
++    }
++  }
++  if (sc.sg_count == 0)
++  {
++    m_emits_this_frame++;
++    return;
++  }
++  std::vector<float> idata;
++  idata.reserve(sc.sg_count * BG_ISTRIDE);
++  std::array<std::vector<std::pair<u32, u32>>, 2> range;
++  u32 nvis = 0;
++  for (int kind = 1; kind <= 2; kind++)
++  {
++    auto& rg = range[kind - 1];
++    rg.assign(sc.subs.size(), {0, 0});
++    for (size_t m = 0; m < sc.sg_by_model.size(); m++)
++    {
++      rg[m].first = static_cast<u32>(idata.size() / BG_ISTRIDE);
++      for (int i : sc.sg_by_model[m])
++      {
++        const BInst& in = sc.inst[i];
++        if (in.kind != kind || in.ok != 1 || (in.zone & S.active) == 0)
++          continue;
++        if (kind == 2)  // ground: frustum (the sky is at the far plane, always kept)
++        {
++          float c[3];
++          for (int r = 0; r < 3; r++)
++            c[r] = V[r * 4] * in.c[0] + V[r * 4 + 1] * in.c[1] + V[r * 4 + 2] * in.c[2] + V[r * 4 + 3];
++          bool vis = c[2] - in.r < 0.0f;
++          for (int k = 0; k < 4 && vis; k++)
++            vis = planes[k][0] * c[0] + planes[k][1] * c[1] + planes[k][2] * c[2] + planes[k][3] > -in.r;
++          if (!vis)
++            continue;
++        }
++        idata.insert(idata.end(), in.m.begin(), in.m.end());
++        idata.insert(idata.end(), {in.billboard ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f});
++        for (size_t k = 0; k < 4; k++)
++        {
++          idata.push_back(k < in.scroll.size() ? in.scroll[k][0] : 0.0f);
++          idata.push_back(k < in.scroll.size() ? in.scroll[k][1] : 0.0f);
++        }
++      }
++      rg[m].second = static_cast<u32>(idata.size() / BG_ISTRIDE) - rg[m].first;
++      nvis += rg[m].second;
++    }
++  }
++  if (nvis == 0)
++    return;
++  const u32 ih = std::max((static_cast<u32>(sc.sg_count) * BG_ISTRIDE + BG_ROW - 1) / BG_ROW, 1u);
++  if (!S.sginst)
++    S.sginst = g_gfx->CreateTexture(TextureConfig(BG_ROW, ih, 1, 1, 1, AbstractTextureFormat::R32F, 0,
++                                                  AbstractTextureType::Texture_2DArray), "bgx sky/ground instances");
++  if (!S.sginst)
++    return;
++  idata.resize(static_cast<size_t>(ih) * BG_ROW, 0.0f);
++  S.sginst->Load(0, BG_ROW, ih, BG_ROW, reinterpret_cast<const u8*>(idata.data()), idata.size() * 4);
++  const u32 d1 = DrawBgxSubs(target, V, fog8, fogcol, range[0], S.sginst.get(), 1, cam);
++  const u32 d2 = DrawBgxSubs(target, V, fog8, fogcol, range[1], S.sginst.get(), 2, cam);
++  if (s_sg.logged < 3)
++  {
++    s_sg.logged++;
++    BLog("BGX sky/ground drawn f=%llu: %u instances, %u sky draws, %u ground draws\n",
++         static_cast<unsigned long long>(s_global_frame), nvis, d1, d2);
++  }
++  m_emits_this_frame++;
++  if (S.trace)
++    BLog("BGX sky/ground f=%llu: %u visible, %u sky draws, %u ground draws, cam [%.0f %.0f %.0f]\n",
++         static_cast<unsigned long long>(s_global_frame), nvis, d1, d2, cam[0], cam[1], cam[2]);
++}
++
++void EmitQuadsNoteEfbCopy(bool to_xfb, bool clear)
++{
++  using namespace PC5090Bgx;
++  if (s_tc_frame != s_global_frame)
++  {
++    s_tc_prev = s_tc_frame == s_global_frame - 1 ? s_tc_cur : 0;
++    s_tc_cur = 0;
++    s_tc_frame = s_global_frame;
++  }
++  if (!to_xfb && clear)
++    s_tc_cur++;
++}
++bool EmitQuadsSkyGroundWanted()
++{
++  using namespace PC5090Bgx;
++  if (!s_bgx_owner || !(s_sg.on || s_sg.early) || s_sg_frame == s_global_frame)
++    return false;
++  const u32 cur = s_tc_frame == s_global_frame ? s_tc_cur : 0;
++  const u32 prev = s_tc_frame == s_global_frame ? s_tc_prev : s_tc_cur;
++  return cur >= prev;
++}
++void EmitQuadsSkyGroundDraw(const EmitQuadsAnchor& anchor, const float* m)
++{
++  PC5090Bgx::s_sg_frame = s_global_frame;
++  if (!s_bgx_owner || !anchor.valid || anchor.projection_rows[3][3] != 0.0f)
++    return;
++  const ScFog bf = CurrentFog();
++  s_bgx_owner->EmitSkyGround(anchor, m, {bf.a, bf.c, bf.bmag, bf.bshift, bf.fsel, bf.far_z, bf.z_range, bf.persp},
++                             {bf.col[0], bf.col[1], bf.col[2], bf.fsel > 0.0f ? 1.0f : 0.0f});
++}
 --- a/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.cpp
 +++ b/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.cpp
-@@ -0,0 +1,14667 @@
+@@ -0,0 +1,14739 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -28779,6 +30510,7 @@ HcmV?d00001
 +#include <algorithm>
 +#include <cctype>
 +#include <cmath>
++#include <cstdarg>
 +#include <cstdio>
 +#include <cstring>
 +#include <cstdlib>
@@ -28788,6 +30520,11 @@ HcmV?d00001
 +#include <span>
 +#include <thread>
 +#include <tuple>
++#include <filesystem>  // lit17s45 sky / ground (HD pack index)
++#include <mutex>
++#include <unordered_map>
++#include <fmt/format.h>
++#include <xxhash.h>
 +
 +#include <tinygltf/tiny_gltf.h>
 +#include <tinygltf/stb_image.h>
@@ -28806,6 +30543,7 @@ HcmV?d00001
 +#include "VideoCommon/TextureDecoder.h"
 +#include "Core/Config/GraphicsSettings.h"
 +#include "Core/HW/Memmap.h"
++#include "Core/HW/DVD/DVDThread.h"  // lit17s45 ERLastColiStage
 +#include "Core/HW/PC5090SafeMem.h"
 +#include "Core/System.h"
 +
@@ -28820,9 +30558,12 @@ HcmV?d00001
 +#include "VideoCommon/FramebufferManager.h"
 +#include "VideoCommon/ShaderGenCommon.h"
 +#include "VideoCommon/TextureConfig.h"
++#include "VideoCommon/TextureDecoder.h"
 +#include "VideoCommon/VertexManagerBase.h"
 +#include "VideoCommon/VideoConfig.h"
 +#include "VideoCommon/PC5090Menu.h"
++#include "VideoCommon/Assets/CustomTextureData.h"  // lit17s45 sky / ground
++#include "VideoCommon/HiresTextures.h"
 +
 +namespace
 +{
@@ -30350,6 +32091,18 @@ HcmV?d00001
 +  u32 draws = 0;
 +};
 +ScView s_scv;
++// lit17s44 background offload: the GX lights of this frame's first lit world draw (view space, as the game set them)
++struct BgxLights
++{
++  u64 frame = ~0ull;
++  bool have = false;
++  u32 mask = 0;
++  float pos[8][3]{};
++  float col[8][3]{};
++  float amb[3]{};
++  float mat[3]{};
++};
++BgxLights s_bgxl;
 +
 +ScFog CurrentFog()
 +{
@@ -32123,7 +33876,7 @@ HcmV?d00001
 +
 +// the RAM view of the frame (read once a frame), and every perspective draw's position matrix near it, by count,
 +// each with the GX fog it was drawn with
-+void EmitQuadsSceneryNoteDraw(const float* m)
++bool EmitQuadsSceneryNoteDraw(const float* m)
 +{
 +  if (s_scv.frame != s_global_frame)
 +  {
@@ -32134,22 +33887,39 @@ HcmV?d00001
 +  }
 +  s_scv.draws++;
 +  if (!s_scv.have_ram)
-+    return;
++    return false;
 +  const float* V = s_scv.ram;
 +  for (int r = 0; r < 3; r++)
 +  {
 +    for (int c = 0; c < 3; c++)
 +      if (std::abs(m[r * 4 + c] - V[r * 4 + c]) > 0.05f)
-+        return;
++        return false;
 +    if (std::abs(m[r * 4 + 3] - V[r * 4 + 3]) > 10.0f)
-+      return;
++      return false;
 +  }
 +  for (auto& c : s_scv.cands)
 +  {
 +    if (std::memcmp(c.m.data(), m, sizeof(float) * 12) == 0)
 +    {
 +      c.n++;
-+      return;
++      return true;
++    }
++  }
++  if (s_bgxl.frame != s_global_frame && xfmem.color[0].enablelighting)
++  {
++    s_bgxl.frame = s_global_frame;
++    s_bgxl.have = true;
++    s_bgxl.mask = xfmem.color[0].GetFullLightMask();
++    for (int i = 0; i < 8; i++)
++      for (int k = 0; k < 3; k++)
++      {
++        s_bgxl.pos[i][k] = xfmem.lights[i].dpos[k];
++        s_bgxl.col[i][k] = xfmem.lights[i].color[3 - k] / 255.0f;  // stored A B G R
++      }
++    for (int k = 0; k < 3; k++)
++    {
++      s_bgxl.amb[k] = ((xfmem.ambColor[0] >> (24 - 8 * k)) & 0xFF) / 255.0f;
++      s_bgxl.mat[k] = ((xfmem.matColor[0] >> (24 - 8 * k)) & 0xFF) / 255.0f;
 +    }
 +  }
 +  if (s_scv.cands.size() < 16)
@@ -32160,6 +33930,7 @@ HcmV?d00001
 +    c.fog = CurrentFog();
 +    s_scv.cands.push_back(c);
 +  }
++  return true;
 +}
 +
 +// lit17s10: load the slot's scene in the background when the slot changes, then upload it a texture a frame
@@ -32256,6 +34027,32 @@ HcmV?d00001
 +    return;
 +  if (m_sc_slot >= 0 && static_cast<u32>(m_sc_slot) != slot)
 +    return;
++  if (m_bgx)
++  {
++    // lit17s44: the background offload draws with the same view / fog choice as the scenery below
++    float bram[12];
++    const bool bhave = ReadRamView(bram);
++    const ScView::Cand* bbest = nullptr;
++    if (m_sc_gpu_view && s_scv.frame == s_global_frame)
++      for (const auto& c : s_scv.cands)
++        if (!bbest || c.n > bbest->n)
++          bbest = &c;
++    float BV[12];
++    if (bbest)
++      std::copy(bbest->m.begin(), bbest->m.end(), BV);
++    else if (bhave)
++      std::copy(bram, bram + 12, BV);
++    else
++      return;
++    ScFog bf;
++    if (bbest)
++      bf = bbest->fog;
++    else if (s_scv.frame == s_global_frame && !s_scv.cands.empty())
++      bf = s_scv.cands[0].fog;
++    EmitBgx(target, static_cast<int>(slot), BV, {bf.a, bf.c, bf.bmag, bf.bshift, bf.fsel, bf.far_z, bf.z_range, bf.persp},
++            {bf.col[0], bf.col[1], bf.col[2], bf.fsel > 0.0f ? 1.0f : 0.0f});
++    return;
++  }
 +  SceneryPoll(static_cast<int>(slot));
 +  if (!m_sc || !m_sc->ready || !m_sc->scene || m_sc->scene->inst.empty())
 +    return;
@@ -32924,6 +34721,8 @@ HcmV?d00001
 +    action->m_sc_max_dist = std::max(num("max_dist", 0.0f), 0.0f);
 +    if (const auto v = ReadStringFromJson(g, "view"))
 +      action->m_sc_gpu_view = *v != "ram";
++    if (const auto bx = g.find("bgx"); bx != g.end() && bx->second.is<bool>())
++      action->m_bgx = bx->second.get<bool>();  // lit17s44 background offload
 +    action->m_quads = 1;
 +    action->m_max_emits_per_frame = 1;
 +    action->m_depth_test = true;
@@ -32941,6 +34740,8 @@ HcmV?d00001
 +  return action;
 +}
 +
++#include "VideoCommon/GraphicsModSystem/Runtime/Actions/ERBgx.inc"  // Evolution Racing lit17s44 background offload
++
 +EmitQuadsAction::EmitQuadsAction()
 +{
 +  s_live_actions.push_back(this);
@@ -32949,6 +34750,8 @@ HcmV?d00001
 +// Pipelines first, then the shaders they were built from.
 +EmitQuadsAction::~EmitQuadsAction()
 +{
++  if (s_bgx_owner == this)  // lit17s45 sky / ground
++    s_bgx_owner = nullptr;
 +  std::erase(s_live_actions, this);
 +  std::erase(s_hr_pending, this);
 +  m_hr_comp_pipes.clear();  // lit17s19
@@ -43437,7 +45240,7 @@ HcmV?d00001
 +}  // namespace PC5090Material
 --- a/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.h
 +++ b/Source/Core/VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.h
-@@ -0,0 +1,517 @@
+@@ -0,0 +1,543 @@
 +// Copyright 2026 Dolphin Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -43472,6 +45275,7 @@ HcmV?d00001
 +class AbstractShader;
 +class AbstractTexture;
 +struct SceneryState;  // Evolution Racing dolphin-lit17s10 (EmitQuadsAction.cpp)
++struct BgxState;      // Evolution Racing lit17s44 background offload (ERBgx.inc)
 +
 +// Computed on the CPU by VertexManagerBase from the target draw's vertices.
 +struct EmitQuadsAnchor
@@ -43897,12 +45701,37 @@ HcmV?d00001
 +  std::unique_ptr<SceneryState> m_sc;
 +  void EmitScenery(const EmitQuadsAnchor& target);
 +  void SceneryPoll(int slot);
++  // Evolution Racing lit17s44 BACKGROUND OFFLOAD ("scenery": {"dir": <...>/bgx, "bgx": true}; SIDECAR-SPEC.md, ERBgx.inc): the
++  // slot's bgx/slotNN sidecar lists the course's background scene objects; they are hidden from the game (zone mask 0
++  // in the loaded COLI) and drawn here, instanced per GCMF submesh, with the game's view, GX lights and fog.
++  bool m_bgx = false;
++  std::unique_ptr<BgxState> m_bgxs;
++  std::map<u32, std::unique_ptr<AbstractPipeline>> m_bgx_pipes;
++  void EmitBgx(const EmitQuadsAnchor& target, int slot, const float* V, const std::array<float, 8>& fog8,
++               const std::array<float, 4>& fogcol);
++  const AbstractPipeline* GetBgxPipeline(const EmitQuadsAnchor& target, bool translucent, bool cull, bool sky = false);
++  // lit17s45 SKY / GROUND (ERBgx.inc)
++public:
++  void EmitSkyGround(const EmitQuadsAnchor& target, const float* V, const std::array<float, 8>& fog8,
++                     const std::array<float, 4>& fogcol);
++private:
++  u32 DrawBgxSubs(const EmitQuadsAnchor& target, const float* V, const std::array<float, 8>& fog8,
++                  const std::array<float, 4>& fogcol, const std::vector<std::pair<u32, u32>>& range,
++                  const AbstractTexture* inst_tex, int mode, const float* cam);
 +};
 +
 +// Evolution Racing dolphin-lit17s9: every perspective GX draw's position matrix while a scenery action exists (cheap: one
 +// compare per draw against the RAM view matrix of the frame)
++// Evolution Racing lit17s44 background offload: an optional per-slot sidecar folder override (ERTrackLib: a library track served
++// in that slot brings its own bgx/ folder holding bgx.json + models.bin + tex/). Returns "" to use the normal lookup.
++using EmitQuadsBgxDirFn = std::string (*)(int slot);
++void EmitQuadsSetBgxDirOverride(EmitQuadsBgxDirFn fn);
 +bool EmitQuadsSceneryActive();
-+void EmitQuadsSceneryNoteDraw(const float* m);
++bool EmitQuadsSceneryNoteDraw(const float* m);  // lit17s45: true = this draw's matrix is the world view
++// lit17s45 SKY / GROUND: the frame's first world draw draws the sky / ground first (before the draw)
++bool EmitQuadsSkyGroundWanted();
++void EmitQuadsNoteEfbCopy(bool to_xfb, bool clear);  // BPStructs: every EFB copy
++void EmitQuadsSkyGroundDraw(const EmitQuadsAnchor& anchor, const float* m);
 +
 +// Evolution Racing dolphin-lit17: persistent machine damage. While any emit_quads action has a "damage" object, every frame end
 +// reads each racer block (energy, state, position, surface flags) and turns real impacts (energy lost beyond the
@@ -47001,11 +48830,13 @@ HcmV?d00001
  
      // Now the vertices can be flushed to the GPU. Everything following the CommitBuffer() call
      // must be careful to not upload any utility vertices, as the binding will be lost otherwise.
-@@ -637,10 +895,162 @@
+@@ -637,10 +895,175 @@
      if (num_indices == 0)
        return;
  
 +    // Evolution Racing dolphin-lit17s9 scenery: this frame's world view = the perspective draws' position matrices
++    bool sg_world = false;  // lit17s45: this draw's matrix is the world view
++    u32 sg_mtx = 0;
 +    if (EmitQuadsSceneryActive() && xfmem.projection.type == ProjectionType::Perspective)
 +    {
 +      const u32 nv = m_index_generator.GetNumVerts();
@@ -47020,7 +48851,8 @@ HcmV?d00001
 +          mtx = first[decl.posmtx.offset] & 0x3f;
 +        }
 +      }
-+      EmitQuadsSceneryNoteDraw(&xfmem.posMatrices[mtx * 4]);
++      sg_world = EmitQuadsSceneryNoteDraw(&xfmem.posMatrices[mtx * 4]);
++      sg_mtx = mtx;
 +    }
 +
 +    // Evolution Racing dolphin-lit17: a machine body draw with a "damage" custom pipeline: its damage hits -> custom uniforms
@@ -47120,6 +48952,16 @@ HcmV?d00001
 +      }
 +    }
 +
++    // Evolution Racing lit17s45 SKY / GROUND: the frame's first world draw draws the host sky / ground before itself (utility
++    // draws, like the emit_before emitters above; this draw binds its own state below)
++    if (sg_world && EmitQuadsSkyGroundWanted())
++    {
++      EmitQuadsAnchor sg_anchor = ComputeEmitQuadsAnchor(m_cur_buffer_pointer, m_index_generator.GetNumVerts(),
++                                                         VertexLoaderManager::GetCurrentVertexFormat(),
++                                                         vertex_shader_manager);
++      sg_anchor.time_ms = pixel_shader_manager.constants.time_ms;
++      EmitQuadsSkyGroundDraw(sg_anchor, &xfmem.posMatrices[sg_mtx * 4]);
++    }
 +    // Evolution Racing lit17s41k FEATURE K nameplates: the world camera of this frame, then the labels right before the HUD
 +    if (ERNameplates::Active())
 +    {
@@ -47164,7 +49006,7 @@ HcmV?d00001
  
      if (!skip)
      {
-@@ -649,20 +1059,64 @@
+@@ -649,20 +1072,64 @@
        if (m_current_pipeline_object)
        {
          const AbstractPipeline* pipeline_object = m_current_pipeline_object;
@@ -47232,7 +49074,7 @@ HcmV?d00001
      // Even if we skip the draw, emulated state should still be impacted
      OnDraw();
  
-@@ -1063,8 +1517,8 @@
+@@ -1063,8 +1530,8 @@
    // Now we can upload uniforms, as nothing else will override them.
    geometry_shader_manager.SetConstants(primitive_type);
    pixel_shader_manager.SetConstants();
@@ -47243,7 +49085,7 @@ HcmV?d00001
    {
      pixel_shader_manager.custom_constants_dirty = true;
    }
-@@ -1103,8 +1557,10 @@
+@@ -1103,8 +1570,10 @@
      const CustomPixelShaderContents& custom_pixel_shader_contents,
      const VideoCommon::GXPipelineUid& current_pipeline_config,
      const VideoCommon::GXUberPipelineUid& current_uber_pipeline_config,
@@ -47255,7 +49097,7 @@ HcmV?d00001
    if (current_pipeline)
    {
      if (!custom_pixel_shader_contents.shaders.empty())
-@@ -1119,6 +1575,8 @@
+@@ -1119,6 +1588,8 @@
          if (auto pipeline = m_custom_shader_cache->GetPipelineAsync(
                  current_pipeline_config, custom_shaders, current_pipeline->m_config))
          {
@@ -47264,7 +49106,7 @@ HcmV?d00001
            return *pipeline;
          }
        }
-@@ -1132,6 +1590,8 @@
+@@ -1132,6 +1603,8 @@
            if (auto pipeline = m_custom_shader_cache->GetPipelineAsync(
                    current_pipeline_config, custom_shaders, current_pipeline->m_config))
            {
@@ -47273,7 +49115,7 @@ HcmV?d00001
              return *pipeline;
            }
          }
-@@ -1150,6 +1610,8 @@
+@@ -1150,6 +1623,8 @@
          if (auto pipeline = m_custom_shader_cache->GetPipelineAsync(
                  current_pipeline_config, custom_shaders, current_pipeline->m_config))
          {
