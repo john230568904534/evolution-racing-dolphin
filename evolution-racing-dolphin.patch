@@ -15131,7 +15131,7 @@ HcmV?d00001
  
 +// Evolution Racing member build id (one id for the Linux and the Windows build of the same source)
 +#ifndef ER_BUILD_ID
-+#define ER_BUILD_ID "lit17s43ermb"
++#define ER_BUILD_ID "lit17s43ermbt"
 +#endif
 +const std::string& GetERBuildStr()
 +{
@@ -15141,7 +15141,7 @@ HcmV?d00001
 +
 +// Evolution Racing X.Y (hub/server/versions.json; lighting_mod/updater/apply_version.py sets it)
 +#ifndef ER_VERSION
-+#define ER_VERSION "1.7.3"
++#define ER_VERSION "1.7.4"
 +#endif
 +// "ER_VERSION=1.3" stays in the binary (not const, read below): scripts/dolphinpack.py / winpack.py look for it
 +extern char er_version_marker[];
@@ -15254,6 +15254,15 @@ HcmV?d00001
    CoreTiming.cpp
    CoreTiming.h
    CPUThreadConfigCallback.cpp
+@@ -185,6 +193,8 @@
+   HW/DVD/DVDMath.cpp
+   HW/DVD/DVDMath.h
+   HW/DVD/DVDThread.cpp
++  HW/DVD/ERTrackLib.cpp
++  HW/DVD/ERTrackLib.h
+   HW/DVD/DVDThread.h
+   HW/DVD/FileMonitor.cpp
+   HW/DVD/FileMonitor.h
 --- a/Source/Core/Core/Config/GraphicsSettings.cpp
 +++ b/Source/Core/Core/Config/GraphicsSettings.cpp
 @@ -19,6 +19,9 @@
@@ -15283,7 +15292,7 @@ HcmV?d00001
  extern const Info<int> GFX_CUSTOM_ASPECT_RATIO_HEIGHT;
 --- a/Source/Core/Core/Core.cpp
 +++ b/Source/Core/Core/Core.cpp
-@@ -46,6 +46,10 @@
+@@ -46,6 +46,11 @@
  #include "Core/CoreTiming.h"
  #include "Core/DSPEmulator.h"
  #include "Core/DolphinAnalytics.h"
@@ -15291,10 +15300,11 @@ HcmV?d00001
 +#include "Core/ERGhosts.h"
 +#include "VideoCommon/ERModes.h"
 +#include "Core/ERTest.h"
++#include "Core/HW/DVD/ERTrackLib.h"
  #include "Core/FifoPlayer/FifoPlayer.h"
  #include "Core/FreeLookManager.h"
  #include "Core/HLE/HLE.h"
-@@ -134,7 +138,8 @@
+@@ -134,7 +139,8 @@
  
  bool GetIsThrottlerTempDisabled()
  {
@@ -15304,18 +15314,19 @@ HcmV?d00001
  }
  
  void SetIsThrottlerTempDisabled(bool disable)
-@@ -150,6 +155,10 @@
+@@ -150,6 +156,11 @@
  
  void OnFrameEnd(Core::System& system)
  {
 +  ERTest::OnFrame(system);
++  ERTrackLib::OnFrame(system);  // tracks on demand (nothing until a library mode or User/pc5090-tracklib.json is used)
 +  EROrbitCam::OnFrame(system);  // orbit camera (nothing when Config/er-orbitcam.txt is 0)
 +  ERGhosts::OnFrame(system);  // Evolution Racing run telemetry (reads nothing unless linked + on)
 +  ERModes::OnFrame(system);   // lit17s43md race modes (Cutoff / Breakaway / Hunted)
  #ifdef USE_MEMORYWATCHER
    if (s_memory_watcher)
    {
-@@ -347,6 +356,33 @@
+@@ -347,6 +358,33 @@
      if (delete_savestate)
        File::Delete(*savestate_path);
    }
@@ -15349,7 +15360,7 @@ HcmV?d00001
  
    {
      std::unique_lock core_lock(s_core_mutex);
-@@ -899,7 +935,9 @@
+@@ -899,7 +937,9 @@
        "{} {} | {} | {}", system.GetPowerPC().GetCPUName(), system.IsDualCoreMode() ? "DC" : "SC",
        g_video_backend->GetDisplayName(), Config::Get(Config::MAIN_DSP_HLE) ? "HLE" : "LLE");
  
@@ -15362,7 +15373,7 @@ HcmV?d00001
      const std::string& title = SConfig::GetInstance().GetTitleDescription();
 --- a/Source/Core/Core/ERGhosts.cpp
 +++ b/Source/Core/Core/ERGhosts.cpp
-@@ -0,0 +1,1078 @@
+@@ -0,0 +1,1140 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -15409,6 +15420,7 @@ HcmV?d00001
 +#include "Core/HW/Memmap.h"
 +#include "Core/System.h"
 +#include "Common/Swap.h"
++#include "Core/HW/DVD/ERTrackLib.h"
 +#include "DiscIO/DiscExtractor.h"
 +#include "DiscIO/Enums.h"
 +#include "DiscIO/Filesystem.h"
@@ -15687,7 +15699,10 @@ HcmV?d00001
 +    return "not a ghost from the USA game (GFZE)";
 +  std::string name(reinterpret_cast<const char*>(h + 8), 32);
 +  name = name.substr(0, name.find('\0'));
-+  bool name_ok = name.size() == 23 && name.starts_with("fzg") && name.ends_with(".dat");
++  // fzg = the game's ghosts; fG2 / fG3 = cup page 2 / Gauntlet discs; fL0-3 = a mode's cups (tracks on demand)
++  const bool kind_ok = name.starts_with("fzg") || name.starts_with("fG2") || name.starts_with("fG3") ||
++                       (name.starts_with("fL") && name.size() > 2 && name[2] >= '0' && name[2] <= '3');
++  bool name_ok = name.size() == 23 && kind_ok && name.ends_with(".dat");
 +  for (size_t i = 3; name_ok && i < 19; ++i)
 +    name_ok = std::isxdigit(static_cast<unsigned char>(name[i])) && !std::isupper(static_cast<unsigned char>(name[i]));
 +  if (!name_ok)
@@ -15857,6 +15872,45 @@ HcmV?d00001
 +  return Hex(Common::SHA1::CalculateDigest(buf));
 +}
 +
++// the track a ghost was driven on (its COLI sha1) from its card kind: fzg page 1, fG2 page 2 (stag2/), fG3 the
++// Gauntlet (stag3/), fL<n> a mode's cups (the track ERTrackLib serves in that slot now, else the disc's). The upload
++// carries the file under the game's own kind name (fzg: header only, the checksummed data is unchanged); a mode
++// ghost is also kept in User/ERTracks/ghosts/<coli sha1>/ (tracks on demand keep ghosts per track).
++bool BankUploads()
++{
++  std::string t;
++  File::ReadFileToString(File::GetUserPath(D_CONFIG_IDX) + "er-tracklib.txt", t);
++  return t.find("upload-bank-ghosts=1") != std::string::npos;
++}
++
++void TagTrack(Ghost& g)
++{
++  const std::string kind = g.name.substr(0, 3);
++  if (kind == "fG2")
++    g.coli = ERTrackLib::DiscColiSha1(g.slot, "stag2");
++  else if (kind == "fG3")
++    g.coli = ERTrackLib::DiscColiSha1(g.slot, "stag3");
++  else if (kind.starts_with("fL"))
++  {
++    g.coli = ERTrackLib::ServedColiSha1(g.slot);
++    if (g.coli.empty())
++      g.coli = ERTrackLib::DiscColiSha1(g.slot);
++    if (!g.coli.empty())
++    {
++      const std::string dir = File::GetUserPath(D_USER_IDX) + "ERTracks/ghosts/" + g.coli + "/";
++      File::CreateFullPath(dir);
++      if (!File::Exists(dir + g.name + ".gci"))
++        File::WriteStringToFile(dir + g.name + ".gci", std::string(g.data.begin(), g.data.end()));
++    }
++  }
++  if (kind != "fzg" && g.data.size() > 8 + 3)
++  {
++    std::memcpy(g.data.data() + 8, "fzg", 3);
++    g.name = "fzg" + g.name.substr(3);
++    g.sha1 = Hex(Common::SHA1::CalculateDigest(g.data));
++  }
++}
++
 +std::string GciFolder()
 +{
 +  return Config::GetGCIFolderPath(ExpansionInterface::Slot::A, DiscIO::Region::NTSC_U);
@@ -15870,10 +15924,13 @@ HcmV?d00001
 +    return out;
 +  bool had_ledger = false;
 +  const std::set<std::string> ledger = ReadLedger(&had_ledger);
++  const std::string banks_mark = Dir() + "banks-read";  // page / Gauntlet / mode ghosts read since this file exists
++  const bool banks_seen = File::Exists(banks_mark);
 +  for (const std::string& path : Common::DoFileSearch(folder, ".gci", false))
 +  {
 +    const std::string base = path.substr(path.find_last_of("/\\") + 1);
-+    if (!base.starts_with("8P-GFZE-fzg"))
++    if (!base.starts_with("8P-GFZE-fzg") && !base.starts_with("8P-GFZE-fG2") && !base.starts_with("8P-GFZE-fG3") &&
++        !base.starts_with("8P-GFZE-fL"))
 +      continue;
 +    std::error_code ec;
 +    const auto mtime = std::filesystem::last_write_time(StringToPath(path), ec);
@@ -15889,9 +15946,20 @@ HcmV?d00001
 +    g.data.assign(text.begin(), text.end());
 +    g.path = path;
 +    const std::string bad = Check(g.data, &g);
++    if (bad.empty())
++      TagTrack(g);
 +    s_scan[path] = {sig, bad.empty() ? g.sha1 : std::string()};
 +    if (!bad.empty())
 +      continue;  // not a ghost (or not written completely yet): looked at again when it changes
++    // page / Gauntlet / mode ghosts go to the hub only when Config/er-tracklib.txt says upload-bank-ghosts=1 (the hub
++    // must know those tracks' course files first, or it could put a ghost on another track of that slot)
++    if (!base.starts_with("8P-GFZE-fzg") && !BankUploads())
++      continue;
++    if (!base.starts_with("8P-GFZE-fzg") && !banks_seen)
++    {
++      AppendLedger(g.sha1, "there-before");  // page / Gauntlet ghosts from before they were read are not sent
++      continue;
++    }
 +    if (ledger.contains(g.sha1) || s_offered.contains(g.sha1))
 +      continue;
 +    if (!had_ledger)
@@ -15907,6 +15975,11 @@ HcmV?d00001
 +    File::CreateFullPath(Dir());
 +    if (!File::Exists(LedgerPath()))
 +      File::WriteStringToFile(LedgerPath(), "");
++  }
++  if (!banks_seen)
++  {
++    File::CreateFullPath(Dir());
++    File::WriteStringToFile(banks_mark, "");
 +  }
 +  return out;
 +}
@@ -16443,7 +16516,7 @@ HcmV?d00001
 +}  // namespace ERGhosts
 --- a/Source/Core/Core/ERGhosts.h
 +++ b/Source/Core/Core/ERGhosts.h
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,142 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -16514,6 +16587,7 @@ HcmV?d00001
 +  std::string time;     // m'ss"mmm as the game shows it
 +  std::string machine_name;
 +  std::vector<u8> data;
++  std::string coli;     // sha1 of the COLI file of the track it was driven on ("" = CourseSha1(slot))
 +};
 +
 +// The file check the game itself would pass (size, header, file name, checksum, time and frames agree). "" = good.
@@ -19752,20 +19826,35 @@ HcmV?d00001
 +}  // namespace ERUpdates
 --- a/Source/Core/Core/HLE/HLE.cpp
 +++ b/Source/Core/Core/HLE/HLE.cpp
-@@ -11,6 +11,7 @@
+@@ -11,6 +11,8 @@
  
  #include "Core/Config/MainSettings.h"
  #include "Core/Core.h"
 +#include "Core/EROrbitCam.h"
++#include "Core/HW/DVD/ERTrackLib.h"
  #include "Core/GeckoCode.h"
  #include "Core/HLE/HLE_Misc.h"
  #include "Core/HLE/HLE_OS.h"
-@@ -26,12 +27,15 @@
+@@ -22,16 +24,31 @@
+ 
+ namespace HLE
+ {
++// tracks on demand: the save struct is about to be compared / encoded, or was loaded (ERTrackLib "Records")
++static void ERTrackSaveOut(const Core::CPUThreadGuard&)
++{
++  ERTrackLib::HookSaveOut();
++}
++static void ERTrackSaveLoad(const Core::CPUThreadGuard&)
++{
++  ERTrackLib::HookSaveLoad();
++}
++
+ // Map addresses to the HLE hook index
  static std::map<u32, u32> s_hooked_addresses;
  
  // clang-format off
 -constexpr std::array<Hook, 23> os_patches{{
-+constexpr std::array<Hook, 26> os_patches{{
++constexpr std::array<Hook, 28> os_patches{{
      // Placeholder, os_patches[0] is the "non-existent function" index
      {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
  
@@ -19774,9 +19863,30 @@ HcmV?d00001
 +    {"EROrbitInit",                  EROrbitCam::HookCameraInit,            HookType::Start,   HookFlag::Fixed},
 +    {"EROrbitStart",                 EROrbitCam::HookCameraStart,           HookType::Start,   HookFlag::Fixed},
 +    {"EROrbitLook",                  EROrbitCam::HookCameraLook,            HookType::Start,   HookFlag::Fixed},
++    {"ERTrackSaveOut",               ERTrackSaveOut,                        HookType::Start,   HookFlag::Fixed},
++    {"ERTrackSaveLoad",              ERTrackSaveLoad,                       HookType::Start,   HookFlag::Fixed},
  
      // Debug/OS Support
      {"OSPanic",                      HLE_OS::HLE_OSPanic,                   HookType::Replace, HookFlag::Debug},
+--- a/Source/Core/Core/HW/DVD/DVDInterface.cpp
++++ b/Source/Core/Core/HW/DVD/DVDInterface.cpp
+@@ -29,6 +29,7 @@
+ #include "Core/HW/DVD/AMMediaboard.h"
+ #include "Core/HW/DVD/DVDMath.h"
+ #include "Core/HW/DVD/DVDThread.h"
++#include "Core/HW/DVD/ERTrackLib.h"
+ #include "Core/HW/EXI/EXI_DeviceIPL.h"
+ #include "Core/HW/MMIO.h"
+ #include "Core/HW/Memmap.h"
+@@ -765,7 +766,7 @@
+   // regular DVD but just before the end of a DVD-R, displaying "Error #001" and failing to boot
+   // if the read succeeds, so it's critical that we set the correct error code for such reads.
+   // See https://wiibrew.org/wiki//dev/di#0x8D_DVDLowUnencryptedRead for details on Error #001.
+-  if (dvd_offset + dvd_length > m_disc_end_offset)
++  if (dvd_offset + dvd_length > m_disc_end_offset && !ERTrackLib::Covers(dvd_offset, dvd_length))
+   {
+     SetDriveError(DriveError::BlockOOB);
+     *interrupt_type = DIInterruptType::DEINT;
 --- a/Source/Core/Core/HW/DVD/DVDThread.cpp
 +++ b/Source/Core/Core/HW/DVD/DVDThread.cpp
 @@ -3,6 +3,10 @@
@@ -19790,7 +19900,14 @@ HcmV?d00001
  #include <map>
  #include <memory>
  #include <optional>
-@@ -27,6 +31,7 @@
+@@ -21,12 +25,14 @@
+ #include "Core/CoreTiming.h"
+ #include "Core/HW/DVD/DVDInterface.h"
+ #include "Core/HW/DVD/FileMonitor.h"
++#include "Core/HW/DVD/ERTrackLib.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/HW/SystemTimers.h"
+ #include "Core/IOS/ES/Formats.h"
  #include "Core/System.h"
  
  #include "DiscIO/Enums.h"
@@ -19798,7 +19915,7 @@ HcmV?d00001
  #include "DiscIO/Volume.h"
  
  namespace DVD
-@@ -293,9 +298,53 @@
+@@ -293,12 +299,58 @@
    dvd_interface.FinishExecutingCommand(request.reply_type, interrupt, cycles_late, buffer);
  }
  
@@ -19851,7 +19968,13 @@ HcmV?d00001
 +
  
    std::vector<u8> buffer(request.length);
-   if (!m_disc->Read(request.dvd_offset, request.length, buffer.data(), request.partition))
+-  if (!m_disc->Read(request.dvd_offset, request.length, buffer.data(), request.partition))
++  if (ERTrackLib::Read(request.dvd_offset, request.length, buffer.data()))
++    ;
++  else if (!m_disc->Read(request.dvd_offset, request.length, buffer.data(), request.partition))
+     buffer.resize(0);
+ 
+   request.realtime_done_us = Common::Timer::NowUs();
 --- a/Source/Core/Core/HW/DVD/DVDThread.h
 +++ b/Source/Core/Core/HW/DVD/DVDThread.h
 @@ -137,4 +137,7 @@
@@ -19862,6 +19985,1300 @@ HcmV?d00001
 +int ERLastColiStage(u32* seq);
 +std::vector<int> ERRecentColiStages();  // the stage numbers of the COLI files read, newest first
  }  // namespace DVD
+--- a/Source/Core/Core/HW/DVD/ERTrackLib.cpp
++++ b/Source/Core/Core/HW/DVD/ERTrackLib.cpp
+@@ -0,0 +1,1239 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Tracks on demand (route 4, 2026-11-24).
++//
++// Track library: User/ERTracks/lib/<id>/track.json, one folder per track built for a carrier course slot:
++//   {"id": "<id>", "name": "Neon Knot", "slot": 3,
++//    "files": {"coli": {"file": "COLI_COURSE.lz", "sha1": "<hex>"}, "gma": {...}, "tpl": {...}, "line": {...},
++//              "ghost": {...}, "selgma": {...}, "seltpl": {...}},          coli / gma / tpl required
++//    "rel": {"venue": "01", "bgm": "05", "bgmfl": "<8 hex>", "minimap": "<56 hex>", "tod": "00", "wth": "<8 hex>",
++//            "picture": "01"},                                             optional, bytes of the slot's table rows
++//    "bgx": "bgx"}                                                         optional sidecar folder (ERBackground)
++// A track whose file hashes do not match is refused (log line "ERTRACKLIB: <id> refused").
++//
++// Who picks tracks: ERModes' mode cups (SetMode, at SELECT MODE, restored when the cups go) and the test file
++// User/pc5090-tracklib.json {"tracks": ["<id>", ...], "files": {"<disc path>": "<host file>"}, "pokes": [...]}
++// (editor Test in game / harness). The test file wins over the mode for the same slot.
++//
++// How a track is served: its slot's FST entries in RAM (*0x80000038) get offset = a virtual disc address past the end
++// of any disc (0xC0000000 + k * 16 MiB) and length = the host file's size; DVDInterface lets those reads through and
++// DVDThread fills them from memory. The slot's rows of the main REL tables (venue, BGM, final-lap BGM, minimap camera,
++// TOD1, WTH1, course picture T1) and its English course-name pointer are written in RAM at the same moment; every
++// byte written is backed up and put back when the track goes. FST entries go back to the disc's own values (read
++// from the booted disc). Twice a second the served entries are checked: a savestate load that put other values in
++// re-applies everything.
++
++#include "Core/HW/DVD/ERTrackLib.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <thread>
++#include <array>
++#include <cctype>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <set>
++#include <string>
++#include <vector>
++
++#include <fmt/format.h>
++#include <picojson.h>
++
++#include "Common/Crypto/SHA1.h"
++#include "Common/FileUtil.h"
++#include "Common/HttpRequest.h"
++#include "Common/Version.h"
++#include "Common/IOFile.h"
++#include "Common/StringUtil.h"
++#include "Common/Swap.h"
++#include "Core/ERGhosts.h"
++#include "Core/HLE/HLE.h"
++#include "Core/HW/Memmap.h"
++#include "DiscIO/DiscExtractor.h"
++#include "Core/HW/PC5090SafeMem.h"
++#include "Core/System.h"
++#include "DiscIO/Filesystem.h"
++#include "DiscIO/Volume.h"
++#include "VideoCommon/GraphicsModSystem/Runtime/Actions/EmitQuadsAction.h"
++
++namespace ERTrackLib
++{
++namespace
++{
++constexpr u64 kBase = 0xC0000000ull;
++constexpr u64 kSpan = 0x01000000ull;  // largest served file (16 MiB)
++// served files are packed one after another from kBase (32 KiB aligned): the FST offset field is 32 bits, so a fixed
++// 16 MiB per file overflowed past 64 files (a 90-file mode wrapped offsets: null reads at the course select, 2026-11-25)
++// main REL (B = [0x800030C8]) file offsets, GFZE01 (scripts/disctools.py, KB game-code.md)
++constexpr u32 kVenue = 0x1986D4, kBgm = 0x163A8C, kBgmFl = 0x163AC4, kMinimap = 0x18B5B0;
++constexpr u32 kNamePtrs = 0x199350;  // u32 pointers, course c language l (EN GER FRE SPA ITA JP) at 4 * (6c + 1 + l)
++constexpr u32 kWth = 0x903D0, kTod = 0x906E0, kT1 = 0x90740;
++
++struct Served
++{
++  std::string disc_path;
++  int slot = -1;
++  u64 off = 0;
++  u64 span = 0;  // the served file's size rounded up to 32 KiB
++  std::shared_ptr<const std::vector<u8>> data;
++  bool logged = false;
++};
++std::mutex s_mtx;  // s_served + s_slot_info: CPU thread writes, DVD / UI threads read
++std::vector<Served> s_served;
++struct SlotInfo
++{
++  std::string id, coli_sha1, bgx;
++};
++std::map<int, SlotInfo> s_slot_info;
++
++struct Track
++{
++  std::string id, dir, name, bgx, coli_sha1;
++  int slot = -1;
++  std::map<std::string, std::shared_ptr<const std::vector<u8>>> files;  // kind -> bytes
++  std::map<std::string, std::vector<u8>> rel;
++  std::string sig;  // track.json mtime + size: reload when it changes
++};
++std::map<std::string, Track> s_tracks;  // CPU thread only
++std::map<std::string, std::string> s_refused;
++
++struct Backup
++{
++  u32 addr;
++  std::vector<u8> bytes;
++};
++std::vector<Backup> s_backups;        // RAM bytes we changed (tables, names, test pokes), oldest first
++std::vector<std::string> s_mode_ids;  // from ERModes
++std::string s_test_text;              // pc5090-tracklib.json contents
++std::string s_test_sig = "-";
++bool s_dirty = false;
++u32 s_frame = 0, s_fst = 0, s_rel = 0;
++
++u32 BE32(const u8* p)
++{
++  u32 v;
++  std::memcpy(&v, p, 4);
++  return Common::swap32(v);
++}
++void W32(u8* p, u32 v)
++{
++  v = Common::swap32(v);
++  std::memcpy(p, &v, 4);
++}
++std::string Lower(std::string s)
++{
++  for (auto& c : s)
++    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++  return s;
++}
++std::string Hex(const u8* p, size_t n)
++{
++  std::string s;
++  for (size_t i = 0; i < n; i++)
++    s += fmt::format("{:02x}", p[i]);
++  return s;
++}
++int HexVal(char c)
++{
++  if (c >= '0' && c <= '9')
++    return c - '0';
++  c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++  return c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
++}
++std::vector<u8> Unhex(const std::string& h)
++{
++  std::vector<u8> b;
++  for (size_t k = 0; k + 1 < h.size(); k += 2)
++  {
++    const int hi = HexVal(h[k]), lo = HexVal(h[k + 1]);
++    if (hi < 0 || lo < 0)
++      return {};
++    b.push_back(static_cast<u8>(hi * 16 + lo));
++  }
++  return b;
++}
++std::string FileSig(const std::string& path)
++{
++  std::error_code ec;
++  const auto t = std::filesystem::last_write_time(path, ec);
++  if (ec)
++    return {};
++  const auto n = std::filesystem::file_size(path, ec);
++  return std::to_string(t.time_since_epoch().count()) + ":" + std::to_string(ec ? 0 : n);
++}
++u8* P(u32 a, size_t n)
++{
++  return PC5090TryPointer(Core::System::GetInstance().GetMemory(), a, n);
++}
++
++std::string DiscPath(const std::string& kind, int s)
++{
++  if (kind == "coli")
++    return fmt::format("stage/COLI_COURSE{:02}.lz", s);
++  if (kind == "gma")
++    return fmt::format("stage/st{:02}.gma.lz", s);
++  if (kind == "tpl")
++    return fmt::format("stage/st{:02}.tpl.lz", s);
++  if (kind == "line")
++    return fmt::format("enemy_line/line{:02}.bin", s);
++  if (kind == "ghost")
++    return fmt::format("staff_ghost/ghost{}.dat", s);
++  if (kind == "selgma")
++    return fmt::format("stage/selst{:02}.gma.lz", s);
++  if (kind == "seltpl")
++    return fmt::format("stage/selst{:02}.tpl.lz", s);
++  return {};
++}
++
++// a library track, loaded and hash-checked (nullptr = refused / missing)
++const Track* GetTrack(const std::string& id)
++{
++  if (id.empty() || id.find('/') != std::string::npos || id.find('\\') != std::string::npos ||
++      id.find("..") != std::string::npos)
++    return nullptr;
++  const std::string dir = LibraryDir() + id + "/";
++  const std::string sig = FileSig(dir + "track.json");
++  auto it = s_tracks.find(id);
++  if (it != s_tracks.end() && it->second.sig == sig)
++    return &it->second;
++  if (auto r = s_refused.find(id); r != s_refused.end() && r->second == sig)
++    return nullptr;
++  auto refuse = [&](const std::string& why) -> const Track* {
++    std::fprintf(stderr, "ERTRACKLIB: %s refused: %s\n", id.c_str(), why.c_str());
++    s_refused[id] = sig;
++    s_tracks.erase(id);
++    return nullptr;
++  };
++  if (sig.empty())
++    return refuse("no track.json");
++  std::string text;
++  picojson::value v;
++  if (!File::ReadFileToString(dir + "track.json", text) || !picojson::parse(v, text).empty() ||
++      !v.is<picojson::object>())
++    return refuse("track.json unreadable");
++  const auto& o = v.get<picojson::object>();
++  Track t;
++  t.id = id;
++  t.dir = dir;
++  t.sig = sig;
++  if (o.count("slot") && o.at("slot").is<double>())
++    t.slot = static_cast<int>(o.at("slot").get<double>());
++  if (t.slot < 1 || t.slot > 45)
++    return refuse("bad slot");
++  if (o.count("name") && o.at("name").is<std::string>())
++    t.name = o.at("name").get<std::string>();
++  if (o.count("bgx") && o.at("bgx").is<std::string>() && File::IsDirectory(dir + o.at("bgx").get<std::string>()))
++    t.bgx = dir + o.at("bgx").get<std::string>();
++  else
++    t.bgx = dir + "bgx-none";  // 1.7.4: no sidecar of its own = no background offload (never the disc slot's sidecar)
++  if (!o.count("files") || !o.at("files").is<picojson::object>())
++    return refuse("no files");
++  for (const auto& [kind, fv] : o.at("files").get<picojson::object>())
++  {
++    if (DiscPath(kind, t.slot).empty() || !fv.is<picojson::object>())
++      continue;
++    const auto& fo = fv.get<picojson::object>();
++    if (!fo.count("file") || !fo.at("file").is<std::string>())
++      continue;
++    const std::string name = fo.at("file").get<std::string>();
++    if (name.find('/') != std::string::npos || name.find('\\') != std::string::npos || name.find("..") != std::string::npos)
++      return refuse("bad file name " + name);
++    std::string bytes;
++    if (!File::ReadFileToString(dir + name, bytes) || bytes.empty() || bytes.size() > kSpan)
++      return refuse("cannot read " + name);
++    const auto d = Common::SHA1::CalculateDigest(std::string_view(bytes));
++    const std::string sha = Hex(d.data(), d.size());
++    const std::string want =
++        fo.count("sha1") && fo.at("sha1").is<std::string>() ? Lower(fo.at("sha1").get<std::string>()) : "";
++    if (want != sha)
++      return refuse(fmt::format("{} hash {} != {}", name, sha, want));
++    if (kind == "coli")
++      t.coli_sha1 = sha;
++    t.files[kind] = std::make_shared<const std::vector<u8>>(bytes.begin(), bytes.end());
++  }
++  if (!t.files.count("coli") || !t.files.count("gma") || !t.files.count("tpl"))
++    return refuse("coli / gma / tpl missing");
++  if (o.count("rel") && o.at("rel").is<picojson::object>())
++    for (const auto& [k, rv] : o.at("rel").get<picojson::object>())
++      if (rv.is<std::string>())
++        t.rel[k] = Unhex(rv.get<std::string>());
++  s_refused.erase(id);
++  std::fprintf(stderr, "ERTRACKLIB: library track %s \"%s\" slot %d ok (%zu files)\n", id.c_str(), t.name.c_str(),
++               t.slot, t.files.size());
++  return &(s_tracks[id] = std::move(t));
++}
++
++// RAM address of the FST entry for path, or 0
++u32 FindEntry(u32 fst, const std::string& path)
++{
++  const u8* root = P(fst, 12);
++  if (!root)
++    return 0;
++  const u32 n = BE32(root + 8);
++  if (n < 2 || n > 100000)
++    return 0;
++  const u8* t = P(fst, n * 12);
++  if (!t)
++    return 0;
++  const u32 strings = fst + n * 12;
++  auto name = [&](u32 i) {
++    const u32 no = BE32(t + i * 12) & 0xFFFFFF;
++    std::string s;
++    for (u32 k = 0; k < 256; k++)
++    {
++      const u8* c = P(strings + no + k, 1);
++      if (!c || !*c)
++        break;
++      s.push_back(static_cast<char>(*c));
++    }
++    return Lower(s);
++  };
++  const std::vector<std::string> parts = SplitString(Lower(path), '/');
++  u32 lo = 1, hi = n;
++  for (size_t p = 0; p < parts.size(); p++)
++  {
++    bool found = false;
++    for (u32 i = lo; i < hi;)
++    {
++      const bool dir = t[i * 12] != 0;
++      const u32 next = dir ? BE32(t + i * 12 + 8) : i + 1;
++      if (name(i) == parts[p])
++      {
++        if (p + 1 == parts.size())
++          return dir ? 0 : fst + i * 12;
++        if (!dir)
++          return 0;
++        lo = i + 1;
++        hi = next;
++        found = true;
++        break;
++      }
++      i = next > i ? next : i + 1;
++    }
++    if (!found)
++      return 0;
++  }
++  return 0;
++}
++
++// the booted disc's own offset / size of a path (to put FST entries back), cached per disc
++std::map<std::string, std::pair<u32, u32>> s_disc_fst;
++std::string s_disc_path;
++bool DiscEntry(const std::string& path, u32* off, u32* len)
++{
++  const std::string disc = ERGhosts::BootDisc();
++  if (disc != s_disc_path)
++  {
++    s_disc_fst.clear();
++    s_disc_path = disc;
++  }
++  const std::string key = Lower(path);
++  auto it = s_disc_fst.find(key);
++  if (it == s_disc_fst.end())
++  {
++    std::pair<u32, u32> e{0, 0};
++    if (auto vol = DiscIO::CreateVolume(disc))
++    {
++      const DiscIO::Partition part = vol->GetGamePartition();
++      if (const DiscIO::FileSystem* fs = vol->GetFileSystem(part))
++        if (auto info = fs->FindFileInfo(path))
++          e = {static_cast<u32>(info->GetOffset()), info->GetSize()};
++    }
++    it = s_disc_fst.emplace(key, e).first;
++  }
++  *off = it->second.first;
++  *len = it->second.second;
++  return *len != 0;
++}
++
++// first-seen bytes of every address we ever wrote this boot: a savestate taken while a track was applied must not
++// become the "original" (restore always writes these)
++std::map<u32, u8> s_orig;
++void Poke(u32 addr, const u8* d, size_t n)
++{
++  u8* p = n ? P(addr, n) : nullptr;
++  if (!p)
++    return;
++  for (size_t i = 0; i < n; i++)
++    s_orig.emplace(addr + static_cast<u32>(i), p[i]);
++  s_backups.push_back({addr, std::vector<u8>(p, p + n)});
++  std::memcpy(p, d, n);
++}
++
++void RestorePokes()
++{
++  for (const auto& b : s_backups)
++    for (size_t i = 0; i < b.bytes.size(); i++)
++    {
++      const u32 a = b.addr + static_cast<u32>(i);
++      if (u8* p = P(a, 1))
++        *p = s_orig.count(a) ? s_orig[a] : b.bytes[i];
++    }
++  s_backups.clear();
++}
++
++// ---------------------------------------------------------------- Records
++// The game keeps records by CUP POSITION: save struct (main REL .bss + 0x7F0C0, 0x5360 bytes) + 0xF8 + (row * 6 + col)
++// * 0x180 (10 times + best lap), ghost / staff flags + 0x4938 [(row - 1) * 6 + col], cup emblems + 0x4956..0x4B5C,
++// cleared cups + 0x4B5F (4). While a mode's cups are shown, every position of the mode holds the record of the TRACK
++// there, from User/ERTracks/records/<key>.bin (key = the track's COLI sha1; a disc course = its disc COLI's sha1), and
++// emblems / cleared cups the mode's own (records/mode-<n>.bin). The stock values of those bytes are kept here and put
++// back whenever the game compares or encodes its save (HLE hooks on fn_1_F7904 / F7954 / F85A0), so the card file
++// f_zero.dat only ever gets stock contents; the next frame end puts the track records back. A card load (fn_1_F79C8 /
++// new save F7A20) re-takes the stock values. Ghosts / replays saved meanwhile go to their own card files: the card
++// kind names fzg / fzr become fL<mode> / fR<mode> (the page discs' trick), so stock ghost lists stay stock.
++constexpr u32 kSaveOff = 0x7F0C0, kRec = 0xF8, kRecLen = 0x180, kGhostFlags = 0x4938, kEmb = 0x4956, kEmbEnd = 0x4B5C;
++constexpr u32 kCleared = 0x4B5F, kClearedLen = 4, kKinds = 0x1641F0, kKindLen = 0x4C;
++constexpr u32 kFnCompare1 = 0xF7904, kFnCompare2 = 0xF7954, kFnEncode = 0xF85A0, kFnLoad = 0xF79C8, kFnNew = 0xF7A20;
++struct RecCell
++{
++  int row, col, slot;
++  std::string key;  // records file key
++};
++std::vector<RecCell> s_rcells;
++int s_rmode = -1;
++std::map<int, std::vector<u8>> s_stock_rec;  // position -> 0x180 record + 1 ghost-flag byte (stock save's)
++std::vector<u8> s_stock_emb;                 // emblems + cleared cups (stock save's)
++bool s_rec_in = false;                       // RAM holds the track records now
++bool s_rec_retake = false;                   // a card load replaced the struct: re-take the stock values
++u32 s_hook_base = 0;
++std::array<std::array<u16, 5>, 5> s_stock_rows{};
++bool s_have_rows = false;
++
++std::string RecDir()
++{
++  return File::GetUserPath(D_USER_IDX) + "ERTracks/records/";
++}
++u32 SaveStruct()
++{
++  // bss = the REL section whose size is the header's bss size (after OSLink its offset field is its address)
++  const u8* bp = P(0x800030C8, 4);
++  if (!bp)
++    return 0;
++  const u32 B = BE32(bp);
++  const u8* h = P(B, 0x40);
++  if (!h)
++    return 0;
++  const u32 n = BE32(h + 0xC), si = BE32(h + 0x10), bss = BE32(h + 0x20);
++  if (n > 32 || !bss)
++    return 0;
++  for (u32 i = 0; i < n; i++)
++    if (const u8* e = P(si + 8 * i, 8); e && BE32(e + 4) == bss && (BE32(e) & ~1u) >= 0x80000000u)
++      return (BE32(e) & ~1u) + kSaveOff;
++  return 0;
++}
++u8* RecPtr(u32 save, int row, int col)
++{
++  return P(save + kRec + static_cast<u32>(row * 6 + col) * kRecLen, kRecLen);
++}
++u8* FlagPtr(u32 save, int row, int col)
++{
++  return row >= 1 ? P(save + kGhostFlags + static_cast<u32>((row - 1) * 6 + col), 1) : nullptr;
++}
++std::vector<u8> ReadEmb(u32 save)
++{
++  std::vector<u8> v;
++  if (const u8* e = P(save + kEmb, kEmbEnd - kEmb))
++    v.assign(e, e + (kEmbEnd - kEmb));
++  if (const u8* c = P(save + kCleared, kClearedLen))
++    v.insert(v.end(), c, c + kClearedLen);
++  return v;
++}
++void WriteEmb(u32 save, const std::vector<u8>& v)
++{
++  if (v.size() != kEmbEnd - kEmb + kClearedLen)
++    return;
++  if (u8* e = P(save + kEmb, kEmbEnd - kEmb))
++    std::memcpy(e, v.data(), kEmbEnd - kEmb);
++  if (u8* c = P(save + kCleared, kClearedLen))
++    std::memcpy(c, v.data() + (kEmbEnd - kEmb), kClearedLen);
++}
++// a new track's record: the position's stock record with every time set to 9'59"999 (the game's "no time") and the
++// name rows kept (the game's default rows carry staff names)
++std::vector<u8> FreshRecord(const std::vector<u8>& stock)
++{
++  std::vector<u8> r = stock;
++  r.resize(kRecLen + 1, 0);
++  for (int i = 0; i < 11; i++)
++  {
++    u8* e = r.data() + i * 0x20;
++    W32(e, 0x93B3E7);
++    W32(e + 4, i == 10 ? 0 : 0x93B3E7);
++    e[0x18] = e[0x19] = 0;
++  }
++  r[kRecLen] = 0;
++  return r;
++}
++std::vector<u8> LoadRec(const RecCell& c)
++{
++  std::string t;
++  if (File::ReadFileToString(RecDir() + c.key + ".bin", t) && t.size() == kRecLen + 1)
++    return std::vector<u8>(t.begin(), t.end());
++  // a disc course seen before in the stock cups: its stock record is the start
++  for (int r = 0; r < 5 && s_have_rows; r++)
++    for (int k = 0; k < 5; k++)
++      if (s_stock_rows[r][k] == c.slot && c.key.starts_with("disc-"))
++        if (auto it = s_stock_rec.find((r + 1) * 6 + k); it != s_stock_rec.end())
++          return it->second;
++  auto it = s_stock_rec.find(c.row * 6 + c.col);
++  return FreshRecord(it != s_stock_rec.end() ? it->second : std::vector<u8>(kRecLen + 1, 0));
++}
++void SaveRec(const RecCell& c, const std::vector<u8>& v)
++{
++  File::CreateFullPath(RecDir());
++  std::string old;
++  if (File::ReadFileToString(RecDir() + c.key + ".bin", old) && old.size() == v.size() &&
++      std::memcmp(old.data(), v.data(), v.size()) == 0)
++    return;
++  File::WriteStringToFile(RecDir() + c.key + ".bin.tmp", std::string(v.begin(), v.end()));
++  File::Rename(RecDir() + c.key + ".bin.tmp", RecDir() + c.key + ".bin");
++}
++std::string ModeEmbPath()
++{
++  return RecDir() + fmt::format("mode-{}.bin", s_rmode);
++}
++
++// RAM -> our store, stock values -> RAM (the game is about to compare / encode its save, or the mode goes)
++void RecordsOut(const char* why)
++{
++  if (!s_rec_in)
++    return;
++  const u32 save = SaveStruct();
++  if (!save)
++    return;
++  int changed = 0;
++  for (const auto& c : s_rcells)
++  {
++    u8* r = RecPtr(save, c.row, c.col);
++    u8* f = FlagPtr(save, c.row, c.col);
++    if (!r || !f)
++      continue;
++    std::vector<u8> v(r, r + kRecLen);
++    v.push_back(*f);
++    if (v != LoadRec(c))
++      changed++;
++    SaveRec(c, v);
++    auto it = s_stock_rec.find(c.row * 6 + c.col);
++    if (it != s_stock_rec.end())
++    {
++      std::memcpy(r, it->second.data(), kRecLen);
++      *f = it->second[kRecLen];
++    }
++  }
++  const std::vector<u8> emb = ReadEmb(save);
++  File::CreateFullPath(RecDir());
++  File::WriteStringToFile(ModeEmbPath(), std::string(emb.begin(), emb.end()));
++  WriteEmb(save, s_stock_emb);
++  s_rec_in = false;
++  std::fprintf(stderr, "ERTRACKLIB: records out (%s): %zu positions, %d changed\n", why, s_rcells.size(), changed);
++}
++// stock values kept, track records -> RAM
++void RecordsIn()
++{
++  if (s_rec_in || s_rcells.empty())
++    return;
++  const u32 save = SaveStruct();
++  if (!save)
++    return;
++  if (s_stock_rec.empty() || s_rec_retake)
++  {
++    s_stock_rec.clear();
++    for (const auto& c : s_rcells)
++    {
++      const u8* r = RecPtr(save, c.row, c.col);
++      const u8* f = FlagPtr(save, c.row, c.col);
++      if (!r || !f)
++        continue;
++      std::vector<u8> v(r, r + kRecLen);
++      v.push_back(*f);
++      s_stock_rec[c.row * 6 + c.col] = v;
++    }
++    s_stock_emb = ReadEmb(save);
++    s_rec_retake = false;
++  }
++  for (const auto& c : s_rcells)
++  {
++    u8* r = RecPtr(save, c.row, c.col);
++    u8* f = FlagPtr(save, c.row, c.col);
++    if (!r || !f)
++      continue;
++    const std::vector<u8> v = LoadRec(c);
++    std::memcpy(r, v.data(), kRecLen);
++    *f = v[kRecLen];
++  }
++  std::string t;
++  if (File::ReadFileToString(ModeEmbPath(), t) && t.size() == s_stock_emb.size())
++    WriteEmb(save, std::vector<u8>(t.begin(), t.end()));
++  else
++  {
++    std::vector<u8> zero(s_stock_emb.size(), 0);
++    WriteEmb(save, zero);  // a mode starts with no emblems / cleared cups of its own
++  }
++  s_rec_in = true;
++}
++void EnsureHooks(Core::System& system, u32 B)
++{
++  if (s_hook_base == B)
++    return;
++  if (s_hook_base)
++  {
++    HLE::UnPatch(system, "ERTrackSaveOut");
++    HLE::UnPatch(system, "ERTrackSaveLoad");
++  }
++  const u32 text = B + 0xDC;
++  HLE::Patch(system, text + kFnCompare1, "ERTrackSaveOut");
++  HLE::Patch(system, text + kFnCompare2, "ERTrackSaveOut");
++  HLE::Patch(system, text + kFnEncode, "ERTrackSaveOut");
++  HLE::Patch(system, text + kFnLoad, "ERTrackSaveLoad");
++  HLE::Patch(system, text + kFnNew, "ERTrackSaveLoad");
++  s_hook_base = B;
++}
++void StockRows(u32 B)
++{
++  if (s_have_rows || !s_rcells.empty())
++    return;
++  for (int r = 0; r < 5; r++)
++    if (const u8* q = P(B + 0x167940 + 12u * static_cast<u32>(r + 1), 10))
++      for (int k = 0; k < 5; k++)
++        s_stock_rows[r][k] = static_cast<u16>((q[2 * k] << 8) | q[2 * k + 1]);
++  s_have_rows = true;
++}
++
++// English course name: the slot's EN pointer -> a string with room. GFZE01 shows English only, so every other
++// language's string (any course) is free room unless an English pointer also uses it; the smallest one that fits wins
++// (else the biggest, the name cut). Strings taken in this apply are not handed out twice.
++std::set<u32> s_name_taken;
++void PokeName(u32 B, int slot, const std::string& name)
++{
++  if (name.empty() || slot < 0 || slot >= 110)
++    return;
++  std::set<u32> en_used;
++  for (int c = 0; c < 110; c++)
++    if (c != slot)
++      if (const u8* q = P(B + kNamePtrs + 4 * (c * 6 + 1), 4))
++        en_used.insert(BE32(q));
++  auto room_of = [](u32 s) {
++    size_t n = 0;
++    while (n < 120)
++    {
++      const u8* c = P(s + static_cast<u32>(n), 1);
++      if (!c || !*c)
++        break;
++      n++;
++    }
++    return n;
++  };
++  std::map<u32, size_t> cand;
++  if (const u8* q = P(B + kNamePtrs + 4 * (slot * 6 + 1), 4); q && !en_used.count(BE32(q)))
++    cand[BE32(q)] = room_of(BE32(q));
++  for (int c = 0; c < 110; c++)
++    for (int l = 1; l < 6; l++)
++      if (const u8* q = P(B + kNamePtrs + 4 * (c * 6 + 1 + l), 4))
++      {
++        const u32 s = BE32(q);
++        if (!en_used.count(s) && !s_name_taken.count(s) && P(s, 1))
++          cand.emplace(s, room_of(s));
++      }
++  u32 best = 0;
++  size_t best_room = 0;
++  for (const auto& [s, room] : cand)
++  {
++    const bool fits = room >= name.size(), best_fits = best && best_room >= name.size();
++    if (!best || (fits && (!best_fits || room < best_room)) || (!fits && !best_fits && room > best_room))
++      best = s, best_room = room;
++  }
++  if (!best || !best_room)
++    return;
++  s_name_taken.insert(best);
++  const std::string nm = name.substr(0, best_room);
++  std::vector<u8> buf(best_room + 1, 0);
++  std::memcpy(buf.data(), nm.data(), nm.size());
++  Poke(best, buf.data(), buf.size());
++  u8 ptr[4];
++  W32(ptr, best);
++  Poke(B + kNamePtrs + 4 * (slot * 6 + 1), ptr, 4);
++  if (nm.size() < name.size())
++    std::fprintf(stderr, "ERTRACKLIB: slot %d name cut to %zu characters (\"%s\")\n", slot, best_room, nm.c_str());
++}
++
++void PokeRel(u32 B, const Track& t)
++{
++  const int s = t.slot;
++  auto put = [&](const char* key, u32 at, size_t n, bool ok) {
++    auto it = t.rel.find(key);
++    if (it == t.rel.end() || it->second.size() != n || !ok)
++      return;
++    Poke(at, it->second.data(), n);
++  };
++  put("venue", B + kVenue + s, 1, true);
++  put("bgm", B + kBgm + s, 1, s < 56);
++  put("bgmfl", B + kBgmFl + 4 * s, 4, s < 46);
++  put("minimap", B + kMinimap + 28 * s, 28, s < 46);
++  const u8* tod = P(B + kTod, 4);
++  put("tod", B + kTod + 4 + s, 1, tod && std::memcmp(tod, "TOD1", 4) == 0 && s < 64);
++  const u8* wth = P(B + kWth, 4);
++  put("wth", B + kWth + 4 + 4 * s, 4, wth && std::memcmp(wth, "WTH1", 4) == 0 && s < 64);
++  // course picture table T1 (discs with the coursepic patch): 0x70 bytes, all picture indexes < 0x40
++  bool t1 = false;
++  if (const u8* q = P(B + kT1, 0x70))
++  {
++    t1 = q[1] != 0;
++    for (int i = 0; i < 0x70 && t1; i++)
++      t1 = q[i] < 0x40;
++  }
++  put("picture", B + kT1 + s, 1, t1);
++  PokeName(B, s, t.name);
++}
++
++void Apply()
++{
++  const u8* fp = P(0x80000038, 4);
++  const u8* bp = P(0x800030C8, 4);
++  if (!fp || !bp)
++    return;
++  const u32 fst = BE32(fp), B = BE32(bp);
++  // every FST entry we changed back to the disc's own values, every poked byte back
++  {
++    std::lock_guard lk(s_mtx);
++    for (const auto& s : s_served)
++    {
++      u32 off = 0, len = 0;
++      const u32 e = FindEntry(fst, s.disc_path);
++      u8* ep = e ? P(e, 12) : nullptr;
++      if (ep && DiscEntry(s.disc_path, &off, &len))
++      {
++        W32(ep + 4, off);
++        W32(ep + 8, len);
++      }
++    }
++  }
++  RestorePokes();
++  s_name_taken.clear();
++
++  // wanted: slot -> track (mode first, then the test file's tracks win), raw test files, test pokes
++  std::map<int, const Track*> by_slot;
++  for (const auto& id : s_mode_ids)
++    if (const Track* t = GetTrack(id))
++    {
++      if (by_slot.count(t->slot))
++        std::fprintf(stderr, "ERTRACKLIB: slot %d wanted twice in this mode (%s and %s): the first stays\n", t->slot,
++                     by_slot[t->slot]->id.c_str(), id.c_str());
++      else
++        by_slot[t->slot] = t;
++    }
++  std::map<std::string, std::shared_ptr<const std::vector<u8>>> raw;
++  std::vector<std::pair<u32, std::vector<u8>>> pokes;
++  picojson::value v;
++  if (!s_test_text.empty() && picojson::parse(v, s_test_text).empty() && v.is<picojson::object>())
++  {
++    const auto& o = v.get<picojson::object>();
++    if (o.count("tracks") && o.at("tracks").is<picojson::array>())
++      for (const auto& x : o.at("tracks").get<picojson::array>())
++        if (x.is<std::string>())
++          if (const Track* t = GetTrack(x.get<std::string>()))
++            by_slot[t->slot] = t;
++    if (o.count("files") && o.at("files").is<picojson::object>())
++      for (const auto& [dp, hv] : o.at("files").get<picojson::object>())
++      {
++        std::string bytes;
++        if (hv.is<std::string>() && File::ReadFileToString(hv.get<std::string>(), bytes) && !bytes.empty() &&
++            bytes.size() <= kSpan)
++          raw[dp] = std::make_shared<const std::vector<u8>>(bytes.begin(), bytes.end());
++        else
++          std::fprintf(stderr, "ERTRACKLIB: cannot use a host file for %s\n", dp.c_str());
++      }
++    if (o.count("pokes") && o.at("pokes").is<picojson::array>())
++      for (const auto& pv : o.at("pokes").get<picojson::array>())
++        if (pv.is<picojson::object>())
++        {
++          const auto& po = pv.get<picojson::object>();
++          if (po.count("a") && po.count("hex") && po.at("a").is<std::string>() && po.at("hex").is<std::string>())
++          {
++            const std::vector<u8> a = Unhex(po.at("a").get<std::string>());
++            if (a.size() == 4)
++              pokes.push_back({BE32(a.data()), Unhex(po.at("hex").get<std::string>())});
++          }
++        }
++  }
++
++  std::vector<Served> served;
++  std::map<int, SlotInfo> info;
++  auto serve = [&](const std::string& dp, int slot, std::shared_ptr<const std::vector<u8>> data) {
++    const u32 e = FindEntry(fst, dp);
++    u8* ep = e ? P(e, 12) : nullptr;
++    if (!ep)
++    {
++      std::fprintf(stderr, "ERTRACKLIB: %s not on this disc: not served\n", dp.c_str());
++      return;
++    }
++    Served s;
++    s.disc_path = dp;
++    s.slot = slot;
++    s.off = served.empty() ? kBase : served.back().off + served.back().span;
++    s.span = (data->size() + 0x7FFF) & ~0x7FFFull;
++    if (s.off + s.span > 0xFFFF8000ull)
++    {
++      std::fprintf(stderr, "ERTRACKLIB: no virtual disc room left for %s: not served\n", dp.c_str());
++      return;
++    }
++    s.data = std::move(data);
++    W32(ep + 4, static_cast<u32>(s.off));
++    W32(ep + 8, static_cast<u32>(s.data->size()));
++    served.push_back(std::move(s));
++  };
++  for (const auto& [slot, t] : by_slot)
++  {
++    for (const auto& [kind, data] : t->files)
++      if (!raw.count(DiscPath(kind, slot)))
++        serve(DiscPath(kind, slot), slot, data);
++    PokeRel(B, *t);
++    info[slot] = {t->id, t->coli_sha1, t->bgx};
++    std::fprintf(stderr, "ERTRACKLIB: slot %d = %s \"%s\"\n", slot, t->id.c_str(), t->name.c_str());
++  }
++  if (s_rmode >= 0 && !s_rcells.empty())
++  {
++    // this mode's ghosts / replays in their own card files (only over the stock names: page discs rename too)
++    const char gk[4] = {'f', 'L', static_cast<char>('0' + s_rmode), 0};
++    const char rk[4] = {'f', 'R', static_cast<char>('0' + s_rmode), 0};
++    if (const u8* q = P(B + kKinds + 2 * kKindLen, 4); q && std::memcmp(q, "fzg", 4) == 0)
++      Poke(B + kKinds + 2 * kKindLen, reinterpret_cast<const u8*>(gk), 4);
++    if (const u8* q = P(B + kKinds + 5 * kKindLen, 4); q && std::memcmp(q, "fzr", 4) == 0)
++      Poke(B + kKinds + 5 * kKindLen, reinterpret_cast<const u8*>(rk), 4);
++  }
++  for (const auto& [dp, data] : raw)
++    serve(dp, -1, data);
++  for (const auto& [a, b] : pokes)
++    Poke(a, b.data(), b.size());
++  size_t n;
++  {
++    std::lock_guard lk(s_mtx);
++    s_served.swap(served);
++    s_slot_info.swap(info);
++    n = s_served.size();
++  }
++  s_fst = fst;
++  s_rel = B;
++  std::fprintf(stderr, "ERTRACKLIB: %zu files host-served, %zu RAM writes\n", n, s_backups.size());
++}
++
++// true when every served FST entry still carries our values (false after a savestate load / a new boot)
++bool StillApplied()
++{
++  const u8* fp = P(0x80000038, 4);
++  const u8* bp = P(0x800030C8, 4);
++  if (!fp || !bp || BE32(fp) != s_fst || BE32(bp) != s_rel)
++    return false;
++  std::lock_guard lk(s_mtx);
++  for (const auto& s : s_served)
++  {
++    const u32 e = FindEntry(s_fst, s.disc_path);
++    const u8* ep = e ? P(e, 12) : nullptr;
++    if (!ep || BE32(ep + 4) != static_cast<u32>(s.off) || BE32(ep + 8) != s.data->size())
++      return false;
++  }
++  return true;
++}
++bool RamReady()
++{
++  const u8* fp = P(0x80000038, 4);
++  const u8* bp = P(0x800030C8, 4);
++  if (!fp || !bp)
++    return false;
++  const u32 fst = BE32(fp), B = BE32(bp);
++  return fst >= 0x80000000u && fst < 0x81800000u && B >= 0x80000000u && B < 0x81800000u;
++}
++
++
++// ---------------------------------------------------------------- Sync from the hub (tracklib.py)
++// Once a boot (and every 15 minutes) when this Dolphin is linked to the hub (Tools > Evolution Racing ghosts: hub +
++// token; Play offline = no sync) and Config/er-tracklib.txt does not say "sync=off": GET /hub/api/erd/tracklib/manifest,
++// then every entry whose files differ is fetched into lib/<id>.part/, checked (sha1) and renamed over lib/<id>; entries
++// the hub dropped go (only ones a sync brought: lib/<id>/.hub); the modes go to ERTracks/modes.json (ERModes reads it
++// between the disc's racemodes.json and the player's pc5090-mode-cups.json). HD textures of an entry are copied to
++// Load/Textures/GFZE01/ERTracks/<id>/ (Dolphin reads them when a game starts). Nothing is applied mid-race: the files
++// are picked up the next time a mode is picked (GetTrack re-reads a changed track.json). HD textures: see SyncNow.
++std::atomic<bool> s_sync_busy{false};
++std::atomic<u64> s_sync_next{0};
++std::string Sha1Hex(const std::string& b)
++{
++  const auto d = Common::SHA1::CalculateDigest(std::string_view(b));
++  return Hex(d.data(), d.size());
++}
++bool SafeRel(const std::string& r)
++{
++  if (r.empty() || r.size() > 200 || r[0] == '/' || r.find("..") != std::string::npos || r.find('\\') != std::string::npos)
++    return false;
++  for (char c : r)
++    if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '-' || c == '/'))
++      return false;
++  return true;
++}
++void SyncNow(std::string hub, std::string token)
++{
++  while (!hub.empty() && hub.back() == '/')
++    hub.pop_back();
++  const std::string base = hub + "/hub/api/erd/tracklib/";
++  Common::HttpRequest req(std::chrono::milliseconds(30000));
++  if (!req.IsValid())
++    return;
++  const Common::HttpRequest::Headers h = {{"X-ER-Dolphin", token}, {"X-ER-Build", Common::GetERBuildStr()},
++                                          {"Accept", "application/json"}};
++  auto resp = req.Get(base + "manifest", h, Common::HttpRequest::AllowedReturnCodes::All);
++  if (!resp || req.GetLastResponseCode() != 200)
++  {
++    std::fprintf(stderr, "ERTRACKLIB sync: no manifest (HTTP %d)\n", req.GetLastResponseCode());
++    return;
++  }
++  picojson::value v;
++  const std::string text(resp->begin(), resp->end());
++  if (!picojson::parse(v, text).empty() || !v.is<picojson::object>())
++    return;
++  const auto& o = v.get<picojson::object>();
++  const std::string lib = LibraryDir();
++  File::CreateFullPath(lib);
++  int fetched = 0, kept = 0, failed = 0, dropped = 0;
++  std::set<std::string> hub_ids;
++  if (o.count("tracks") && o.at("tracks").is<picojson::object>())
++    for (const auto& [id, tv] : o.at("tracks").get<picojson::object>())
++    {
++      if (id.empty() || id.size() > 64 || !SafeRel(id) || id.find('/') != std::string::npos || !tv.is<picojson::object>() ||
++          !tv.get<picojson::object>().count("files") || !tv.get<picojson::object>().at("files").is<picojson::object>())
++        continue;
++      hub_ids.insert(id);
++      const auto& files = tv.get<picojson::object>().at("files").get<picojson::object>();
++      bool same = true;
++      for (const auto& [rel, fv] : files)
++      {
++        std::string b;
++        if (!fv.is<picojson::array>() || fv.get<picojson::array>().empty() || !SafeRel(rel) ||
++            !File::ReadFileToString(lib + id + "/" + rel, b) || Sha1Hex(b) != fv.get<picojson::array>()[0].to_str())
++        {
++          same = false;
++          break;
++        }
++      }
++      if (same)
++      {
++        kept++;
++        continue;
++      }
++      const std::string part = lib + id + ".part/";
++      File::DeleteDirRecursively(part);
++      bool ok = true;
++      for (const auto& [rel, fv] : files)
++      {
++        if (!SafeRel(rel) || !fv.is<picojson::array>() || fv.get<picojson::array>().empty())
++        {
++          ok = false;
++          break;
++        }
++        const std::string want = fv.get<picojson::array>()[0].to_str();
++        std::string b;
++        if (File::ReadFileToString(lib + id + "/" + rel, b) && Sha1Hex(b) == want)  // unchanged file: no download
++        {
++          File::CreateFullPath(part + rel);
++          File::WriteStringToFile(part + rel, b);
++          continue;
++        }
++        auto fr = req.Get(base + "file/" + id + "/" + rel, h, Common::HttpRequest::AllowedReturnCodes::All);
++        if (!fr || req.GetLastResponseCode() != 200 || fr->size() > kSpan * 4 ||
++            Sha1Hex(std::string(fr->begin(), fr->end())) != want)
++        {
++          ok = false;
++          break;
++        }
++        File::CreateFullPath(part + rel);
++        File::WriteStringToFile(part + rel, std::string(fr->begin(), fr->end()));
++      }
++      if (!ok)
++      {
++        File::DeleteDirRecursively(part);
++        failed++;
++        continue;
++      }
++      File::WriteStringToFile(part + ".hub", "");
++      File::DeleteDirRecursively(lib + id);
++      File::Rename(lib + id + ".part", lib + id);
++      fetched++;
++      // HD textures where Dolphin's texture loader finds them
++      // Load/Textures/1-GFZE01-tracklib/<id>/ (a GFZE01.txt marker makes Dolphin read the folder; launchers rebuild GFZE01/)
++      const std::string hdroot = File::GetUserPath(D_HIRESTEXTURES_IDX) + "1-GFZE01-tracklib/";
++      File::CreateFullPath(hdroot);
++      if (!File::Exists(hdroot + "GFZE01.txt"))
++        File::WriteStringToFile(hdroot + "GFZE01.txt", "");
++      const std::string hd = hdroot + id + "/";
++      File::DeleteDirRecursively(hd);
++      for (const auto& [rel, fv] : files)
++        if (rel.starts_with("hd/") && rel.ends_with(".png"))
++        {
++          File::CreateFullPath(hd);
++          File::Copy(lib + id + "/" + rel, hd + rel.substr(3));
++        }
++    }
++  // entries a sync brought that the hub no longer has
++  for (const auto& e : File::ScanDirectoryTree(lib, false).children)
++    if (e.isDirectory && !hub_ids.count(e.virtualName) && File::Exists(e.physicalName + "/.hub"))
++    {
++      File::DeleteDirRecursively(e.physicalName);
++      File::DeleteDirRecursively(File::GetUserPath(D_HIRESTEXTURES_IDX) + "1-GFZE01-tracklib/" + e.virtualName);
++      dropped++;
++    }
++  if (o.count("modes"))
++  {
++    picojson::object mc;
++    mc["modeCups"] = o.at("modes");
++    mc["gen"] = o.count("gen") ? o.at("gen") : picojson::value(0.0);
++    const std::string mp = File::GetUserPath(D_USER_IDX) + "ERTracks/modes.json";
++    std::string old;
++    const std::string now = picojson::value(mc).serialize(true);
++    if (!File::ReadFileToString(mp, old) || old != now)
++    {
++      File::WriteStringToFile(mp + ".tmp", now);
++      File::Rename(mp + ".tmp", mp);
++    }
++  }
++  std::fprintf(stderr, "ERTRACKLIB sync: %d fetched, %d up to date, %d failed, %d dropped\n", fetched, kept, failed, dropped);
++}
++void MaybeSync()
++{
++  const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
++                                       std::chrono::steady_clock::now().time_since_epoch())
++                                       .count());
++  const std::string poke = File::GetUserPath(D_USER_IDX) + "ERTracks/sync-now";  // test / tool: sync at once
++  if (File::Exists(poke) && !s_sync_busy)
++  {
++    File::Delete(poke);
++    s_sync_next = 0;
++  }
++  if (s_sync_busy || now < s_sync_next)
++    return;
++  s_sync_next = now + 15 * 60;
++  std::string cfg;
++  File::ReadFileToString(File::GetUserPath(D_CONFIG_IDX) + "er-tracklib.txt", cfg);
++  if (cfg.find("sync=off") != std::string::npos)
++    return;
++  const ERGhosts::Settings st = ERGhosts::Load();
++  if (st.offline || st.token.empty() || !ERGhosts::HubAllowed(st.hub))
++    return;
++  s_sync_busy = true;
++  std::thread([hub = st.hub, tok = st.token]() {
++    SyncNow(hub, tok);
++    s_sync_busy = false;
++  }).detach();
++}
++}  // namespace
++
++std::string LibraryDir()
++{
++  return File::GetUserPath(D_USER_IDX) + "ERTracks/lib/";
++}
++
++int LibSlot(const std::string& id)
++{
++  const Track* t = GetTrack(id);
++  return t ? t->slot : -1;
++}
++
++void SetMode(int mode, const std::vector<Cell>& cells)
++{
++  std::vector<std::string> ids;
++  std::vector<RecCell> rc;
++  for (const auto& c : cells)
++  {
++    if (!c.lib.empty() && std::find(ids.begin(), ids.end(), c.lib) == ids.end())
++      ids.push_back(c.lib);
++    std::string key;
++    if (!c.lib.empty())
++      if (const Track* t = GetTrack(c.lib))
++        key = t->coli_sha1;
++    if (key.empty())
++      key = "disc-" + DiscColiSha1(c.slot);
++    if (c.row >= 1 && c.row <= 5 && c.col >= 0 && c.col <= 4)
++      rc.push_back({c.row, c.col, c.slot, key});
++  }
++  const bool same = ids == s_mode_ids && mode == s_rmode && rc.size() == s_rcells.size() &&
++                    std::equal(rc.begin(), rc.end(), s_rcells.begin(), [](const RecCell& a, const RecCell& b) {
++                      return a.row == b.row && a.col == b.col && a.key == b.key;
++                    });
++  if (same)
++    return;
++  RecordsOut("mode change");
++  s_rcells = rc;
++  s_rmode = mode;
++  s_stock_rec.clear();
++  if (!s_rcells.empty())
++    RecordsIn();
++  // ghost / replay card files of this mode: fL<n> / fR<n> (kind names, restored with the other pokes)
++  s_mode_ids = ids;
++  s_dirty = true;
++  // at once (menus): the cup screen and Select Course must already see names / pictures
++  if (RamReady())
++  {
++    Apply();
++    s_dirty = false;
++  }
++}
++
++void HookSaveOut()
++{
++  RecordsOut("save");
++}
++
++void HookSaveLoad()
++{
++  s_rec_in = false;  // the struct now holds the card's (stock) values
++  s_rec_retake = true;
++}
++
++std::string DiscColiSha1(int slot, const std::string& bank)
++{
++  static std::map<std::string, std::string> cache;
++  const std::string disc = ERGhosts::BootDisc();
++  const std::string path = fmt::format("{}/COLI_COURSE{:02}.lz", bank, slot);
++  const std::string k = disc + "|" + path;
++  if (auto it = cache.find(k); it != cache.end())
++    return it->second;
++  std::string sha;
++  if (auto vol = DiscIO::CreateVolume(disc))
++  {
++    const DiscIO::Partition part = vol->GetGamePartition();
++    if (const DiscIO::FileSystem* fs = vol->GetFileSystem(part))
++      if (auto info = fs->FindFileInfo(path); info && info->GetSize() && info->GetSize() <= (64u << 20))
++      {
++        std::vector<u8> buf(info->GetSize());
++        if (DiscIO::ReadFile(*vol, part, info.get(), buf.data(), buf.size()) == buf.size())
++        {
++          const auto d = Common::SHA1::CalculateDigest(buf);
++          sha = Hex(d.data(), d.size());
++        }
++      }
++  }
++  cache[k] = sha;
++  return sha;
++}
++
++void OnFrame(Core::System& system)
++{
++  if (!RamReady())
++    return;
++  const u32 fst = BE32(P(0x80000038, 4)), B = BE32(P(0x800030C8, 4));
++  // records: back in at the end of every frame the game compared / encoded / loaded its save in
++  if (!s_rcells.empty() && !s_rec_in && B == s_rel)
++    RecordsIn();
++  if (++s_frame % 30)
++    return;
++  EnsureHooks(system, B);
++  StockRows(B);
++  static bool s_bgx_hooked = false;
++  if (!s_bgx_hooked)  // ERBackground: a served library track's own bgx folder (none set = the slot index as before)
++  {
++    EmitQuadsSetBgxDirOverride(&BgxDir);
++    s_bgx_hooked = true;
++  }
++  MaybeSync();
++  const std::string path = File::GetUserPath(D_USER_IDX) + "pc5090-tracklib.json";
++  const std::string sig = FileSig(path);
++  if (sig != s_test_sig)
++  {
++    s_test_sig = sig;
++    s_test_text.clear();
++    if (!sig.empty())
++      File::ReadFileToString(path, s_test_text);
++    s_dirty = true;
++  }
++  if (fst != s_fst || B != s_rel)
++  {
++    // a new boot (or the REL moved): the bytes we backed up belong to the old one
++    s_backups.clear();
++    s_orig.clear();
++    s_rcells.clear();
++    s_rmode = -1;
++    s_stock_rec.clear();
++    s_rec_in = false;
++    s_have_rows = false;
++    s_mode_ids.clear();
++    {
++      std::lock_guard lk(s_mtx);
++      s_served.clear();
++      s_slot_info.clear();
++    }
++    s_fst = fst;
++    s_rel = B;
++    s_dirty = !s_mode_ids.empty() || !s_test_text.empty();
++  }
++  bool any;
++  {
++    std::lock_guard lk(s_mtx);
++    any = !s_served.empty();
++  }
++  if (!s_dirty && any && !StillApplied())
++  {
++    std::fprintf(stderr, "ERTRACKLIB: served entries changed under us (savestate load?): re-applying\n");
++    s_dirty = true;
++  }
++  if (!s_dirty)
++    return;
++  s_dirty = false;
++  Apply();
++}
++
++std::string ServedColiSha1(int slot)
++{
++  std::lock_guard lk(s_mtx);
++  auto it = s_slot_info.find(slot);
++  return it == s_slot_info.end() ? std::string() : it->second.coli_sha1;
++}
++
++std::string ServedId(int slot)
++{
++  std::lock_guard lk(s_mtx);
++  auto it = s_slot_info.find(slot);
++  return it == s_slot_info.end() ? std::string() : it->second.id;
++}
++
++std::string BgxDir(int slot)
++{
++  std::lock_guard lk(s_mtx);
++  auto it = s_slot_info.find(slot);
++  return it == s_slot_info.end() ? std::string() : it->second.bgx;
++}
++
++bool Covers(u64 offset, u32 length)
++{
++  if (offset < kBase)
++    return false;
++  std::lock_guard lk(s_mtx);
++  for (const auto& s : s_served)
++    if (offset >= s.off && offset + length <= s.off + s.span)
++      return true;
++  return false;
++}
++
++bool Read(u64 offset, u32 length, u8* out)
++{
++  if (offset < kBase)
++    return false;
++  std::lock_guard lk(s_mtx);
++  for (auto& s : s_served)
++  {
++    if (offset < s.off || offset + length > s.off + s.span)
++      continue;
++    const u64 rel = offset - s.off;
++    std::memset(out, 0, length);
++    if (rel < s.data->size())
++      std::memcpy(out, s.data->data() + rel, std::min<u64>(length, s.data->size() - rel));
++    if (!s.logged)
++    {
++      std::fprintf(stderr, "ERTRACKLIB: serving %s from the host\n", s.disc_path.c_str());
++      s.logged = true;
++    }
++    return true;
++  }
++  return false;
++}
++}  // namespace ERTrackLib
+--- a/Source/Core/Core/HW/DVD/ERTrackLib.h
++++ b/Source/Core/Core/HW/DVD/ERTrackLib.h
+@@ -0,0 +1,49 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Tracks on demand: a course slot's files and table rows come from a host track library instead of the disc.
++#pragma once
++
++#include <string>
++#include <vector>
++
++#include "Common/CommonTypes.h"
++
++namespace Core
++{
++class System;
++}
++
++namespace ERTrackLib
++{
++// User/ERTracks/lib/ (one folder per track: track.json + its files, see ERTrackLib.cpp)
++std::string LibraryDir();
++// carrier course slot of a library track (its track.json "slot"), -1 when the entry is missing / broken
++int LibSlot(const std::string& id);
++// one cup position of the mode picked on SELECT MODE: cup row 1-5, index 0-4, the course slot it holds and the
++// library track served there ("" = the disc's own track in that slot)
++struct Cell
++{
++  int row = 0, col = 0, slot = 0;
++  std::string lib;
++};
++// the mode's cup positions (ERModes mode cups); mode -1 / {} = none. Applied at once (menus only): library tracks'
++// files and table rows, and the records / ghost flags / emblems of every position swap to our own store (keyed by
++// track) while the game's own save file keeps its stock contents (ERTrackLib.cpp "Records").
++void SetMode(int mode, const std::vector<Cell>& cells);
++// HLE hooks (Core/HLE/HLE.cpp): the save struct is about to be compared / encoded for the card, or was just loaded
++void HookSaveOut();
++void HookSaveLoad();
++// sha1 of the booted disc's COLI file of a slot (bank "stage", "stag2" or "stag3"), cached
++std::string DiscColiSha1(int slot, const std::string& bank = "stage");
++// CPU thread, once per frame: User/pc5090-tracklib.json (test / editor tracks), re-apply after a savestate load
++void OnFrame(Core::System& system);
++// sha1 (hex) of the COLI file the game reads for this slot now: the library's when one is served, else ""
++std::string ServedColiSha1(int slot);
++// library track id served in this slot now, else ""
++std::string ServedId(int slot);
++// the served track's bgx sidecar folder for this slot ("" = none: use the slot folder as before)
++std::string BgxDir(int slot);
++// DVD interface / DVD thread
++bool Covers(u64 offset, u32 length);
++bool Read(u64 offset, u32 length, u8* out);
++}  // namespace ERTrackLib
 --- a/Source/Core/Core/HW/PC5090SafeMem.h
 +++ b/Source/Core/Core/HW/PC5090SafeMem.h
 @@ -0,0 +1,63 @@
@@ -20218,7 +21635,7 @@ HcmV?d00001
 +  m_er_ghost_busy = true;
 +  const ERGhosts::Settings s = ERGhosts::Load();
 +  std::thread([this, g = std::move(g), s, dry]() mutable {
-+    const std::string coli = ERGhosts::CourseSha1(g.slot);
++    const std::string coli = g.coli.empty() ? ERGhosts::CourseSha1(g.slot) : g.coli;
 +    ERGhosts::Reply r = ERGhosts::Upload(s, g, coli, dry);
 +    QueueOnObject(this, [this, g = std::move(g), r, dry]() mutable {
 +      m_er_ghost_busy = false;
@@ -22146,7 +23563,7 @@ HcmV?d00001
 +};
 --- a/Source/Core/VideoCommon/ERModes.cpp
 +++ b/Source/Core/VideoCommon/ERModes.cpp
-@@ -0,0 +1,3333 @@
+@@ -0,0 +1,3392 @@
 +// Copyright 2026 Evolution Racing (Evolution Racing Dolphin)
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -22173,6 +23590,7 @@ HcmV?d00001
 +#include <cmath>
 +#include <cstdio>
 +#include <cstring>
++#include <functional>
 +#include <memory>
 +#include <mutex>
 +#include <string>
@@ -22186,6 +23604,7 @@ HcmV?d00001
 +#include "Common/Swap.h"
 +#include "Core/Config/MainSettings.h"
 +#include "Core/ERGhosts.h"
++#include "Core/HW/DVD/ERTrackLib.h"
 +#include "Core/HW/Memmap.h"
 +#include "Core/HW/PC5090SafeMem.h"
 +#include "Core/System.h"
@@ -22368,6 +23787,7 @@ HcmV?d00001
 +{
 +  std::vector<int> ids;  // 5 course ids, or empty
 +  std::string name;      // optional cup name
++  std::vector<std::string> lib;  // per id: the track library id served in that slot ("" = the disc's track)
 +};
 +const char* const kModeKeys[4] = {"normal", "cutoff", "breakaway", "hunted"};
 +struct DiscModes
@@ -22391,15 +23811,36 @@ HcmV?d00001
 +  if (!v.is<picojson::object>())
 +    return;
 +  const auto& o = v.get<picojson::object>();
-+  auto ids_of = [](const picojson::value& e) {
++  // a course is a disc course id or a track library id (string, User/ERTracks/lib/<id>: served in its carrier slot)
++  auto ids_of = [](const picojson::value& e, ModeCup& cup) {
 +    std::vector<int> ids;
++    std::vector<std::string> lib;
 +    if (e.is<picojson::array>())
 +      for (const auto& x : e.get<picojson::array>())
-+        if (x.is<double>() && x.get<double>() >= 1 && x.get<double>() < 64 && ids.size() < 5)
++      {
++        if (ids.size() >= 5)
++          break;
++        if (x.is<double>() && x.get<double>() >= 1 && x.get<double>() < 64)
++        {
 +          ids.push_back(static_cast<int>(x.get<double>()));
++          lib.emplace_back();
++        }
++        else if (x.is<std::string>())
++        {
++          const int slot = ERTrackLib::LibSlot(x.get<std::string>());
++          if (slot < 1)
++            continue;
++          ids.push_back(slot);
++          lib.push_back(x.get<std::string>());
++        }
++      }
 +    while (!ids.empty() && ids.size() < 5)
++    {
 +      ids.push_back(ids.back());
-+    return ids;
++      lib.push_back(lib.back());
++    }
++    cup.ids = ids;
++    cup.lib = lib;
 +  };
 +  for (int m = 0; m < 4; m++)
 +  {
@@ -22414,7 +23855,7 @@ HcmV?d00001
 +    const auto& a = e->get<picojson::array>();
 +    if (a[0].is<double>())
 +    {
-+      out[m][0].ids = ids_of(*e);
++      ids_of(*e, out[m][0]);
 +      continue;
 +    }
 +    for (size_t c = 0; c < a.size() && c < 5; c++)
@@ -22423,12 +23864,12 @@ HcmV?d00001
 +      {
 +        const auto& co = a[c].get<picojson::object>();
 +        if (co.count("courses"))
-+          out[m][c].ids = ids_of(co.at("courses"));
++          ids_of(co.at("courses"), out[m][c]);
 +        if (co.count("name") && co.at("name").is<std::string>())
 +          out[m][c].name = co.at("name").get<std::string>();
 +      }
 +      else
-+        out[m][c].ids = ids_of(a[c]);
++        ids_of(a[c], out[m][c]);
 +    }
 +  }
 +}
@@ -23764,12 +25205,34 @@ HcmV?d00001
 +  static const std::array<ModeCup, 5> none{};
 +  if (mode < 0 || mode > 3)
 +    return none;
++  static u32 s_lib_poll = 0;
++  if (s_mc.cache && s_mc.applied < 0 && (++s_lib_poll % 120) == 0)  // the hub sync or the track swapper changed the cups: re-read (not while shown)
++  {
++    static u64 s_lib_sig = 0;
++    u64 sig2 = 0;
++    for (const char* f : {"ERTracks/modes.json", "pc5090-mode-cups.json"})   // hub sync / the track swapper page
++    {
++      std::string t;
++      sig2 = sig2 * 1000003ull ^ (File::ReadFileToString(File::GetUserPath(D_USER_IDX) + f, t) ? std::hash<std::string>{}(t) + 1 : 0);
++    }
++    if (sig2 != s_lib_sig)
++    {
++      s_lib_sig = sig2;
++      s_mc.cache = false;
++    }
++  }
 +  if (!s_mc.cache)
 +  {
 +    LoadDiscModes();
 +    s_mc.cups = s_disc.mode_cup;
 +    std::string t;
 +    picojson::value v;
++    // the hub's track library cups (ERTrackLib sync: User/ERTracks/modes.json), under the player's own file
++    if (File::ReadFileToString(File::GetUserPath(D_USER_IDX) + "ERTracks/modes.json", t) && picojson::parse(v, t).empty() &&
++        v.is<picojson::object>() && v.get<picojson::object>().count("modeCups"))
++      ParseModeCups(v.get<picojson::object>().at("modeCups"), s_mc.cups);
++    t.clear();
++    v = {};
 +    if (File::ReadFileToString(File::GetUserPath(D_USER_IDX) + "pc5090-mode-cups.json", t) && picojson::parse(v, t).empty() &&
 +        v.is<picojson::object>() && v.get<picojson::object>().count("modeCups"))
 +      ParseModeCups(v.get<picojson::object>().at("modeCups"), s_mc.cups);
@@ -23822,6 +25285,7 @@ HcmV?d00001
 +  if (s_mc.applied >= 0)
 +    std::fprintf(stderr, "ERMODES modecup: %s cups off, regular cups back\n", kModeKeys[s_mc.applied]);
 +  SelRestoreList(s_mc.rows);
++  ERTrackLib::SetMode(-1, {});  // library tracks + the mode's own records go with the mode's cups
 +  s_mc.applied = -1;
 +  s_mc.row_set = false;
 +}
@@ -23880,8 +25344,20 @@ HcmV?d00001
 +    for (u32 cp = 0; cp < 3; cp++)
 +      SelPatch(s_mc.rows, B + kCupTable + cp * 132 + 12u * static_cast<u32>(c + 1), row, sizeof(row));
 +  }
++  std::vector<ERTrackLib::Cell> cells;
++  size_t nlib = 0;
++  for (int c = 0; c < 5; c++)
++    if (cups[c].ids.size() == 5)
++      for (int k = 0; k < 5; k++)
++      {
++        const std::string lib = k < static_cast<int>(cups[c].lib.size()) ? cups[c].lib[k] : std::string();
++        nlib += !lib.empty();
++        cells.push_back({c + 1, k, cups[c].ids[k], lib});
++      }
++  // tracks on demand: library files + table rows, every position's records from our store, before the cup screen
++  ERTrackLib::SetMode(mode, cells);
 +  s_mc.applied = mode;
-+  std::fprintf(stderr, "ERMODES modecup: %s cups on\n", kModeKeys[mode]);
++  std::fprintf(stderr, "ERMODES modecup: %s cups on (%zu library tracks)\n", kModeKeys[mode], nlib);
 +}
 +// every pad poll: outside the cup screen
 +void McOutside(int mo, int sub, int gtype)
