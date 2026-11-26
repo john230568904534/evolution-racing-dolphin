@@ -15131,7 +15131,7 @@ HcmV?d00001
  
 +// Evolution Racing member build id (one id for the Linux and the Windows build of the same source)
 +#ifndef ER_BUILD_ID
-+#define ER_BUILD_ID "lit17s43ermbtghl"
++#define ER_BUILD_ID "lit17s43ermbtghlp"
 +#endif
 +const std::string& GetERBuildStr()
 +{
@@ -15141,7 +15141,7 @@ HcmV?d00001
 +
 +// Evolution Racing X.Y (hub/server/versions.json; lighting_mod/updater/apply_version.py sets it)
 +#ifndef ER_VERSION
-+#define ER_VERSION "1.7.7"
++#define ER_VERSION "1.7.8"
 +#endif
 +// "ER_VERSION=1.3" stays in the binary (not const, read below): scripts/dolphinpack.py / winpack.py look for it
 +extern char er_version_marker[];
@@ -20548,7 +20548,7 @@ HcmV?d00001
  }  // namespace DVD
 --- a/Source/Core/Core/HW/DVD/ERTrackLib.cpp
 +++ b/Source/Core/Core/HW/DVD/ERTrackLib.cpp
-@@ -0,0 +1,1409 @@
+@@ -0,0 +1,1468 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +// Tracks on demand (route 4, 2026-11-24).
@@ -21455,9 +21455,33 @@ HcmV?d00001
 +  File::CreateFullPath(lib);
 +  int fetched = 0, kept = 0, failed = 0, dropped = 0;
 +  std::set<std::string> hub_ids;
++  // 1.7.8 private Test in game: this member's own tracks (GET private: only theirs, files under pfile/); an older hub
++  // answers 404 and nothing changes
++  struct Item
++  {
++    std::string id, pfx;
++    picojson::value tv;
++  };
++  std::vector<Item> items;
 +  if (o.count("tracks") && o.at("tracks").is<picojson::object>())
 +    for (const auto& [id, tv] : o.at("tracks").get<picojson::object>())
++      items.push_back({id, "file/", tv});
++  picojson::value pv;
++  bool have_private = false;
++  if (auto pr = req.Get(base + "private", h, Common::HttpRequest::AllowedReturnCodes::All);
++      pr && req.GetLastResponseCode() == 200 && picojson::parse(pv, std::string(pr->begin(), pr->end())).empty() &&
++      pv.is<picojson::object>())
++  {
++    have_private = true;
++    const auto& po = pv.get<picojson::object>();
++    if (po.count("tracks") && po.at("tracks").is<picojson::object>())
++      for (const auto& [id, tv] : po.at("tracks").get<picojson::object>())
++        items.push_back({id, "pfile/", tv});
++  }
++  for (const auto& it : items)
 +    {
++      const std::string& id = it.id;
++      const picojson::value& tv = it.tv;
 +      if (id.empty() || id.size() > 64 || !SafeRel(id) || id.find('/') != std::string::npos || !tv.is<picojson::object>() ||
 +          !tv.get<picojson::object>().count("files") || !tv.get<picojson::object>().at("files").is<picojson::object>())
 +        continue;
@@ -21508,7 +21532,7 @@ HcmV?d00001
 +          File::WriteStringToFile(part + rel, b);
 +          continue;
 +        }
-+        auto fr = req.Get(base + "file/" + id + "/" + rel, h, Common::HttpRequest::AllowedReturnCodes::All);
++        auto fr = req.Get(base + it.pfx + id + "/" + rel, h, Common::HttpRequest::AllowedReturnCodes::All);
 +        if (!fr || req.GetLastResponseCode() != 200 || fr->size() > kSpan * 4 ||
 +            Sha1Hex(std::string(fr->begin(), fr->end())) != want)
 +        {
@@ -21544,6 +21568,20 @@ HcmV?d00001
 +          File::Copy(lib + id + "/" + rel, hd + rel.substr(3));
 +        }
 +    }
++  if (!have_private)  // the private list did not come this time (network, an older hub): keep the last MY TESTS tracks
++  {
++    std::string t;
++    picojson::value pj;
++    if (File::ReadFileToString(File::GetUserPath(D_USER_IDX) + "ERTracks/private.json", t) && picojson::parse(pj, t).empty() &&
++        pj.is<picojson::object>() && pj.get<picojson::object>().count("cup") && pj.get<picojson::object>().at("cup").is<picojson::object>())
++    {
++      const auto& c = pj.get<picojson::object>().at("cup").get<picojson::object>();
++      if (c.count("courses") && c.at("courses").is<picojson::array>())
++        for (const auto& x : c.at("courses").get<picojson::array>())
++          if (x.is<std::string>())
++            hub_ids.insert(x.get<std::string>());
++    }
++  }
 +  // entries a sync brought that the hub no longer has
 +  for (const auto& e : File::ScanDirectoryTree(lib, false).children)
 +    if (e.isDirectory && !hub_ids.count(e.virtualName) && File::Exists(e.physicalName + "/.hub"))
@@ -21565,6 +21603,27 @@ HcmV?d00001
 +      File::WriteStringToFile(mp + ".tmp", now);
 +      File::Rename(mp + ".tmp", mp);
 +    }
++  }
++  if (have_private)  // ERModes reads it: the MY TESTS cup of Practice (Normal)
++  {
++    const auto& po = pv.get<picojson::object>();
++    picojson::object pj;
++    pj["cup"] = po.count("cup") ? po.at("cup") : picojson::value(picojson::object());
++    pj["pending"] = po.count("pending") ? po.at("pending") : picojson::value(picojson::array());
++    const std::string pp = File::GetUserPath(D_USER_IDX) + "ERTracks/private.json";
++    std::string old;
++    const std::string now = picojson::value(pj).serialize(true);
++    if (!File::ReadFileToString(pp, old) || old != now)
++    {
++      File::WriteStringToFile(pp + ".tmp", now);
++      File::Rename(pp + ".tmp", pp);
++    }
++    std::fprintf(stderr, "ERTRACKLIB sync: private %zu tracks in MY TESTS, %zu building\n",
++                 pj["cup"].is<picojson::object>() && pj["cup"].get<picojson::object>().count("courses") &&
++                         pj["cup"].get<picojson::object>().at("courses").is<picojson::array>() ?
++                     pj["cup"].get<picojson::object>().at("courses").get<picojson::array>().size() :
++                     size_t{0},
++                 pj["pending"].is<picojson::array>() ? pj["pending"].get<picojson::array>().size() : size_t{0});
 +  }
 +  std::fprintf(stderr, "ERTRACKLIB sync: %d fetched, %d up to date, %d failed, %d dropped\n", fetched, kept, failed, dropped);
 +  SendPendingRuns(req, hub, h);
@@ -24340,7 +24399,7 @@ HcmV?d00001
 +};
 --- a/Source/Core/VideoCommon/ERModes.cpp
 +++ b/Source/Core/VideoCommon/ERModes.cpp
-@@ -0,0 +1,4439 @@
+@@ -0,0 +1,4468 @@
 +// Copyright 2026 Evolution Racing (Evolution Racing Dolphin)
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -26682,6 +26741,8 @@ HcmV?d00001
 +  int cur_row = 1, cur_idx = 0;
 +  bool saved = true;
 +  bool row_set = false;
++  ModeCup priv;                  // 1.7.8: MY TESTS (ERTracks/private.json, the member's own tracks), cup 1 of Practice Normal
++  std::array<ModeCup, 5> pn{};   // Practice Normal's cups with it
 +} s_mc;
 +constexpr u32 kCupTable = 0x167940;
 +std::string McCourseFile()
@@ -26699,7 +26760,7 @@ HcmV?d00001
 +  {
 +    static u64 s_lib_sig = 0;
 +    u64 sig2 = 0;
-+    for (const char* f : {"ERTracks/modes.json", "pc5090-mode-cups.json"})   // hub sync / the track swapper page
++    for (const char* f : {"ERTracks/modes.json", "pc5090-mode-cups.json", "ERTracks/private.json"})   // hub sync / the track swapper page
 +    {
 +      std::string t;
 +      sig2 = sig2 * 1000003ull ^ (File::ReadFileToString(File::GetUserPath(D_USER_IDX) + f, t) ? std::hash<std::string>{}(t) + 1 : 0);
@@ -26725,6 +26786,27 @@ HcmV?d00001
 +    if (File::ReadFileToString(File::GetUserPath(D_USER_IDX) + "pc5090-mode-cups.json", t) && picojson::parse(v, t).empty() &&
 +        v.is<picojson::object>() && v.get<picojson::object>().count("modeCups"))
 +      ParseModeCups(v.get<picojson::object>().at("modeCups"), s_mc.cups);
++    // 1.7.8 private Test in game: {"cup": {"name": "MY TESTS", "courses": [library ids]}} from the hub sync
++    s_mc.priv = {};
++    t.clear();
++    v = {};
++    if (File::ReadFileToString(File::GetUserPath(D_USER_IDX) + "ERTracks/private.json", t) && picojson::parse(v, t).empty() &&
++        v.is<picojson::object>() && v.get<picojson::object>().count("cup") && v.get<picojson::object>().at("cup").is<picojson::object>())
++    {
++      picojson::object mo, nm;
++      picojson::array cups;
++      cups.push_back(v.get<picojson::object>().at("cup"));
++      nm["cups"] = picojson::value(cups);
++      mo["normal"] = picojson::value(nm);
++      std::array<std::array<ModeCup, 5>, 4> tmp{};
++      ParseModeCups(picojson::value(mo), tmp);
++      s_mc.priv = tmp[0][0];
++      if (s_mc.priv.name.empty())
++        s_mc.priv.name = "MY TESTS";
++      if (s_mc.priv.ids.size() == 5)
++        std::fprintf(stderr, "ERMODES modecup practice MY TESTS: %d %d %d %d %d (%s)\n", s_mc.priv.ids[0], s_mc.priv.ids[1],
++                     s_mc.priv.ids[2], s_mc.priv.ids[3], s_mc.priv.ids[4], s_mc.priv.lib[0].c_str());
++    }
 +    s_mc.cache = true;
 +    for (int m = 0; m < 4; m++)
 +      for (int c = 0; c < 5; c++)
@@ -26732,6 +26814,12 @@ HcmV?d00001
 +          std::fprintf(stderr, "ERMODES modecup %s cup %d \"%s\": %d %d %d %d %d\n", kModeKeys[m], c + 1, s_mc.cups[m][c].name.c_str(),
 +                       s_mc.cups[m][c].ids[0], s_mc.cups[m][c].ids[1], s_mc.cups[m][c].ids[2], s_mc.cups[m][c].ids[3],
 +                       s_mc.cups[m][c].ids[4]);
++  }
++  if (mode == 0 && s_pick_practice.load() && s_mc.priv.ids.size() == 5)  // Practice Normal: MY TESTS is cup 1
++  {
++    s_mc.pn = s_mc.cups[0];
++    s_mc.pn[0] = s_mc.priv;
++    return s_mc.pn;
 +  }
 +  return s_mc.cups[mode];
 +}
