@@ -15131,7 +15131,7 @@ HcmV?d00001
  
 +// Evolution Racing member build id (one id for the Linux and the Windows build of the same source)
 +#ifndef ER_BUILD_ID
-+#define ER_BUILD_ID "lit17s43ermbtg"
++#define ER_BUILD_ID "lit17s43ermbtgh"
 +#endif
 +const std::string& GetERBuildStr()
 +{
@@ -15141,7 +15141,7 @@ HcmV?d00001
 +
 +// Evolution Racing X.Y (hub/server/versions.json; lighting_mod/updater/apply_version.py sets it)
 +#ifndef ER_VERSION
-+#define ER_VERSION "1.7.5"
++#define ER_VERSION "1.7.6"
 +#endif
 +// "ER_VERSION=1.3" stays in the binary (not const, read below): scripts/dolphinpack.py / winpack.py look for it
 +extern char er_version_marker[];
@@ -22470,7 +22470,7 @@ HcmV?d00001
 +}
 --- a/Source/Core/DolphinQt/ERUpdatesUI.cpp
 +++ b/Source/Core/DolphinQt/ERUpdatesUI.cpp
-@@ -0,0 +1,935 @@
+@@ -0,0 +1,955 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -23291,6 +23291,26 @@ HcmV?d00001
 +    connect(b, &QRadioButton::toggled, dlg, [key](bool on) { if (on) ERModes::SetSetting(key); });
 +  }
 +  lay->addWidget(rm);
++
++  // lit17s45mh: Hunted level (GFX.ini [PC5090] HuntedLevel; empty = the disc's level)
++  auto* hl = new QGroupBox(tr("Hunted level"));
++  auto* hll = new QVBoxLayout(hl);
++  const RmOpt hl_opts[] = {
++      {"", tr("As the disc says (Normal when the disc has none)")},
++      {"Calm", tr("Calm - few attacks, light hits")},
++      {"Normal", tr("Normal")},
++      {"Fierce", tr("Fierce - more attacks, harder hits")},
++      {"Mayhem", tr("Mayhem - every machine chases its target down and fights")}};
++  const std::string hl_cur = ERModes::GetHuntedLevel();
++  for (const auto& o : hl_opts)
++  {
++    auto* b = new QRadioButton(o.text);
++    b->setChecked(QString::fromStdString(hl_cur).compare(QString::fromLatin1(o.key), Qt::CaseInsensitive) == 0);
++    hll->addWidget(b);
++    const std::string key = o.key;
++    connect(b, &QRadioButton::toggled, dlg, [key](bool on) { if (on) ERModes::SetHuntedLevel(key); });
++  }
++  lay->addWidget(hl);
 +
 +  // Evolution Racing 1.7: threat HUD (GFX.ini [PC5090] ThreatHUD / ThreatUnits, read live) and the 360 orbit camera
 +  auto* rv = new QGroupBox(tr("Race view"));
@@ -24132,7 +24152,7 @@ HcmV?d00001
 +};
 --- a/Source/Core/VideoCommon/ERModes.cpp
 +++ b/Source/Core/VideoCommon/ERModes.cpp
-@@ -0,0 +1,3392 @@
+@@ -0,0 +1,4189 @@
 +// Copyright 2026 Evolution Racing (Evolution Racing Dolphin)
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -24218,13 +24238,16 @@ HcmV?d00001
 +constexpr float kCutWarnS = 10.0f;  // countdown length (s)
 +// Breakaway
 +constexpr float kCrownMinKmh = 350.0f;  // no points below this (stopping / blocking earns nothing)
-+constexpr float kCrownFull = 5.0f;      // s a new reign scores in full
-+constexpr float kCrownFade = 15.0f;     // s over which the reign's score fades to nothing; the racer in 2nd earns the rest
-+constexpr float kTakeBonus = 40.0f;     // points for taking the crown (not for retaking it within kRetakeS)
-+constexpr float kRetakeS = 10.0f;
-+constexpr float kRoundCap = 150.0f;     // most points one racer can earn in one round
-+constexpr int kRounds = 5;
-+constexpr int kRoundBonus = 25;
++// lit17s45mh scoring: the crown holder earns kCrownPts points per second of emulated race time while it is eligible
++// (alive, not finished, >= kCrownMinKmh, moving forward along the course), from GO until the FIRST finisher. No fade, no
++// share for 2nd, no caps, no rounds. Kept in frames (ints): 1 point = 6 frames held, so the score is exact.
++constexpr int kCrownFramesPerPt = 6;    // 10 points a second
++constexpr int kTakeBonusFrames = 120;   // a confirmed takeover = 2 s of holding (20 points)
++constexpr float kRetakeS = 10.0f;       // one racer earns at most one takeover bonus per 10 s
++constexpr float kPairS = 20.0f;         // no bonus for taking it back from the racer who took it from you within 20 s
++constexpr float kMaxStepM = 80.0f;      // more race distance than this in one frame = a progress jump, not driving
++constexpr int kJumpBlock = 60;
++constexpr int kTakeGrace = 300;         // no takeover bonus in the first 5 s after GO (the start scramble is not a takeover)          // no takeover bonus for 1 s after a progress jump
 +constexpr int kCrownHold = 18;  // frames in first before the crown moves (no flicker on a side-by-side)
 +// Hunted = a food chain: every racer has one target ahead and one hunter behind
 +struct HuntLevel
@@ -24240,14 +24263,28 @@ HcmV?d00001
 +  int min_field;     // no takedowns once this few racers are left
 +  float refill;      // share of max energy a takedown gives back
 +};
-+constexpr HuntLevel kHunt[3] = {{"Calm", 1.0f, 480, 12.0f, 8.0f, 0.04f, 0.02f, 0.10f, 26, 0.15f},
++// Mayhem (lit17s45mh): the same chain, but every CPU really pursues its target (TickPursuit). rate / cooldown / reach
++// are not used by the pursuit; the strike window and pace live in the kPu* constants below
++constexpr int kHuntLevels = 4;
++constexpr HuntLevel kHunt[kHuntLevels] = {{"Calm", 1.0f, 480, 12.0f, 8.0f, 0.04f, 0.02f, 0.10f, 26, 0.15f},
 +                                {"Normal", 3.5f, 220, 18.0f, 11.0f, 0.14f, 0.06f, 0.24f, 20, 0.25f},
-+                                {"Fierce", 7.0f, 110, 30.0f, 15.0f, 0.28f, 0.13f, 0.42f, 14, 0.35f}};
-+constexpr float kHuntFinish[3] = {0.02f, 0.18f, 0.28f};  // a prey hit that leaves less than this share of max energy is the takedown
++                                {"Fierce", 7.0f, 110, 30.0f, 15.0f, 0.28f, 0.13f, 0.42f, 14, 0.35f},
++                                {"Mayhem", 0.0f, 150, 22.0f, 7.0f, 0.24f, 0.10f, 0.38f, 8, 0.30f}};  // Mayhem: 8 = a safety floor only (the race ends at the 10th takedown)
++constexpr int kMayhem = 3;
++constexpr float kHuntFinish[kHuntLevels] = {0.02f, 0.18f, 0.28f, 0.24f};
++// the same line when the human player is the prey (Mayhem: he must really be low, not one-shot from 40 %)
++constexpr float kHuntFinishPl[kHuntLevels] = {0.02f, 0.18f, 0.28f, 0.10f};  // a prey hit that leaves less than this share of max energy is the takedown
 +constexpr int kHuntWindow = 300;      // the cap's window (frames)
 +constexpr int kHuntHitGap = 120;      // one racer deals its hit at most this often
 +constexpr float kHuntFloor = 1.0f;    // a hit never takes the last energy itself: the NEXT hit is the takedown
-+constexpr int kHuntKoPoints = 10;     // Hunted result points for one takedown (hard at speed: worth far more than a place)
++constexpr int kHuntKoPoints = 10;     // Hunted result points for one CONFIRMED takedown
++// Hunted place points (owner 2026-11-26): per lap, the time-weighted mean of (field - 1 - place) / (field - 1) over that lap x
++// the lap's share of kHuntPlaceBudget (budget / laps); no line-crossing bonus; a lap cut short (race end, taken out) counts
++// pro-rata. Budget 48 vs 10 a takedown, tuned on 8 measured Mayhem races (fzgx-mayhem/sim): a front runner with 1-3
++// takedowns beats both a passive leader (0 takedowns, ~35-42) and a back-marker farming takedowns (~13-49) in every one.
++constexpr float kHuntPlaceBudget = 48.0f;
++constexpr int kHuLaps = 9;            // laps tracked per racer (Practice can set up to 9)
++constexpr int kMayhemEndKos = 10;     // Mayhem: the race ends at this many confirmed takedowns (falls / energy KOs do not count)
 +constexpr float kChainPick = 350.0f;  // a target can be this far ahead
 +constexpr float kChainDrop = 450.0f;  // a target further ahead than this is let go
 +constexpr float kChainPassed = -15.0f;  // a target that fell this far behind its hunter is let go
@@ -24257,12 +24294,40 @@ HcmV?d00001
 +constexpr float kChainPassedPlayer = -150.0f;  // the human player keeps his target until it is this far behind him
 +constexpr float kChainPassedOnPlayer = -75.0f;  // a CPU hunting the player stays on him until this far past him
 +// the racer hunting the human player only (Calm, Normal, Fierce): more attempts, the damage and the 5 s cap stay as they are
-+constexpr float kHuntPlRate[3] = {1.25f, 1.25f, 1.5f};    // attack chance
-+constexpr float kHuntPlBeside[3] = {1.6f, 1.6f, 3.0f};   // ... on top of that while it is right alongside him
-+constexpr float kHuntPlCool[3] = {0.85f, 0.85f, 0.7f};    // cooldown
-+constexpr float kHuntPlReach[3] = {1.15f, 1.15f, 1.3f};   // reach behind and beside
++constexpr float kHuntPlRate[kHuntLevels] = {1.25f, 1.25f, 1.5f, 1.0f};    // attack chance
++constexpr float kHuntPlBeside[kHuntLevels] = {1.6f, 1.6f, 3.0f, 1.0f};   // ... on top of that while it is right alongside him
++constexpr float kHuntPlCool[kHuntLevels] = {0.85f, 0.85f, 0.7f, 1.0f};    // cooldown
++constexpr float kHuntPlReach[kHuntLevels] = {1.15f, 1.15f, 1.3f, 1.0f};   // reach behind and beside
 +constexpr float kHuntPlPast = -14.0f;                    // it may still strike this far past him (others -8)
 +constexpr int kChainHold = 480;             // frames a new target is kept (the HUD's mark must not flicker between racers)
++// Mayhem pursuit (TickPursuit): close -> line up -> strike -> recover, through the game's own AI state (AI record):
++// mode 5 holds a lateral target with no attack request, mode 6 is the game's attack (it requests the attack every frame,
++// so it is only written once the target is beside), AI flag bit 15 = throttle x1.1 and bit 21 = boost x1.5 (the game's
++// own pilot traits, read every frame and never rewritten by the game)
++constexpr float kPuRange = 320.0f;     // a target this far ahead (race distance) is chased (pace + boost)
++constexpr float kPuLineUp = 70.0f;     // ... and from this close its line is taken (mode 5 + its lateral)
++constexpr float kPuBehind = -6.0f;     // line-up holds until the target is this far behind
++constexpr float kPuStrikeBack = 10.0f; // strike: target at most this far ahead ...
++constexpr float kPuStrikePast = -1.0f; // ... or level (the game's attack brakes when its rival is behind)
++constexpr float kPuStrikeSide = 4.5f;  // ... and within this many metres to the side (the game's own rule is 10 m)
++constexpr int kPuStrikeFrames = 45;    // mode-6 time a strike gets
++constexpr int kPuRecover = 100;        // frames after a strike with no pursuit writes (the game's own driving settles)
++constexpr int kPuRecoverMiss = 60;     // ... after a strike that did not connect
++constexpr u16 kPuMaxAngle = 0x1400;    // heading off the track tangent above this (about 28 deg): no line-up steering
++constexpr float kPuLatMax = 0.40f;     // line-up target clamp on open road (share of the road width from the centre)
++constexpr u32 kAiThrottleUp = 0x8000u, kAiBoostUp = 0x200000u;
++// the pursuit pace: a chaser well behind its target uses the game's own boost (AI flag bit 31 = boost request, which the
++// game's CPU code only ever sets; the next frame turns it into the machine's boost). It costs energy as any boost does.
++// (A push on the velocity was tried first: the game re-derives its speed every frame, +0.4 %/frame gained ~15 km/h.)
++constexpr float kPuBoostGap = 55.0f;     // m: boost only when the target is further ahead than this
++constexpr int kPuBoostEvery = 150;       // frames between one chaser's boosts
++constexpr int kPuBoostEveryFar = 90;     // ... while the target is further ahead than kPuBoostFar
++constexpr float kPuBoostFar = 150.0f;
++constexpr float kPuBoostMinE = 0.40f;    // never below this share of max energy
++constexpr float kPuBoostDv = 120.0f;     // km/h: no boost while already this much quicker than the target
++// Mayhem's takedowns are spread over the race: by the leader's share p of the race distance at most
++// kMayhemKoBase + kMayhemKoSpan * p / kMayhemKoBy chain takedowns so far (a limit, never a quota: nothing is forced)
++constexpr float kMayhemKoBase = 2.0f, kMayhemKoSpan = 8.0f, kMayhemKoBy = 0.8f;
 +
 +Memory::MemoryManager* s_mem = nullptr;
 +
@@ -24348,6 +24413,8 @@ HcmV?d00001
 +    return 2;
 +  if (v == "normal")
 +    return 1;
++  if (v == "mayhem")
++    return kMayhem;
 +  return -1;
 +}
 +
@@ -24558,8 +24625,8 @@ HcmV?d00001
 +  // Breakaway
 +  int crown = -1;
 +  std::array<float, kMax> score{};
-+  std::array<u8, kMax> rounds{};
-+  int round = 0;
++  std::array<s8, kMax> ba_order{};
++  bool ba_retired_pl = false;
 +  bool scoring_over = false;
 +  int winner = -1;
 +  // Hunted
@@ -24567,6 +24634,15 @@ HcmV?d00001
 +  int ch_points = -1;  // the player's result (finishing position + kHuntKoPoints per takedown), once finished
 +  float ch_target_gap = 0.0f, ch_hunter_gap = 0.0f;
 +  bool ch_danger = false;
++  bool ch_vulnerable = false;  // the next landed hit from his hunter takes the player out
++  bool hu_done = false;
++  std::array<s8, kMax> hu_order{};
++  std::array<int, kMax> hu_pts{};
++  int hu_live = 0;      // the player's points so far (place points + takedowns), live
++  int hu_lap_pos = -1;  // the player's mean place this lap (1-based), live
++  int hu_nlaps = 0;     // the player's laps with place points (result panel)
++  std::array<int, kHuLaps> hu_laps{};
++  int hu_over_frame = -1;  // Mayhem: race frame of the 10th takedown (race over)
 +  int ch_kos = 0;
 +  int hunt_level = 1;
 +  int hunt_result = 0;  // 1 escaped, 2 caught
@@ -24605,10 +24681,19 @@ HcmV?d00001
 +  int cut_deadline = -1;  // race frame of the announced cut
 +  // breakaway
 +  int crown = -1, crown_cand = -1, crown_cand_n = 0;
-+  std::array<float, kMax> score{}, round_score{};
++  std::array<float, kMax> score{};  // points (held + bonus frames / kCrownFramesPerPt), for the HUD
++  std::array<int, kMax> ba_held{}, ba_bonus{};  // frames held while eligible, bonus frames
++  std::array<int, kMax> ba_takes{};             // bonuses awarded
 +  std::array<float, kMax> last_dist{};
-+  std::array<u8, kMax> rounds{};
-+  int round = 0;
++  std::array<int, kMax> ba_jump = [] { std::array<int, kMax> a; a.fill(-100000); return a; }();  // frame of the last progress jump
++  std::array<s8, kMax> ba_lost_to = [] { std::array<s8, kMax> a; a.fill(-1); return a; }();      // who took the crown from it last
++  std::array<int, kMax> ba_lost_at = [] { std::array<int, kMax> a; a.fill(-100000); return a; }();
++  std::array<bool, kMax> ba_eligible{};  // eligible this frame (alive, moving, fast enough)
++  std::array<s8, kMax> ba_order = [] { std::array<s8, kMax> a; a.fill(-1); return a; }();  // final standings
++  int ba_awarded = 0, ba_rejected = 0;
++  std::array<int, kMax> ba_cup0{};  // Grand Prix cup points before this race (-1 = not read)
++  bool ba_cup_read = false;
++  int ba_cup_state = 0;  // 0 waiting for the game's points, 1 rewritten, 2 gave up / not a cup race
 +  bool scoring_over = false;
 +  int winner = -1;
 +  // hunted: the food chain
@@ -24627,8 +24712,8 @@ HcmV?d00001
 +  int ch_attacks = 0, ch_spins = 0, ch_landed = 0, ch_capped = 0, ch_takedowns = 0, ch_frames = 0, ch_with_target = 0;
 +  float ch_player_taken = 0.0f, ch_min_e = 1000.0f;
 +  bool ch_logged = false;
++  bool ch_vulnerable = false;
 +  int crown_since = 0;
-+  std::array<int, kMax> round_full = [] { std::array<int, kMax> a; a.fill(-1); return a; }();
 +  std::array<int, kMax> last_take = [] { std::array<int, kMax> a; a.fill(-100000); return a; }();
 +  bool pending = false;
 +  int pre = 0;  // in-race frames before GO
@@ -24642,6 +24727,43 @@ HcmV?d00001
 +  int ch_points = -1;
 +  u8 hit_prev = 0;
 +  u32 rng = 0x5090u;
++  // mayhem pursuit (per racer): phase 0 idle 1 close 2 line up 3 strike 4 recover
++  std::array<u8, kMax> pu_phase{};
++  std::array<int, kMax> pu_until{}, pu_strike_at{};
++  std::array<u8, kMax> pu_started{}, pu_connected{};
++  std::array<u32, kMax> pu_orig{};
++  std::array<u8, kMax> pu_have_orig{};
++  std::array<float, kMax> pu_kmh_at{};
++  std::array<int, kMax> pu_boost_at = [] { std::array<int, kMax> a; a.fill(-100000); return a; }();
++  int pu_boosts = 0;
++  std::array<u8, kMax> pu_ko_seen{}, pu_fell_seen{};
++  std::array<int, kMax> pu_close_f{};  // frame the current chase began
++  int ch_assigns = 0;  // targets handed out by the chain
++  // Hunted standings (place points + kHuntKoPoints per confirmed takedown), fixed when the player's race ends
++  bool hu_done = false;
++  std::array<s8, kMax> hu_order = [] { std::array<s8, kMax> a; a.fill(-1); return a; }();
++  std::array<int, kMax> hu_pts{};
++  // Hunted place points per racer: running sum of the place value (0..1) x frames and the frames, for the lap it is in
++  std::array<double, kMax> hu_sum{};
++  std::array<int, kMax> hu_n{}, hu_lap{};
++  std::array<std::array<float, kHuLaps>, kMax> hu_lap_pts{};  // closed laps (and the cut-short one once stopped)
++  std::array<float, kMax> hu_frac{};                          // share of the current lap driven
++  std::array<float, kMax> hu_part{};                          // the current lap's points so far (pro-rata)
++  std::array<u8, kMax> hu_stop{};                             // 1 = no more place points (out / finished / race over)
++  std::array<float, kMax> hu_place{};                         // place points (for the result panel)
++  u32 hu_prev = 0;
++  bool hu_over = false;  // Mayhem: the 10th confirmed takedown ended the race
++  int hu_over_frame = -1;
++  std::array<s8, kMax> hu_fin = [] { std::array<s8, kMax> a; a.fill(-1); return a; }();  // finishing order at that moment
++  std::array<u8, kMax> hu_frank{};
++  int hu_fin_lap = 0;  // the leader's lap counter at that moment  // the game's place (rank byte) of each racer at that moment
++  int hu_fin_n = 0, hu_fin_next = 0;
++  int pu_close_n = 0, pu_line_n = 0, pu_strikes = 0, pu_strikes_pl = 0, pu_started_n = 0, pu_connect_n = 0, pu_connect_pl = 0;
++  int pu_reach_n = 0, pu_abandon_route = 0, pu_abandon_unsafe = 0, pu_energy_kos = 0, pu_falls = 0, pu_incoming_max = 0;
++  int pu_reach_frames = 0, pu_reach_count = 0;
++  float pu_loss_sum = 0.0f;
++  int pu_loss_n = 0;
++  int pu_hunter_frames = 0, pu_hunter_near = 0;  // frames the player has a CPU hunter / ... within 30 m of him
 +};
 +Race s_race;
 +int s_prev_sub = -1;
@@ -24874,118 +24996,238 @@ HcmV?d00001
 +    AddFlash("FINAL", -1, 3, 150);
 +}
 +
-+void TickBreakaway(std::array<RacerView, kMax>& v, int leader)
++void BaFinish(std::array<RacerView, kMax>& v)
 +{
-+  if (s_race.scoring_over)
++  // standings: racers still in (racing or finished) by points, then finishing position / race position; retired racers
++  // keep their points but rank below everyone still in
++  const int n = s_race.count;
++  std::array<int, kMax> o{};
++  for (int i = 0; i < n; i++)
++    o[i] = i;
++  const auto in = [&](int i) { return v[i].alive || v[i].finished; };
++  std::sort(o.begin(), o.begin() + n, [&](int a, int b) {
++    if (in(a) != in(b))
++      return in(a);
++    const int pa = s_race.ba_held[a] + s_race.ba_bonus[a], pb = s_race.ba_held[b] + s_race.ba_bonus[b];
++    if (pa != pb)
++      return pa > pb;
++    if (v[a].finished != v[b].finished)
++      return v[a].finished;
++    return v[a].rank < v[b].rank;
++  });
++  for (int k = 0; k < n; k++)
++    s_race.ba_order[k] = static_cast<s8>(o[k]);
++  s_race.winner = n > 0 && in(o[0]) ? o[0] : -1;
++  const int best = s_race.winner;
++  std::fprintf(stderr, "ERMODES breakaway over at %.1f s: winner %d with %.1f points%s; takeover bonuses %d awarded, %d rejected\n",
++               s_race.frames / 60.0f, best, best >= 0 ? s_race.score[best] : 0.0f, best == s_race.player ? " = PLAYER" : "",
++               s_race.ba_awarded, s_race.ba_rejected);
++  for (int k = 0; k < n; k++)
++  {
++    const int j = o[k];
++    if (s_race.ba_held[j] + s_race.ba_bonus[j] > 0 || j == s_race.player)
++      std::fprintf(stderr, "ERMODES breakaway place %d racer %d%s: %.1f points (held %.1f s, %d takeovers = %.1f), %s, race pos %d\n",
++                   k + 1, j, j == s_race.player ? " (player)" : "", s_race.score[j], s_race.ba_held[j] / 60.0f,
++                   s_race.ba_takes[j], s_race.ba_bonus[j] / static_cast<float>(kCrownFramesPerPt),
++                   v[j].finished ? "finished" : in(j) ? "racing" : "retired", v[j].rank + 1);
++  }
++  if (best >= 0 && best == s_race.player)
++    s_race.big = 2;
++  else if (best >= 0)
++    AddFlash("{n} WINS", best, 3, 300);
++}
++
++void BaTake(std::array<RacerView, kMax>& v, int from, int to, const char* why_none)
++{
++  const int f = static_cast<int>(s_race.frames);
++  const char* why = why_none;
++  if (!why)
++  {
++    if (f < kTakeGrace)
++      why = "start scramble";
++    else if (!s_race.ba_eligible[from])
++      why = "holder not eligible";
++    else if (!s_race.ba_eligible[to])
++      why = "taker not eligible";
++    else if (f - s_race.ba_jump[to] < kJumpBlock || f - s_race.ba_jump[from] < kJumpBlock)
++      why = "progress jump";
++    else if (f - s_race.last_take[to] < static_cast<int>(kRetakeS * 60.0f))
++      why = "reclaim cooldown";
++    else if (s_race.ba_lost_to[to] == from && f - s_race.ba_lost_at[to] < static_cast<int>(kPairS * 60.0f))
++      why = "swap back with the same racer";
++  }
++  if (!why)
++  {
++    s_race.ba_bonus[to] += kTakeBonusFrames;
++    s_race.ba_takes[to]++;
++    s_race.last_take[to] = f;
++    s_race.ba_awarded++;
++    if (to == s_race.player)
++      AddFlash("CROWN TAKEN +" + std::to_string(kTakeBonusFrames / kCrownFramesPerPt), -1, 3, 120);
++  }
++  else
++  {
++    if (from >= 0 && std::strcmp(why, "initial") != 0)
++      s_race.ba_rejected++;
++    if (to == s_race.player && from >= 0)
++      AddFlash("CROWN TAKEN", -1, 3, 90);
++  }
++  if (from >= 0)
++  {
++    s_race.ba_lost_to[from] = static_cast<s8>(to);
++    s_race.ba_lost_at[from] = f;
++  }
++  if (s_trace || from >= 0)
++    std::fprintf(stderr, "ERMODES crown %d -> %d at %.2f s: %s\n", from, to, f / 60.0f, why ? why : "bonus");
++  s_race.crown = to;
++  s_race.crown_since = f;
++}
++
++// Grand Prix cup points (GFZE01, found 2026-11-25 by MEM1 diffs): u16 total per racer at game block + 0xD8 + racer * 0xA0
++// (game block = REL base + 0x1BDC70), the race's points by finishing place = u8 table at REL base + 0x16D248
++// (100, 93, 87, ... 15). The game adds them when the player finishes. Breakaway swaps them for the Breakaway places,
++// so the cup standings follow the mode's result.
++constexpr u32 kCupGameBlock = 0x1BDC70u, kCupTotals = 0xD8u, kCupStride = 0xA0u, kCupPtsTable = 0x16D248u;
++u8* CupTotal(u32 B, int i)
++{
++  return P(B + kCupGameBlock + kCupTotals + static_cast<u32>(i) * kCupStride, 2);
++}
++// shared by Breakaway and Hunted: once the game has added this race's points, give each racer the points of its place in
++// the mode's own standings (order_of fills racer indices, best first)
++template <class F>
++void CupPoints(std::array<RacerView, kMax>& v, bool ready, F order_of, const char* tag)
++{
++  const int n = s_race.count;
++  u32 B = 0;
++  if (!R32(0x800030C8u, &B) || !InRam(B))
 +    return;
-+  // scoring ends when the first racer finishes
-+  for (int i = 0; i < s_race.count; i++)
-+    if (v[i].finished)
++  const u8* gm = P(B + kCupGameBlock, 8);
++  const u8* tab = P(B + kCupPtsTable, 30);
++  if (!gm || gm[5] != 1 || !tab || tab[0] != 100 || n > 30)
++  {
++    s_race.ba_cup_state = 2;
++    return;
++  }
++  for (int k = 1; k < 30; k++)
++    if (tab[k] > tab[k - 1])
 +    {
-+      s_race.scoring_over = true;
-+      int best = -1;
-+      for (int j = 0; j < s_race.count; j++)
-+        if (best < 0 || s_race.score[j] > s_race.score[best] ||
-+            (s_race.score[j] == s_race.score[best] && s_race.rounds[j] > s_race.rounds[best]))
-+          best = j;
-+      s_race.winner = best;
-+      std::fprintf(stderr, "ERMODES breakaway over at %.1f s: winner %d with %.0f points (%d rounds)%s\n",
-+                   s_race.frames / 60.0f, best, s_race.score[best] / 10.0f, s_race.rounds[best],
-+                   best == s_race.player ? " = PLAYER" : "");
-+      for (int j = 0; j < s_race.count; j++)
-+        if (s_race.score[j] > 0)
-+          std::fprintf(stderr, "ERMODES breakaway score racer %d %.0f rounds %d\n", j, s_race.score[j] / 10.0f,
-+                       s_race.rounds[j]);
-+      if (best == s_race.player)
-+        s_race.big = 2;
-+      else
-+        AddFlash("{n}", best, 3, 100000);
++      s_race.ba_cup_state = 2;
 +      return;
 +    }
-+  // crown: first place among the alive, held kCrownHold frames before it moves
-+  if (leader >= 0 && leader != s_race.crown)
++  if (!s_race.ba_cup_read)
 +  {
-+    if (leader == s_race.crown_cand)
-+      s_race.crown_cand_n++;
-+    else
-+      s_race.crown_cand = leader, s_race.crown_cand_n = 1;
-+    if (s_race.crown < 0 || s_race.crown_cand_n >= kCrownHold || !v[s_race.crown].alive)
++    for (int i = 0; i < n; i++)
 +    {
-+      if (s_race.crown >= 0)
-+      {
-+        std::fprintf(stderr, "ERMODES crown %d -> %d at %.1f s\n", s_race.crown, leader, s_race.frames / 60.0f);
-+        if (static_cast<int>(s_race.frames) - s_race.last_take[leader] > static_cast<int>(kRetakeS * 60.0f) &&
-+            v[leader].kmh >= kCrownMinKmh)
-+        {
-+          s_race.score[leader] += kTakeBonus * 10.0f;
-+          s_race.last_take[leader] = static_cast<int>(s_race.frames);
-+        }
-+        if (leader == s_race.player)
-+          AddFlash("CROWN", -1, 3, 90);
-+      }
-+      s_race.crown = leader;
-+      s_race.crown_since = static_cast<int>(s_race.frames);
++      const u8* t = CupTotal(B, i);
++      s_race.ba_cup0[i] = t ? static_cast<u16>(BE16(t)) : -1;
 +    }
++    s_race.ba_cup_read = true;
++    return;
 +  }
-+  const int c = s_race.crown;
-+  // the racer in 2nd among the alive: earns what a long reign no longer does
-+  int second = -1;
-+  for (int i = 0; i < s_race.count; i++)
-+    if (i != c && v[i].alive && !v[i].finished && (second < 0 || v[i].rank < v[second].rank))
-+      second = i;
-+  const float held = (static_cast<int>(s_race.frames) - s_race.crown_since) / 60.0f;
-+  const float w = std::clamp(1.0f - (held - kCrownFull) / kCrownFade, 0.0f, 1.0f);
-+  for (int i = 0; i < s_race.count; i++)
++  if (!ready || s_race.ba_cup_state != 0)
++    return;
++  // the game has added this race's points once every racer's delta is one of the table's values, each used once
++  // (a racer that is out of the race scores nothing in the game's cup: delta 0, left as it is)
++  std::array<int, 30> used{};
++  for (int i = 0; i < n; i++)
++  {
++    const u8* t = CupTotal(B, i);
++    if (!t || s_race.ba_cup0[i] < 0)
++      return;
++    const int d = static_cast<u16>(BE16(t)) - s_race.ba_cup0[i];
++    if (d == 0 && !v[i].alive && !v[i].finished)
++      continue;
++    int k = 0;
++    while (k < n && (tab[k] != d || used[k]))
++      k++;
++    // a Mayhem race ended at the 10th takedown: the game's own finish of the frozen field can hand the same place to
++    // more than one racer, so once every racer still in has received points of the table, the mode's order is written
++    if (k >= n && s_race.hu_over)
++      for (k = 0; k < n && tab[k] != d; k++)
++      {
++      }
++    if (k >= n)
++    {
++      if (s_trace && s_race.frames % 300 == 0)
++        std::fprintf(stderr, "ERMODES %s cup points waiting: racer %d delta %d (alive %d finished %d flags %08x)\n", tag, i, d,
++                     v[i].alive, v[i].finished, v[i].flags);
++      return;  // not yet (or not all)
++    }
++    used[k] = 1;
++  }
++  std::array<s8, kMax> order;
++  order.fill(-1);
++  order_of(order);
++  int place = 0;  // places among the racers the game scored (those still in), in the mode's order
++  for (int k = 0; k < n; k++)
++  {
++    const int i = order[k];
++    if (i < 0)
++      continue;
++    u8* t = CupTotal(B, i);
++    const int was = static_cast<u16>(BE16(t));
++    if (was == s_race.ba_cup0[i] && !v[i].alive && !v[i].finished)
++      continue;  // out of the race: no cup points, as the game has it
++    const int now = s_race.ba_cup0[i] + tab[place++];
++    t[0] = static_cast<u8>(now >> 8);
++    t[1] = static_cast<u8>(now);
++    if (i == s_race.player || k < 5)
++      std::fprintf(stderr, "ERMODES %s cup points: racer %d place %d: %d -> %d (race points %d)\n", tag, i, place, was, now, tab[place - 1]);
++  }
++  s_race.ba_cup_state = 1;
++}
++
++void TickBreakaway(std::array<RacerView, kMax>& v, int leader)
++{
++  CupPoints(v, s_race.scoring_over, [](std::array<s8, kMax>& o) { o = s_race.ba_order; }, "breakaway");
++  if (s_race.scoring_over)
++    return;
++  const int n = s_race.count, f = static_cast<int>(s_race.frames);
++  // eligibility and progress this frame (emulated frames: a pause stops everything)
++  for (int i = 0; i < n; i++)
 +  {
 +    const float d = v[i].dist - s_race.last_dist[i];
 +    s_race.last_dist[i] = v[i].dist;
-+    if (!v[i].alive || d <= 0.0f || d > 80.0f || v[i].kmh < kCrownMinKmh)
-+      continue;
-+    const float share = i == c ? w : i == second ? 1.0f - w : 0.0f;
-+    if (share <= 0.0f)
-+      continue;
-+    const float room = kRoundCap * 10.0f - s_race.round_score[i];
-+    const float got = std::min(d * share, std::max(room, 0.0f));
-+    s_race.score[i] += got;
-+    s_race.round_score[i] += got;
-+    if (got > 0.0f && s_race.round_score[i] >= kRoundCap * 10.0f - 0.01f && s_race.round_full[i] < 0)
-+      s_race.round_full[i] = static_cast<int>(s_race.frames);
++    if (f > 1 && (d > kMaxStepM || d < -kMaxStepM))
++      s_race.ba_jump[i] = f;
++    s_race.ba_eligible[i] = v[i].alive && !v[i].finished && d > 0.0f && d <= kMaxStepM && v[i].kmh >= kCrownMinKmh;
 +  }
-+  // rounds: the leader's distance in fifths of the race
-+  if (leader >= 0 && s_race.total > 0.0f && v[leader].dist > 0.0f)
-+  {
-+    const int r = std::min(kRounds - 1, static_cast<int>(v[leader].dist / (s_race.total / kRounds)));
-+    if (r > s_race.round)
++  // scoring closes for the whole field at the first finisher
++  for (int i = 0; i < n; i++)
++    if (v[i].finished)
 +    {
-+      int best = -1;
-+      for (int j = 0; j < s_race.count; j++)
-+        if (s_race.round_score[j] > 0 &&
-+            (best < 0 || s_race.round_score[j] > s_race.round_score[best] ||
-+             (s_race.round_score[j] == s_race.round_score[best] && s_race.round_full[j] >= 0 &&
-+              (s_race.round_full[best] < 0 || s_race.round_full[j] < s_race.round_full[best]))))  // level: first to the cap
-+          best = j;
-+      if (best >= 0)
-+      {
-+        s_race.rounds[best]++;
-+        // the +50 goes to a round winner who is not already top of the table
-+        int top = 0;
-+        for (int j = 1; j < s_race.count; j++)
-+          if (s_race.score[j] > s_race.score[top])
-+            top = j;
-+        const bool bonus = true;
-+        (void)top;
-+        if (bonus)
-+          s_race.score[best] += kRoundBonus * 10.0f;
-+        std::fprintf(stderr, "ERMODES breakaway round %d won by %d (%.0f points in the round)\n", s_race.round + 1,
-+                     best, s_race.round_score[best] / 10.0f);
-+        if (best == s_race.player)
-+          AddFlash("+25", -1, 3, 120);
-+      }
-+      s_race.round_score = {};
-+      s_race.round_full.fill(-1);
-+      s_race.round = r;
++      s_race.scoring_over = true;
++      BaFinish(v);
++      return;
++    }
++  // crown: first place among the racers still in, confirmed kCrownHold frames before it moves (no side-by-side flicker)
++  const int c0 = s_race.crown;
++  if (leader >= 0 && leader != c0)
++  {
++    if (c0 < 0)
++      BaTake(v, -1, leader, "initial");
++    else if (!v[c0].alive || v[c0].finished)
++      BaTake(v, c0, leader, "vacancy");
++    else
++    {
++      if (leader == s_race.crown_cand)
++        s_race.crown_cand_n++;
++      else
++        s_race.crown_cand = leader, s_race.crown_cand_n = 1;
++      if (s_race.crown_cand_n >= kCrownHold)
++        BaTake(v, c0, leader, nullptr);
 +    }
 +  }
++  else
++    s_race.crown_cand = -1, s_race.crown_cand_n = 0;
++  const int c = s_race.crown;
++  if (c >= 0 && s_race.ba_eligible[c])
++    s_race.ba_held[c]++;
++  for (int i = 0; i < n; i++)
++    s_race.score[i] = (s_race.ba_held[i] + s_race.ba_bonus[i]) / static_cast<float>(kCrownFramesPerPt);
++  if (s_trace && f % 600 == 0 && c >= 0)
++    std::fprintf(stderr, "ERMODES breakaway t %d: crown %d (%.1f), player %.1f\n", f / 60, c, s_race.score[c],
++                 s_race.player >= 0 ? s_race.score[s_race.player] : 0.0f);
 +}
 +
 +// a short race has fewer meetings, so each hit counts for more and the grace is shorter (3 laps of 8 km vs 37 km)
@@ -25015,6 +25257,19 @@ HcmV?d00001
 +               s_race.ch_capped, 100.0f * s_race.ch_with_target / std::max(1, s_race.ch_frames * s_race.count),
 +               s_race.player >= 0 ? s_race.ch_kos[s_race.player] : 0, s_race.ch_player_taken,
 +               s_race.ch_min_e > 999.0f ? 0.0f : s_race.ch_min_e);
++  if (s_race.hunt_level == kMayhem)
++    std::fprintf(stderr,
++                 "ERMODES mayhem %s at %.0f s: targets assigned %d, chases %d, line-ups %d, strikes %d (on player %d), attack started %d, contact %d "
++                 "(on player %d), takedowns %d, energy KOs %d, falls %d, capped %d, reach %d (mean %.1f s to reach), "
++                 "speed lost after a strike %.0f km/h, dropped: route %d unsafe %d, most incoming %d, player hunted %.0f %% of "
++                 "the time, hunter within 30 m %.0f %%, pursuit boosts %d\n",
++                 when, s_race.frames / 60.0f, s_race.ch_assigns, s_race.pu_close_n, s_race.pu_line_n, s_race.pu_strikes, s_race.pu_strikes_pl,
++                 s_race.pu_started_n, s_race.pu_connect_n, s_race.pu_connect_pl, s_race.ch_takedowns, s_race.pu_energy_kos,
++                 s_race.pu_falls, s_race.ch_capped, s_race.pu_reach_n,
++                 s_race.pu_reach_n ? s_race.pu_reach_frames / 60.0f / s_race.pu_reach_n : 0.0f,
++                 s_race.pu_loss_n ? s_race.pu_loss_sum / s_race.pu_loss_n : 0.0f, s_race.pu_abandon_route,
++                 s_race.pu_abandon_unsafe, s_race.pu_incoming_max, 100.0f * s_race.pu_hunter_frames / std::max(1, s_race.ch_frames),
++                 100.0f * s_race.pu_hunter_near / std::max(1, s_race.pu_hunter_frames), s_race.pu_boosts);
 +}
 +
 +// who hunts whom: sticky, so a battle lasts; a racer without a target takes the nearest one ahead that nobody hunts yet
@@ -25087,6 +25342,7 @@ HcmV?d00001
 +        s_race.ch_target[i] = static_cast<s8>(t);
 +        s_race.ch_hunter[t] = static_cast<s8>(i);
 +        s_race.ch_since[i] = static_cast<int>(s_race.frames);
++        s_race.ch_assigns++;
 +        break;
 +      }
 +    }
@@ -25113,8 +25369,383 @@ HcmV?d00001
 +      s_race.ch_target[pl] = static_cast<s8>(best);
 +      s_race.ch_hunter[best] = static_cast<s8>(pl);
 +      s_race.ch_since[pl] = static_cast<int>(s_race.frames);
++      s_race.ch_assigns++;
 +    }
 +  }
++}
++
++// ---- Mayhem: the pursuit controller ----
++// Everything goes through state the game's own CPU code already reads every frame (enemy_ctrl.c fn_1_C4ABC):
++//  close   = AI flag bits 15 + 21 (throttle x1.1 within the class's top throttle p0, boost x1.5: costs energy as usual)
++//  line up = AI mode 5 + lateral target (+0x18, the target's own share of its road width: track frame, wraps in pipes)
++//            + throttle (+0x0C, the game keeps it in [p2, p0] in mode 5); the game itself leaves mode 5 in its no-attack
++//            ranges and when it takes a boost / recharge zone
++//  strike  = AI mode 6 on the target (the game's own attack), only when it is beside
++//  recover = no writes for a while, the pilot's own traits back
++void PuTraits(const RacerView& x, int a, bool on)
++{
++  u8* ai = P(x.ai, 0x40);
++  if (!ai)
++    return;
++  const u32 fl = BE32(ai);
++  if (!s_race.pu_have_orig[a])
++  {
++    s_race.pu_orig[a] = fl;
++    s_race.pu_have_orig[a] = 1;
++  }
++  constexpr u32 m = kAiThrottleUp | kAiBoostUp;
++  const u32 want = on ? (fl | m) : ((fl & ~m) | (s_race.pu_orig[a] & m));
++  if (want != fl)
++    W32(ai, want);
++}
++void PuLeaveMode5(u8* ai, int t)
++{
++  if (ai[0x28] == 5 && ai[0x2A] == t)
++  {
++    ai[0x28] = 1;
++    ai[0x2A] = 99;
++    ai[0x2F] = 0;
++    W32(ai, BE32(ai) | 0x2000000u);  // as the game does: the next frame settles on the state the race position asks for
++  }
++}
++void TickPursuit(std::array<RacerView, kMax>& v, const HuntLevel& L)
++{
++  const int n = s_race.count, pl = s_race.player, f = static_cast<int>(s_race.frames);
++  u32 B = 0;
++  float p0 = 1.0f, p1 = 0.9f;
++  if (R32(0x800030C8u, &B) && InRam(B))
++    if (const u8* d = P(B + 0x234CA4u, 0x24))
++    {
++      p0 = BEF(d + 4);
++      p1 = BEF(d + 8);
++    }
++  if (!(p0 > 0.1f && p0 < 4.0f))
++    p0 = 1.0f;
++  if (!(p1 > 0.1f && p1 <= p0))
++    p1 = std::min(p0, 0.9f);
++  // ordinary KOs (energy, walls, the game's own attacks) and falls, apart from the chain's takedowns
++  for (int i = 0; i < n; i++)
++  {
++    const u32 fl = v[i].flags;
++    if ((fl & F_KO) && !s_race.pu_ko_seen[i])  // a chain takedown marks its victim 2 first
++    {
++      s_race.pu_ko_seen[i] = 1;
++      s_race.pu_energy_kos++;
++    }
++    if ((fl & F_FELL) && !s_race.pu_fell_seen[i] && !s_race.pu_ko_seen[i] && !(fl & F_KO))  // a KO'd wreck falls too
++    {
++      s_race.pu_fell_seen[i] = 1;
++      s_race.pu_falls++;
++    }
++  }
++  std::array<int, kMax> incoming{};
++  for (int a = 0; a < n; a++)
++  {
++    RacerView& x = v[a];
++    if (s_race.ch_attack[a] > 0)
++      s_race.ch_attack[a]--;
++    if (s_race.ch_cool[a] > 0)
++      s_race.ch_cool[a]--;
++    u8& ph = s_race.pu_phase[a];
++    if (!x.cpu || !InRam(x.ai) || !x.prog)
++      continue;
++    u8* ai = P(x.ai, 0x40);
++    if (!ai)
++      continue;
++    if (!x.alive || x.finished)
++    {
++      if (ph != 0)
++        PuTraits(x, a, false), ph = 0;
++      continue;
++    }
++    const int t = s_race.ch_target[a];
++    const u8 st = ai[0x28];
++    if (ph == 3)
++    {
++      if (!s_race.pu_started[a] && (x.flags & 0x8u))
++      {
++        s_race.pu_started[a] = 1;
++        s_race.pu_started_n++;
++      }
++      // the target dropped behind: end the attack early (mode 6 cuts the throttle while its rival is behind)
++      if (f < s_race.pu_until[a] && t >= 0 && v[t].alive && v[t].dist - x.dist < -3.0f &&
++          (s_race.pu_started[a] || f - s_race.pu_strike_at[a] > 20) && st == 6 && ai[0x2A] == t)
++      {
++        ai[0x28] = 1;
++        ai[0x2A] = 99;
++        ai[0x2F] = 0;
++        W32(ai, BE32(ai) | 0x2000000u);
++        s_race.pu_until[a] = f;
++      }
++      if (f >= s_race.pu_until[a])
++      {
++        s_race.pu_loss_sum += std::max(0.0f, s_race.pu_kmh_at[a] - x.kmh);
++        s_race.pu_loss_n++;
++        PuTraits(x, a, false);
++        ph = 4;
++        s_race.pu_until[a] = f + (s_race.pu_connected[a] ? kPuRecover : kPuRecoverMiss);
++      }
++      if (t >= 0)
++        incoming[t]++;
++      continue;
++    }
++    if (ph == 4)
++    {
++      if (f < s_race.pu_until[a])
++        continue;
++      ph = 0;
++    }
++    const bool ok = t >= 0 && t != a && v[t].alive && !v[t].finished && v[t].prog;
++    const float gap = ok ? v[t].dist - x.dist : 0.0f;
++    if (!ok || gap > kPuRange || gap < kPuBehind)
++    {
++      if (ph != 0)
++      {
++        if (t >= 0)
++          PuLeaveMode5(ai, t);
++        PuTraits(x, a, false);
++        ph = 0;
++      }
++      continue;
++    }
++    // the same road: a target on another branch is waited for (the chain hands out another one if it stays away)
++    const s32 ra = static_cast<s32>(BE32(x.prog + 0x8C)), rt = static_cast<s32>(BE32(v[t].prog + 0x8C));
++    if (ra != 0 && rt != 0 && ra != rt)
++    {
++      if (ph != 0)
++      {
++        PuLeaveMode5(ai, t);
++        PuTraits(x, a, false);
++        s_race.pu_abandon_route++;
++        ph = 0;
++      }
++      continue;
++    }
++    // the game is spinning back, recovering or running its own attack: hands off
++    if (st == 3 || st == 4 || st == 6)
++      continue;
++    if (ph == 0)
++    {
++      s_race.pu_close_n++;
++      s_race.pu_close_f[a] = f;
++    }
++    incoming[t]++;
++    PuTraits(x, a, true);
++    const float wa = BEF(x.prog + 0x84), wt = BEF(v[t].prog + 0x84);
++    const bool tube = (BE32(x.prog + 0x7C) & 0x1400000u) != 0;
++    const int ang = std::abs(static_cast<int>(BE16(x.prog + 0x104)));
++    const bool safe = !(x.flags & 0x2u) && ang < kPuMaxAngle && wa > 1.0f && wt > 1.0f;
++    if (safe && gap > kPuBoostGap && x.r[0x18A] == 0 && x.kmh < v[t].kmh + kPuBoostDv &&
++        f - s_race.pu_boost_at[a] >= (gap > kPuBoostFar ? kPuBoostEveryFar : kPuBoostEvery))
++    {
++      const float raw = static_cast<float>(static_cast<u16>(BE16(x.r + 0x5DA)));
++      if (BEF(x.r + 0x184) > kPuBoostMinE * (raw > 0.0f ? raw : 100.0f))
++      {
++        W32(ai, BE32(ai) | 0x80000000u);
++        s_race.pu_boost_at[a] = f;
++        s_race.pu_boosts++;
++      }
++    }
++    if (gap > kPuLineUp || !safe)
++    {
++      if (ph == 2)
++      {
++        PuLeaveMode5(ai, t);
++        if (!safe)
++          s_race.pu_abandon_unsafe++;
++      }
++      ph = 1;
++      continue;
++    }
++    if (ph != 2)
++      s_race.pu_line_n++;
++    ph = 2;
++    const float side = (BEF(v[t].r + 0x7C) - BEF(x.r + 0x7C)) * BEF(x.r + 0xEC) +
++                       (BEF(v[t].r + 0x80) - BEF(x.r + 0x80)) * BEF(x.r + 0xEC + 16) +
++                       (BEF(v[t].r + 0x84) - BEF(x.r + 0x84)) * BEF(x.r + 0xEC + 32);
++    if (gap <= kPuStrikeBack && gap >= kPuStrikePast && std::abs(side) <= kPuStrikeSide && s_race.ch_cool[a] == 0)
++    {
++      ai[0x28] = 6;
++      ai[0x2A] = static_cast<u8>(t);
++      ai[0x2F] = kPuStrikeFrames;
++      ph = 3;
++      s_race.pu_until[a] = f + kPuStrikeFrames;
++      s_race.pu_strike_at[a] = f;
++      s_race.pu_started[a] = 0;
++      s_race.pu_connected[a] = 0;
++      s_race.pu_kmh_at[a] = x.kmh;
++      s_race.ch_attack[a] = kPuStrikeFrames;
++      s_race.ch_spun[a] = 0;
++      s_race.ch_cool[a] = static_cast<int>(L.cooldown / ChainScale());
++      s_race.ch_attacks++;
++      s_race.pu_strikes++;
++      s_race.pu_reach_n++;
++      s_race.pu_reach_frames += f - s_race.pu_close_f[a];
++      if (t == pl)
++      {
++        s_race.pu_strikes_pl++;
++        s_race.st_attacks_on_pl++;
++      }
++      continue;
++    }
++    float lat = BEF(v[t].prog + 0x108) / wt;
++    if (!tube)
++      lat = std::clamp(lat, -kPuLatMax, kPuLatMax);
++    if (st != 5 || ai[0x2A] != t)
++    {
++      ai[0x28] = 5;
++      ai[0x2A] = static_cast<u8>(t);
++    }
++    ai[0x2F] = 20;
++    WF(ai + 0x18, lat);
++    const float k = std::clamp((gap - 4.0f) / 26.0f, 0.0f, 1.0f);
++    WF(ai + 0x0C, p1 + (p0 - p1) * k);
++  }
++  // the game's own attacks count as incoming too
++  for (int a = 0; a < n; a++)
++    if (v[a].cpu && v[a].alive && InRam(v[a].ai) && s_race.pu_phase[a] == 0)
++      if (const u8* ai = P(v[a].ai, 0x40); ai && ai[0x28] == 6 && ai[0x2A] < n)
++        incoming[ai[0x2A]]++;
++  for (int t = 0; t < n; t++)
++    s_race.pu_incoming_max = std::max(s_race.pu_incoming_max, incoming[t]);
++  if (pl >= 0 && v[pl].alive && !v[pl].finished)
++  {
++    const int h = s_race.ch_hunter[pl];
++    if (h >= 0 && v[h].cpu)
++    {
++      s_race.pu_hunter_frames++;
++      const float g = v[pl].dist - v[h].dist;
++      if (g > -30.0f && g < 30.0f)
++        s_race.pu_hunter_near++;
++      if (s_trace && f % 60 == 0)
++        std::fprintf(stderr, "ERMODES pursuit t %d: player hunter %d gap %.0f m phase %d closing %.0f km/h, player energy %.1f\n",
++                     f / 60, h, g, s_race.pu_phase[h], v[h].kmh - v[pl].kmh, BEF(v[pl].r + 0x184));
++    }
++  }
++}
++
++// Hunted place points: this racer's share of kHuntPlaceBudget for one lap (budget / the race's laps)
++float HuLapBudget(const RacerView& x)
++{
++  const float len = x.prog ? BEF(x.prog + 0xFC) : 0.0f;
++  const int laps = s_race.total > 0.0f && len > 1.0f ? std::max(1, static_cast<int>(std::lround(s_race.total / len))) : 3;
++  return kHuntPlaceBudget / static_cast<float>(laps);
++}
++// every emulated frame from GO (a pause stops it): each racer still racing adds its place value (field - 1 - place) / (field - 1)
++// to the lap it is in; a lap closes at its full share x the lap's mean value; a racer that goes out, finishes or is stopped by
++// the race end keeps its cut-short lap pro-rata (x the share of that lap it drove)
++void HuAccrue(const std::array<RacerView, kMax>& v)
++{
++  const int n = s_race.count;
++  const u32 f = s_race.frames;
++  const int d = s_race.hu_prev ? static_cast<int>(f - s_race.hu_prev) : 1;
++  s_race.hu_prev = f;
++  if (d <= 0 || d > 120 || n < 2)
++    return;  // no emulated time passed, or a reload / jump: nothing
++  for (int i = 0; i < n; i++)
++  {
++    if (s_race.hu_stop[i])
++      continue;
++    const RacerView& x = v[i];
++    const float len = x.prog ? BEF(x.prog + 0xFC) : 0.0f;
++    if (!(len > 1.0f))
++      continue;
++    const float P = HuLapBudget(x);
++    const float lapf = std::max(0.0f, x.dist / len);
++    const int li = std::min(static_cast<int>(lapf), kHuLaps - 1);
++    while (s_race.hu_lap[i] < li)  // a lap done: its full share x its mean place value
++    {
++      const int L = s_race.hu_lap[i];
++      s_race.hu_lap_pts[i][L] = s_race.hu_n[i] > 0 ? static_cast<float>(P * s_race.hu_sum[i] / s_race.hu_n[i]) : 0.0f;
++      s_race.hu_sum[i] = 0.0;
++      s_race.hu_n[i] = 0;
++      s_race.hu_lap[i]++;
++    }
++    s_race.hu_frac[i] = std::clamp(lapf - static_cast<float>(s_race.hu_lap[i]), 0.0f, 1.0f);
++    if (x.alive && !x.finished && !s_race.hu_over)
++    {
++      s_race.hu_sum[i] += static_cast<double>(n - 1 - std::min(x.rank, n - 1)) / (n - 1) * d;
++      s_race.hu_n[i] += d;
++    }
++    s_race.hu_part[i] = s_race.hu_n[i] > 0 ? static_cast<float>(P * s_race.hu_sum[i] / s_race.hu_n[i]) * s_race.hu_frac[i] : 0.0f;
++    if (!x.alive || x.finished || s_race.hu_over)
++    {
++      s_race.hu_lap_pts[i][s_race.hu_lap[i]] = s_race.hu_part[i];
++      s_race.hu_stop[i] = 1;
++    }
++  }
++}
++// the place points as the result panel shows them: each lap rounded, so the rows add up to the total exactly
++int HuPlaceInt(int i)
++{
++  int s = s_race.hu_stop[i] ? 0 : static_cast<int>(std::lround(s_race.hu_part[i]));
++  for (int L = 0; L < kHuLaps; L++)
++    s += static_cast<int>(std::lround(s_race.hu_lap_pts[i][L]));
++  return s;
++}
++float HuPlace(int i)
++{
++  float s = s_race.hu_stop[i] ? 0.0f : s_race.hu_part[i];
++  for (int L = 0; L < kHuLaps; L++)
++    s += s_race.hu_lap_pts[i][L];
++  return s;
++}
++
++// Hunted standings: place points (HuAccrue) + kHuntKoPoints per CONFIRMED takedown (only the chain's own takedowns count);
++// ties: finished first, then the race place. Racers taken out keep their points on the list but rank below everyone still
++// in, as Breakaway's retired racers do (the game's cup gives them nothing).
++void HuStandings(const std::array<RacerView, kMax>& v, bool log = true)
++{
++  const int n = s_race.count;
++  std::array<int, kMax> o{};
++  for (int i = 0; i < n; i++)
++  {
++    o[i] = i;
++    s_race.hu_place[i] = HuPlace(i);
++    s_race.hu_pts[i] = HuPlaceInt(i) + kHuntKoPoints * s_race.ch_kos[i];
++  }
++  const auto in = [&](int i) { return v[i].alive || v[i].finished; };
++  std::sort(o.begin(), o.begin() + n, [&](int a, int b) {
++    if (in(a) != in(b))
++      return in(a);  // racers taken out rank below everyone still in (they score no cup points)
++    if (s_race.hu_pts[a] != s_race.hu_pts[b])
++      return s_race.hu_pts[a] > s_race.hu_pts[b];
++    if (v[a].finished != v[b].finished)
++      return v[a].finished;
++    return v[a].rank < v[b].rank;
++  });
++  for (int k = 0; k < n; k++)
++    s_race.hu_order[k] = static_cast<s8>(o[k]);
++  s_race.hu_done = true;
++  for (int k = 0; k < n && log; k++)
++  {
++    const int j = o[k];
++    if (k < 8 || j == s_race.player || s_race.ch_kos[j] > 0)
++    {
++      std::string laps;
++      for (int L = 0; L <= std::min(s_race.hu_lap[j], kHuLaps - 1); L++)
++      {
++        char b[24];
++        std::snprintf(b, sizeof b, "%s%.1f", L ? " " : "", L < s_race.hu_lap[j] || s_race.hu_stop[j] ? s_race.hu_lap_pts[j][L] : s_race.hu_part[j]);
++        laps += b;
++      }
++      std::fprintf(stderr, "ERMODES hunted place %d racer %d%s: %d points = place %.1f (laps %s) + %d takedowns x %d (race place %d), %s\n",
++                   k + 1, j, j == s_race.player ? " (player)" : "", s_race.hu_pts[j], s_race.hu_place[j], laps.c_str(),
++                   s_race.ch_kos[j], kHuntKoPoints, v[j].rank + 1, v[j].finished ? "finished" : v[j].alive ? "racing" : "out");
++    }
++  }
++}
++
++// Mayhem: may the chain take someone out now (the takedowns spread over the race)
++bool MayhemPaced(const std::array<RacerView, kMax>& v)
++{
++  if (s_race.hunt_level != kMayhem || s_race.total <= 0.0f)
++    return true;
++  float lead = 0.0f;
++  for (int q = 0; q < s_race.count; q++)
++    if (v[q].alive || v[q].finished)
++      lead = std::max(lead, v[q].dist);
++  return s_race.ch_takedowns < kMayhemKoBase + kMayhemKoSpan * std::min(1.0f, lead / s_race.total / kMayhemKoBy);
 +}
 +
 +void TickHunted(std::array<RacerView, kMax>& v)
@@ -25125,6 +25756,54 @@ HcmV?d00001
 +  const HuntLevel& L = kHunt[s_race.hunt_level];
 +  const int n = s_race.count, f = static_cast<int>(s_race.frames);
 +  RacerView& p = v[pl];
++  // Mayhem (owner 2026-11-26): the race ends at the kMayhemEndKos-th confirmed takedown. The order is frozen where it
++  // stands and the game's own finish runs for everyone still racing (one racer a frame, best place first, so the game hands
++  // out the places in that order): result card, cup points and the next race work as after a normal finish
++  if (s_race.hunt_level == kMayhem && !s_race.hu_over && s_race.ch_takedowns >= kMayhemEndKos && !p.finished)
++  {
++    s_race.hu_over = true;
++    s_race.hu_over_frame = f;
++    for (int i = 0; i < n; i++)
++    {
++      s_race.hu_frank[i] = static_cast<u8>(std::min(v[i].rank, 255));
++      if (v[i].prog)
++        s_race.hu_fin_lap = std::max(s_race.hu_fin_lap, static_cast<int>(BE32(v[i].prog + 0x118)));
++      if (v[i].alive && !v[i].finished)
++        s_race.hu_fin[s_race.hu_fin_n++] = static_cast<s8>(i);
++    }
++    std::sort(s_race.hu_fin.begin(), s_race.hu_fin.begin() + s_race.hu_fin_n, [&v](s8 a, s8 b) { return v[a].rank < v[b].rank; });
++    std::fprintf(stderr, "ERMODES mayhem race over at %.1f s: %d confirmed takedowns, %d racers finished in place order (player place %d)\n",
++                 f / 60.0f, s_race.ch_takedowns, s_race.hu_fin_n, p.rank + 1);
++    LogChain("race over", v);
++  }
++  HuAccrue(v);
++  // the racers finished so far keep the place they held at the end (the game's own finish would re-place them: a racer a
++  // lap down was handed 1st), so the result card shows the frozen place
++  for (int k = 0; s_race.hu_over && k < s_race.hu_fin_next; k++)
++  {
++    const int i = s_race.hu_fin[k];
++    if (v[i].prog && v[i].finished)
++      v[i].prog[0x115] = s_race.hu_frank[i];
++  }
++  if (s_race.hu_over)
++    while (s_race.hu_fin_next < s_race.hu_fin_n)
++    {
++      const int i = s_race.hu_fin[s_race.hu_fin_next++];
++      if (v[i].alive && !v[i].finished)
++      {
++        // the game places a finisher among those on its own lap: a racer a lap down would be handed 1st, so every racer
++        // finishes on the leader's lap count (the frozen order decides the place)
++        if (v[i].prog && s_race.hu_fin_lap > static_cast<int>(BE32(v[i].prog + 0x118)))
++          W32(v[i].prog + 0x118, static_cast<u32>(s_race.hu_fin_lap));
++        W32(v[i].r, BE32(v[i].r) | F_FINISHED);
++        break;
++      }
++    }
++  // the cup standings follow the Hunted standings (place + confirmed takedowns), as Breakaway's follow its points
++  // (the standings are taken again at the moment the game hands out the race's points: its final / predicted places)
++  CupPoints(v, s_race.hu_done, [&v](std::array<s8, kMax>& o) { HuStandings(v, true); o = s_race.hu_order; }, "hunted");
++  if (s_race.hu_done && s_race.ba_cup_state != 1 && static_cast<int>(s_race.frames) % 60 == 0)
++    HuStandings(v, false);  // shown live until the game's places are final
 +  // the player's result on the finish screen: finishing position plus kHuntKoPoints per takedown. Shown only: the Grand Prix
 +  // cup still scores the game's own finishing places
 +  if (s_race.result == 0)
@@ -25132,25 +25811,26 @@ HcmV?d00001
 +    if (p.finished)
 +    {
 +      s_race.result = 1;
-+      const auto points = [&](int i) { return (n - v[i].rank) + kHuntKoPoints * s_race.ch_kos[i]; };
-+      s_race.ch_points = points(pl);
-+      bool best = true;
-+      for (int i = 0; i < n; i++)
-+        if (i != pl && points(i) > points(pl))
-+          best = false;
++      HuStandings(v);
++      s_race.ch_points = s_race.hu_pts[pl];
++      const bool best = s_race.hu_order[0] == pl;  // the same order the cup standings get
 +      if (best)
 +        s_race.big = 2;
-+      std::fprintf(stderr, "ERMODES chain result: player place %d, %d takedowns, %d points%s\n", p.rank + 1,
-+                   s_race.ch_kos[pl], points(pl), best ? " = best of the field" : "");
++      std::fprintf(stderr, "ERMODES chain result: player place %d, %d takedowns, %d points (place %.1f + %d)%s\n", p.rank + 1,
++                   s_race.ch_kos[pl], s_race.hu_pts[pl], s_race.hu_place[pl], kHuntKoPoints * s_race.ch_kos[pl],
++                   best ? " = best of the field" : "");
 +      LogChain("final", v);
 +    }
 +    else if (!p.alive)
 +    {
 +      s_race.result = f - s_race.ch_last_hit[pl] < 300 ? 2 : 3;  // 2 = taken down or knocked out by the chain
 +      s_race.big = 1;
++      HuStandings(v);
 +      LogChain("player out", v);
 +    }
 +  }
++  if (s_race.hu_over)
++    return;  // the race is over: no more pursuit, attacks or hits
 +  const int grace = ChainGrace();
 +  if (f >= grace && f % 1200 == 0)
 +    LogChain("so far", v);
@@ -25216,6 +25896,13 @@ HcmV?d00001
 +    if (f - s_race.ch_hits[a] < (s_test_hitstress ? 20 : kHuntHitGap))
 +      continue;
 +    s_race.ch_hits[a] = f;
++    if (s_race.pu_phase[a] == 3 && !s_race.pu_connected[a])
++    {
++      s_race.pu_connected[a] = 1;
++      s_race.pu_connect_n++;
++      if (t == pl)
++        s_race.pu_connect_pl++;
++    }
 +    if (f - s_race.ch_last_hit[t] > 1200)
 +      s_race.ch_combo[t] = 0;
 +    const int combo = s_race.ch_combo[t];
@@ -25239,10 +25926,12 @@ HcmV?d00001
 +    if (room < want)
 +      s_race.ch_capped++;
 +    // never on the first hit of a run: a racer is worn down, then finished
-+    if (prey && (combo >= 1 || cur < 0.5f * maxe) && cur - want <= std::max(kHuntFloor, kHuntFinish[s_race.hunt_level] * maxe) && room > 0.0f && field > L.min_field)
++    const bool paced = MayhemPaced(v);
++    if (prey && paced && (combo >= 1 || cur < 0.5f * maxe) && cur - want <= std::max(kHuntFloor, (t == pl ? kHuntFinishPl : kHuntFinish)[s_race.hunt_level] * maxe) && room > 0.0f && field > L.min_field)
 +    {
 +      // the takedown: what the game itself does when a hit takes the last energy
 +      W32(v[t].r, BE32(v[t].r) | F_KO);
++      s_race.pu_ko_seen[t] = 2;
 +      v[t].r[0x593] = 0x3C;
 +      WF(v[t].r + 0x184, 0.0f);
 +      WF(v[t].r + 0x224, 0.0f);
@@ -25278,7 +25967,7 @@ HcmV?d00001
 +      continue;
 +    }
 +    // room for the hit, but never the last point of energy (and no takedowns at all once the field is at its floor)
-+    const float keep = field > L.min_field ? kHuntFloor : std::max(kHuntFloor, 0.12f * maxe);
++    const float keep = field > L.min_field && paced ? kHuntFloor : std::max(kHuntFloor, 0.12f * maxe);
 +    const float dmg = std::max(0.0f, std::min({want, room, cur - keep}));
 +    if (dmg > 0.0f)
 +    {
@@ -25296,8 +25985,23 @@ HcmV?d00001
 +  }
 +  if (p.alive && !p.finished)
 +    s_race.ch_min_e = std::min(s_race.ch_min_e, BEF(p.r + 0x184));
++  {
++    // the takedown rule seen from the player: worn down (a hit in the last 20 s, or under half energy) and one more hit
++    // from his hunter would leave him under the level's finish line. It clears as soon as he recharges above it.
++    const float raw = static_cast<float>(static_cast<u16>(BE16(p.r + 0x5DA)));
++    const float maxe = raw > 0.0f ? raw : 100.0f, cur = BEF(p.r + 0x184);
++    const int combo = f - s_race.ch_last_hit[pl] > 1200 ? 0 : s_race.ch_combo[pl];
++    const float next = std::min(L.hit_player * ChainScale() * (1.0f + 0.5f * combo), 0.34f) * maxe;
++    s_race.ch_vulnerable = p.alive && !p.finished && s_race.ch_hunter[pl] >= 0 && field > L.min_field && MayhemPaced(v) &&
++                           (combo >= 1 || cur < 0.5f * maxe) && cur - next <= std::max(kHuntFloor, kHuntFinishPl[s_race.hunt_level] * maxe);
++  }
 +  if (f < grace)
 +    return;
++  if (s_race.hunt_level == kMayhem)
++  {
++    TickPursuit(v, L);
++    return;
++  }
 +  // every CPU goes for its target with the game's own attack
 +  for (int a = 0; a < n; a++)
 +  {
@@ -25389,10 +26093,9 @@ HcmV?d00001
 +  h.crown = s_race.crown;
 +  for (int i = 0; i < kMax; i++)
 +  {
-+    h.score[i] = s_race.score[i] / 10.0f;
-+    h.rounds[i] = s_race.rounds[i];
++    h.score[i] = s_race.score[i];  // Breakaway points (lit17s45mh: already points, 10 a second held)
++    h.ba_order[i] = s_race.ba_order[i];
 +  }
-+  h.round = s_race.round;
 +  h.scoring_over = s_race.scoring_over;
 +  h.winner = s_race.winner;
 +  if (s_race.player >= 0)
@@ -25403,7 +26106,23 @@ HcmV?d00001
 +    h.ch_target_gap = h.ch_target >= 0 ? v[h.ch_target].dist - v[pl].dist : 0.0f;
 +    h.ch_hunter_gap = h.ch_hunter >= 0 ? v[pl].dist - v[h.ch_hunter].dist : 0.0f;
 +    h.ch_danger = h.ch_hunter >= 0 && s_race.ch_attack[h.ch_hunter] > 0;
++    h.ch_vulnerable = s_race.ch_vulnerable;
++    h.hu_done = s_race.hu_done;
++    h.hu_order = s_race.hu_order;
++    h.hu_pts = s_race.hu_pts;
 +    h.ch_kos = s_race.ch_kos[pl];
++    h.hu_live = HuPlaceInt(pl) + kHuntKoPoints * s_race.ch_kos[pl];
++    h.hu_lap_pos = s_race.hu_n[pl] > 0 && s_race.count > 1 ?
++                       static_cast<int>(std::lround((s_race.count - 1) * (1.0 - s_race.hu_sum[pl] / s_race.hu_n[pl]))) + 1 : -1;
++    h.hu_nlaps = 0;
++    for (int L = 0; L < kHuLaps; L++)
++    {
++      const float x = L < s_race.hu_lap[pl] || s_race.hu_stop[pl] ? s_race.hu_lap_pts[pl][L] : L == s_race.hu_lap[pl] ? s_race.hu_part[pl] : 0.0f;
++      h.hu_laps[L] = static_cast<int>(std::lround(x));
++      if (L <= s_race.hu_lap[pl] && (x > 0.0f || L < s_race.hu_lap[pl]))
++        h.hu_nlaps = L + 1;
++    }
++    h.hu_over_frame = s_race.hu_over_frame;
 +  }
 +  h.hunt_level = s_race.hunt_level;
 +  h.hunt_result = s_race.result;
@@ -25440,6 +26159,17 @@ HcmV?d00001
 +void SetSetting(const std::string& s)
 +{
 +  Config::SetBaseOrCurrent(GFX_PC5090_RACEMODE, s);
++  Config::Save();
++}
++
++std::string GetHuntedLevel()
++{
++  return Config::Get(GFX_PC5090_HUNTEDLEVEL);
++}
++
++void SetHuntedLevel(const std::string& s)
++{
++  Config::SetBaseOrCurrent(GFX_PC5090_HUNTEDLEVEL, s);
 +  Config::Save();
 +}
 +
@@ -27435,27 +28165,65 @@ HcmV?d00001
 +  }
 +  else if (h.kind == Kind::Breakaway)
 +  {
-+    int top = 0;
-+    for (int i = 0; i < h.count; i++)
-+      if (h.score[i] > h.score[top])
-+        top = i;
-+    if (!h.scoring_over && h.crown >= 0)
-+    {
-+      Crown(VX(X), VY(Y0 + 14.0f), VX(X + 18.0f), VY(Y0 - 1.0f), 1.0f);
-+      std::string holder = h.crown == h.player ? std::string("YOU") : NameOf(h.crown, 12);
-+      while (holder.size() > 3 && TextWidth(holder, 13.0f * 1.12f) > 100.0f)  // never into the round counter
-+        holder.pop_back();
-+      Label(holder, X + 21.0f, Y0, 13.0f, h.crown == h.player ? kGold : kCyan);
-+    }
-+    Rac(R_ST, X, Y0 + 19.0f, 20.0f, 12.0f);
-+    Digits(R_CYAN, static_cast<int>(h.score[top]), X + 24.0f, Y0 + 17.0f, 15.0f, 15.0f, 13.0f, kWhite);
-+    Rac(R_YOU, X - 1.0f, Y0 + 37.0f, 26.0f, 14.0f);
-+    Digits(R_CYAN, static_cast<int>(h.score[h.player]), X + 28.0f, Y0 + 36.0f, 15.0f, 15.0f, 13.0f,
-+           h.crown == h.player ? A(kWhite, 0.72f + 0.28f * pulse) : kWhite);
-+    for (int k = 0; k < std::min<int>(h.rounds[h.player], 5); k++)
-+      Rac(R_STAR, left_block ? X + k * 12.0f : X + 92.0f + k * 12.0f, left_block ? Y0 + 54.0f : Y0 + 36.0f, 11.0f, 13.0f);
++    const int pl = h.player;
++    const auto name = [&](int slot, float room, float fh) {
++      std::string nm = slot == pl ? std::string("YOU") : NameOf(slot, 12);
++      while (nm.size() > 3 && TextWidth(nm, fh * 1.12f) > room)
++        nm.pop_back();
++      return nm;
++    };
 +    if (!h.scoring_over)
-+      Label("R" + std::to_string(std::min(h.round + 1, kRounds)) + "/" + std::to_string(kRounds), X + 166.0f, Y0, 13.0f, kCyan, 1);
++    {
++      int top = -1;  // the points leader (not the same as the crown holder)
++      for (int i = 0; i < h.count; i++)
++        if (top < 0 || h.score[i] > h.score[top])
++          top = i;
++      if (h.frame < 300)
++      {
++        const Col c = A(kWhite, std::clamp((300.0f - h.frame) / 30.0f, 0.0f, 1.0f));
++        GameText("Hold the lead to earn points.", 330.0f, 104.0f, 13.0f, c, 0);
++        GameText("Take the crown for a bonus. Highest score wins.", 330.0f, 121.0f, 13.0f, c, 0);
++      }
++      const float vx = X + 96.0f;  // value column; everything stays left of X + 170 (the POS counter)
++      Crown(VX(X), VY(Y0 + 12.0f), VX(X + 14.0f), VY(Y0 - 1.0f), 1.0f);
++      Label("CROWN HOLDER", X + 16.0f, Y0 + 2.0f, 9.0f, kCyan);
++      if (h.crown >= 0)
++        Label(name(h.crown, 74.0f, 13.0f), vx, Y0, 13.0f, h.crown == pl ? kGold : kWhite);
++      Label("YOUR SCORE", X, Y0 + 20.0f, 9.0f, kCyan);
++      const float w = Digits(R_CYAN, static_cast<int>(h.score[pl]), vx, Y0 + 17.0f, 15.0f, 15.0f, 13.0f,
++                             h.crown == pl ? A(kWhite, 0.72f + 0.28f * pulse) : kWhite);
++      if (top >= 0 && top != pl && h.score[top] >= 1.0f)  // the gap to the points leader
++        Label("-" + std::to_string(static_cast<int>(h.score[top]) - static_cast<int>(h.score[pl])), vx + w + 4.0f, Y0 + 19.0f,
++              11.0f, kAmber);
++      Label("POINTS LEADER", X, Y0 + 38.0f, 9.0f, kCyan);
++      if (top >= 0 && h.score[top] >= 1.0f)
++        Label(name(top, 74.0f, 13.0f), vx, Y0 + 36.0f, 13.0f, top == pl ? kGold : kWhite);
++    }
++    else
++    {
++      // the result: Breakaway points decide, finishing position breaks ties, retired racers rank below. Once the player is
++      // through the line the game's own result card takes the middle: the list moves into the left margin, smaller
++      const bool slim = h.player_finished;
++      const float x0 = slim ? 4.0f : X, fh = slim ? 9.0f : 12.0f, lh = slim ? 12.0f : 15.0f, dw = slim ? 10.0f : 13.0f;
++      const float nx = slim ? 21.0f : 28.0f, sx = slim ? 76.0f : 116.0f, room = slim ? 50.0f : 80.0f;
++      Label(slim ? "BREAKAWAY" : "BREAKAWAY RESULT", x0, Y0 + 1.0f, slim ? 9.0f : 11.0f, kGold);
++      int mine = -1, shown = 0;
++      for (int k = 0; k < h.count; k++)
++        if (h.ba_order[k] == pl)
++          mine = k;
++      const auto row = [&](int k, float y) {
++        const int slot = h.ba_order[k];
++        const Col c = slot == pl ? kGold : kWhite;
++        Digits(R_CYAN, k + 1, x0, y + 1.0f, dw, dw, dw - 2.0f, c);
++        Label(name(slot, room, fh), x0 + nx, y, fh, c);
++        Digits(R_CYAN, static_cast<int>(h.score[slot]), x0 + sx, y + 1.0f, dw, dw, dw - 2.0f, c);
++      };
++      for (int k = 0; k < std::min(h.count, 5); k++)
++        if (h.ba_order[k] >= 0)
++          row(k, Y0 + lh + 2.0f + lh * k), shown = k + 1;
++      if (mine >= shown && mine >= 0)
++        row(mine, Y0 + lh + 2.0f + lh * shown + 4.0f);
++    }
 +  }
 +  else if (h.kind == Kind::Hunted && !h.player_finished && !h.player_out)
 +  {
@@ -27482,20 +28250,69 @@ HcmV?d00001
 +      metres(h.ch_hunter_gap, X + 25.0f, Y0 + 24.0f);
 +    else
 +      Label(h.player_pos >= 0 && h.player_pos + 1 >= h.alive ? "LAST" : "CLEAR", X + 25.0f, Y0 + 25.0f, 13.0f, kGreen);
++    if (h.ch_vulnerable)
++      Label("VULNERABLE", X + 92.0f, Y0 + 25.0f, 12.0f, A(kRed, 0.65f + 0.35f * pulse));
 +    if (h.ch_kos > 0)
 +    {
 +      // not the star: the game's star next to the portraits already counts spare machines
 +      Label("KO", X + 92.0f, Y0 + 2.0f, 13.0f, kGold);
 +      Digits(R_CYAN, h.ch_kos, X + 115.0f, Y0 + 1.0f, 16.0f, 16.0f, 14.0f, kWhite);
 +    }
++    // the running score: place points (per lap, by the place held) + takedowns, and the mean place this lap
++    Label("YOUR POINTS", X, Y0 + 44.0f, 9.0f, kCyan);
++    Digits(R_CYAN, h.hu_live, X + 66.0f, Y0 + 42.0f, 12.0f, 12.0f, 10.0f, kWhite);
++    if (h.hu_lap_pos > 0)
++    {
++      Label("LAP AVG", X + 100.0f, Y0 + 44.0f, 9.0f, kCyan);
++      Digits(R_CYAN, h.hu_lap_pos, X + 142.0f, Y0 + 42.0f, 12.0f, 12.0f, 10.0f, kWhite);
++    }
 +  }
 +  // the Hunted result, in the block's place: takedowns and points (the game shows the finishing place itself)
-+  if (h.kind == Kind::Hunted && h.player_finished && h.ch_points >= 0)
++  // lit17s45mh: the Hunted standings (race place + 10 per confirmed takedown) in the left margin, the same order the cup
++  // standings get; the game's own result card keeps the middle
++  if (h.kind == Kind::Hunted && h.hu_done && (h.player_finished || h.player_out))
 +  {
-+    Label("KO", X, Y0 + 2.0f, 13.0f, kGold);
-+    Digits(R_CYAN, h.ch_kos, X + 25.0f, Y0 + 1.0f, 16.0f, 16.0f, 14.0f, kWhite);
-+    Label("PTS", X, Y0 + 25.0f, 13.0f, kCyan);
-+    Digits(R_CYAN, h.ch_points, X + 34.0f, Y0 + 24.0f, 16.0f, 16.0f, 14.0f, kWhite);
++    const int pl = h.player;
++    const float x0 = 4.0f, fh = 9.0f, lh = 12.0f, dw = 10.0f;
++    Label("HUNTED RESULT", x0, Y0 + 1.0f, 9.0f, kGold);
++    int mine = -1, shown = 0;
++    for (int k = 0; k < h.count; k++)
++      if (h.hu_order[k] == pl)
++        mine = k;
++    const auto row = [&](int k, float y) {
++      const int slot = h.hu_order[k];
++      const Col c = slot == pl ? kGold : kWhite;
++      std::string nm = slot == pl ? std::string("YOU") : NameOf(slot, 12);
++      while (nm.size() > 3 && TextWidth(nm, fh * 1.12f) > 50.0f)
++        nm.pop_back();
++      Digits(R_CYAN, k + 1, x0, y + 1.0f, dw, dw, dw - 2.0f, c);
++      Label(nm, x0 + 21.0f, y, fh, c);
++      Digits(R_CYAN, h.hu_pts[slot], x0 + 76.0f, y + 1.0f, dw, dw, dw - 2.0f, c);
++    };
++    for (int k = 0; k < std::min(h.count, 5); k++)
++      if (h.hu_order[k] >= 0)
++        row(k, Y0 + lh + 2.0f + lh * k), shown = k + 1;
++    float y = Y0 + lh + 2.0f + lh * shown + 4.0f;
++    if (mine >= shown && mine >= 0)
++      row(mine, y), y += lh;
++    // the player's points: place points per lap + takedowns = total (the same numbers the standings use)
++    y += 4.0f;
++    for (int L = 0; L < h.hu_nlaps; L++, y += lh)
++    {
++      Label("LAP " + std::to_string(L + 1), x0, y + 2.0f, fh, kCyan);
++      Digits(R_CYAN, h.hu_laps[L], x0 + 76.0f, y + 2.0f, dw, dw, dw - 2.0f, kWhite);
++    }
++    Label("KO " + std::to_string(h.ch_kos) + " X" + std::to_string(kHuntKoPoints), x0, y + 2.0f, fh, kCyan);
++    Digits(R_CYAN, h.ch_kos * kHuntKoPoints, x0 + 76.0f, y + 2.0f, dw, dw, dw - 2.0f, kWhite);
++    y += lh;
++    Label("TOTAL", x0, y + 2.0f, fh, kGold);
++    Digits(R_CYAN, pl >= 0 ? h.hu_pts[pl] : 0, x0 + 76.0f, y + 2.0f, dw, dw, dw - 2.0f, kGold);
++  }
++  // Mayhem: the 10th confirmed takedown ended the race
++  if (h.kind == Kind::Hunted && h.hu_over_frame >= 0 && static_cast<int>(h.frame) - h.hu_over_frame < 360)
++  {
++    const float a = std::clamp((360.0f - static_cast<float>(static_cast<int>(h.frame) - h.hu_over_frame)) / 30.0f, 0.0f, 1.0f);
++    Label(std::to_string(kMayhemEndKos) + " TAKEDOWNS: RACE OVER", 320.0f, 58.0f, 20.0f, A(kGold, a), 0);
 +  }
 +  // one short event, sliding in under the block like the game's own notices
 +  if (!h.flashes.empty() && !h.player_finished)
@@ -27527,7 +28344,7 @@ HcmV?d00001
 +}  // namespace ERModes
 --- a/Source/Core/VideoCommon/ERModes.h
 +++ b/Source/Core/VideoCommon/ERModes.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,67 @@
 +// Copyright 2026 Evolution Racing (Evolution Racing Dolphin)
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -27539,12 +28356,13 @@ HcmV?d00001
 +//     and the machine parked far under the course (it falls out of the world, out of sight; the game ranks it last);
 +//   - Hunted is a food chain: every racer has a target ahead and a hunter behind; CPUs use the game's own attack on it
 +//     target (per-racer damage cap, 10 s grace, a field floor below which nobody is taken out);
-+//   - Breakaway: scoring rules only (a long reign fades, 2nd earns the rest, take bonus, round cap); no speed or energy change.
++//     Mayhem (lit17s45mh): every CPU pursues its target (pace, its line, the game's attack once beside it);
++//   - Breakaway: scoring rules only (the crown holder scores while leading, a takeover bonus); no speed or energy change.
 +// The HUD (countdowns, crown, hunter markers, scores) is drawn into the EFB right before the game's HUD (the
 +// nameplates pass), so it is in screenshots / frame dumps too.
 +//
 +// Which mode: GFX.ini [PC5090] RaceMode = Disc (default: the disc's files/evo/racemodes.json, per cup) | Off |
-+// Cutoff | Breakaway | Hunted (every Grand Prix race). [PC5090] HuntedLevel = Calm | Normal | Fierce (overrides the
++// Cutoff | Breakaway | Hunted (every Grand Prix race). [PC5090] HuntedLevel = Calm | Normal | Fierce | Mayhem (overrides the
 +// disc's). Nothing is read or written outside a Grand Prix race with an active mode.
 +
 +#pragma once
@@ -27581,6 +28399,8 @@ HcmV?d00001
 +// Qt menu / ini
 +std::string GetSetting();             // "Disc" | "Off" | "Cutoff" | "Breakaway" | "Hunted"
 +void SetSetting(const std::string&);  // sets + saves GFX.ini
++std::string GetHuntedLevel();             // "" (the disc's) | "Calm" | "Normal" | "Fierce" | "Mayhem"
++void SetHuntedLevel(const std::string&);  // sets + saves GFX.ini
 +
 +// video thread
 +bool HudActive();  // a mode is running in this race (cheap)
