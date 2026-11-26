@@ -15131,7 +15131,7 @@ HcmV?d00001
  
 +// Evolution Racing member build id (one id for the Linux and the Windows build of the same source)
 +#ifndef ER_BUILD_ID
-+#define ER_BUILD_ID "lit17s43ermbtgh"
++#define ER_BUILD_ID "lit17s43ermbtghl"
 +#endif
 +const std::string& GetERBuildStr()
 +{
@@ -15141,7 +15141,7 @@ HcmV?d00001
 +
 +// Evolution Racing X.Y (hub/server/versions.json; lighting_mod/updater/apply_version.py sets it)
 +#ifndef ER_VERSION
-+#define ER_VERSION "1.7.6"
++#define ER_VERSION "1.7.7"
 +#endif
 +// "ER_VERSION=1.3" stays in the binary (not const, read below): scripts/dolphinpack.py / winpack.py look for it
 +extern char er_version_marker[];
@@ -20548,7 +20548,7 @@ HcmV?d00001
  }  // namespace DVD
 --- a/Source/Core/Core/HW/DVD/ERTrackLib.cpp
 +++ b/Source/Core/Core/HW/DVD/ERTrackLib.cpp
-@@ -0,0 +1,1239 @@
+@@ -0,0 +1,1409 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +// Tracks on demand (route 4, 2026-11-24).
@@ -20584,6 +20584,7 @@ HcmV?d00001
 +#include <cctype>
 +#include <cstdio>
 +#include <cstring>
++#include <ctime>
 +#include <filesystem>
 +#include <map>
 +#include <memory>
@@ -21410,6 +21411,10 @@ HcmV?d00001
 +// are picked up the next time a mode is picked (GetTrack re-reads a changed track.json). HD textures: see SyncNow.
 +std::atomic<bool> s_sync_busy{false};
 +std::atomic<u64> s_sync_next{0};
++std::atomic<u64> s_sync_last{0};  // steady seconds of the last sync START (RequestSync: at most one every 20 s)
++std::atomic<u32> s_sync_gen{0};   // completed syncs
++constexpr u64 kSyncGap = 20;
++void SendPendingRuns(Common::HttpRequest& req, const std::string& hub, const Common::HttpRequest::Headers& h);
 +std::string Sha1Hex(const std::string& b)
 +{
 +  const auto d = Common::SHA1::CalculateDigest(std::string_view(b));
@@ -21440,6 +21445,7 @@ HcmV?d00001
 +    std::fprintf(stderr, "ERTRACKLIB sync: no manifest (HTTP %d)\n", req.GetLastResponseCode());
 +    return;
 +  }
++  std::fprintf(stderr, "ERTRACKLIB sync: manifest\n");
 +  picojson::value v;
 +  const std::string text(resp->begin(), resp->end());
 +  if (!picojson::parse(v, text).empty() || !v.is<picojson::object>())
@@ -21457,6 +21463,16 @@ HcmV?d00001
 +        continue;
 +      hub_ids.insert(id);
 +      const auto& files = tv.get<picojson::object>().at("files").get<picojson::object>();
++      // 1.7.7: the hub's credit for this track (full name, author, version) next to its files (not one of them)
++      const auto write_credit = [&] {
++        const auto& to = tv.get<picojson::object>();
++        if (!to.count("credit") || !to.at("credit").is<picojson::object>() || !File::IsDirectory(lib + id))
++          return;
++        const std::string c = to.at("credit").serialize();
++        std::string old;
++        if (c.size() < 2048 && (!File::ReadFileToString(lib + id + "/credit.json", old) || old != c))
++          File::WriteStringToFile(lib + id + "/credit.json", c);
++      };
 +      bool same = true;
 +      for (const auto& [rel, fv] : files)
 +      {
@@ -21471,6 +21487,7 @@ HcmV?d00001
 +      if (same)
 +      {
 +        kept++;
++        write_credit();
 +        continue;
 +      }
 +      const std::string part = lib + id + ".part/";
@@ -21511,6 +21528,7 @@ HcmV?d00001
 +      File::DeleteDirRecursively(lib + id);
 +      File::Rename(lib + id + ".part", lib + id);
 +      fetched++;
++      write_credit();
 +      // HD textures where Dolphin's texture loader finds them
 +      // Load/Textures/1-GFZE01-tracklib/<id>/ (a GFZE01.txt marker makes Dolphin read the folder; launchers rebuild GFZE01/)
 +      const std::string hdroot = File::GetUserPath(D_HIRESTEXTURES_IDX) + "1-GFZE01-tracklib/";
@@ -21549,6 +21567,7 @@ HcmV?d00001
 +    }
 +  }
 +  std::fprintf(stderr, "ERTRACKLIB sync: %d fetched, %d up to date, %d failed, %d dropped\n", fetched, kept, failed, dropped);
++  SendPendingRuns(req, hub, h);
 +}
 +void MaybeSync()
 +{
@@ -21564,6 +21583,7 @@ HcmV?d00001
 +  if (s_sync_busy || now < s_sync_next)
 +    return;
 +  s_sync_next = now + 15 * 60;
++  s_sync_last = now;
 +  std::string cfg;
 +  File::ReadFileToString(File::GetUserPath(D_CONFIG_IDX) + "er-tracklib.txt", cfg);
 +  if (cfg.find("sync=off") != std::string::npos)
@@ -21574,14 +21594,164 @@ HcmV?d00001
 +  s_sync_busy = true;
 +  std::thread([hub = st.hub, tok = st.token]() {
 +    SyncNow(hub, tok);
++    s_sync_gen++;
 +    s_sync_busy = false;
 +  }).detach();
++}
++
++// ---------------------------------------------------------------- 1.7.7 library-run reports
++std::mutex s_runs_mtx;
++std::string RunsPendingPath()
++{
++  return File::GetUserPath(D_USER_IDX) + "ERTracks/runs-pending.json";
++}
++// returns true when the hub took (or refused for good) this report; false = try again later
++bool PostRun(Common::HttpRequest& req, const std::string& hub, const Common::HttpRequest::Headers& h0, const std::string& body)
++{
++  Common::HttpRequest::Headers h = h0;
++  h["Content-Type"] = "application/json";
++  h["Expect"] = std::nullopt;
++  auto r = req.Post(hub + "/hub/api/erd/tracklib/run", std::string_view(body), h, Common::HttpRequest::AllowedReturnCodes::All);
++  const int code = r ? req.GetLastResponseCode() : 0;
++  std::fprintf(stderr, "ERTRACKLIB run report: HTTP %d %s\n", code,
++               r ? std::string(r->begin(), r->begin() + std::min<size_t>(r->size(), 160)).c_str() : "");
++  return code == 200 || code == 400 || code == 403 || code == 404;
++}
++void QueueRuns(const std::vector<std::string>& bodies)
++{
++  std::lock_guard lk(s_runs_mtx);
++  picojson::array a;
++  std::string t;
++  picojson::value v;
++  if (File::ReadFileToString(RunsPendingPath(), t) && picojson::parse(v, t).empty() && v.is<picojson::array>())
++    a = v.get<picojson::array>();
++  for (const auto& b : bodies)
++    if (a.size() < 50)
++      a.push_back(picojson::value(b));
++  File::CreateFullPath(RunsPendingPath());
++  File::WriteStringToFile(RunsPendingPath(), picojson::value(a).serialize());
++}
++void SendPendingRuns(Common::HttpRequest& req, const std::string& hub, const Common::HttpRequest::Headers& h)
++{
++  std::vector<std::string> todo, keep;
++  {
++    std::lock_guard lk(s_runs_mtx);
++    std::string t;
++    picojson::value v;
++    if (!File::ReadFileToString(RunsPendingPath(), t) || !picojson::parse(v, t).empty() || !v.is<picojson::array>())
++      return;
++    for (const auto& x : v.get<picojson::array>())
++      if (x.is<std::string>())
++        todo.push_back(x.get<std::string>());
++    File::Delete(RunsPendingPath());
++  }
++  for (const auto& b : todo)
++    if (!PostRun(req, hub, h, b))
++      keep.push_back(b);
++  if (!keep.empty())
++    QueueRuns(keep);
 +}
 +}  // namespace
 +
 +std::string LibraryDir()
 +{
 +  return File::GetUserPath(D_USER_IDX) + "ERTracks/lib/";
++}
++
++void RequestSync()
++{
++  if (s_sync_busy)
++    return;
++  const u64 last = s_sync_last;
++  const u64 at = last ? last + kSyncGap : 0;  // now when the last start is 20 s old, else when it will be
++  if (at < s_sync_next)
++    s_sync_next = at;
++}
++bool SyncBusy()
++{
++  return s_sync_busy;
++}
++u32 SyncGen()
++{
++  return s_sync_gen;
++}
++
++Credit CreditOf(int slot)
++{
++  static std::map<std::string, std::pair<std::string, Credit>> s_cache;  // id -> (file sig, credit); CPU thread only
++  const std::string id = ServedId(slot);
++  if (id.empty())
++    return {};
++  const std::string dir = LibraryDir() + id + "/";
++  const std::string sig = FileSig(dir + "credit.json") + "|" + FileSig(dir + "track.json");
++  auto it = s_cache.find(id);
++  if (it != s_cache.end() && it->second.first == sig)
++    return it->second.second;
++  Credit c;
++  c.ok = true;
++  const auto clean = [](std::string x, size_t n) {
++    std::string o;
++    for (unsigned char ch : x)
++      if (ch >= 32 && ch < 127 && o.size() < n)
++        o += static_cast<char>(ch);
++    while (!o.empty() && o.back() == ' ')
++      o.pop_back();
++    return o;
++  };
++  for (const char* f : {"track.json", "credit.json"})  // credit.json (the hub's) wins
++  {
++    std::string t;
++    picojson::value v;
++    if (!File::ReadFileToString(dir + f, t) || t.size() > (1u << 20) || !picojson::parse(v, t).empty() ||
++        !v.is<picojson::object>())
++      continue;
++    const auto& o = v.get<picojson::object>();
++    const auto str = [&](const char* k) { return o.count(k) && o.at(k).is<std::string>() ? o.at(k).get<std::string>() : std::string(); };
++    if (!str("name").empty())
++      c.name = clean(str("name"), 48);
++    if (!str("author").empty())
++      c.author = clean(str("author"), 32);
++    if (o.count("version") && o.at("version").is<double>() && o.at("version").get<double>() >= 1)
++      c.version = std::to_string(static_cast<int>(o.at("version").get<double>()));
++    else if (!str("version").empty())
++      c.version = clean(str("version"), 12);
++  }
++  if (c.author.empty())
++    c.author = "Unreal";  // the owner's tracks (older entries carry no author)
++  s_cache[id] = {sig, c};
++  return c;
++}
++
++void ReportRun(int slot, u32 ms, const std::string& mode, int racers)
++{
++  const std::string id = ServedId(slot), coli = ServedColiSha1(slot);
++  if (id.empty() || coli.empty())
++    return;
++  std::string cfg;
++  File::ReadFileToString(File::GetUserPath(D_CONFIG_IDX) + "er-tracklib.txt", cfg);
++  const ERGhosts::Settings st = ERGhosts::Load();
++  if (cfg.find("runs=off") != std::string::npos || st.offline || st.token.empty() || !ERGhosts::HubAllowed(st.hub))
++    return;
++  picojson::object o;
++  o["coli"] = picojson::value(coli);
++  o["id"] = picojson::value(id);
++  o["slot"] = picojson::value(static_cast<double>(slot));
++  o["ms"] = picojson::value(static_cast<double>(ms));
++  o["mode"] = picojson::value(mode);
++  o["racers"] = picojson::value(static_cast<double>(racers));
++  o["at"] = picojson::value(static_cast<double>(std::time(nullptr)));
++  const std::string body = picojson::value(o).serialize();
++  std::fprintf(stderr, "ERTRACKLIB run: %s slot %d %u ms (%s, %d racers)\n", id.c_str(), slot, ms, mode.c_str(), racers);
++  std::thread([hub = st.hub, tok = st.token, body]() {
++    std::string h0 = hub;
++    while (!h0.empty() && h0.back() == '/')
++      h0.pop_back();
++    Common::HttpRequest req(std::chrono::milliseconds(20000));
++    const Common::HttpRequest::Headers h = {{"X-ER-Dolphin", tok}, {"X-ER-Build", Common::GetERBuildStr()},
++                                            {"Accept", "application/json"}};
++    if (!req.IsValid() || !PostRun(req, h0, h, body))
++      QueueRuns({body});
++  }).detach();
 +}
 +
 +int LibSlot(const std::string& id)
@@ -21790,7 +21960,7 @@ HcmV?d00001
 +}  // namespace ERTrackLib
 --- a/Source/Core/Core/HW/DVD/ERTrackLib.h
 +++ b/Source/Core/Core/HW/DVD/ERTrackLib.h
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,67 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +// Tracks on demand: a course slot's files and table rows come from a host track library instead of the disc.
@@ -21836,6 +22006,24 @@ HcmV?d00001
 +std::string ServedId(int slot);
 +// the served track's bgx sidecar folder for this slot ("" = none: use the slot folder as before)
 +std::string BgxDir(int slot);
++// 1.7.7 re-sync at mode pick: ERModes calls this every time SELECT MODE shows; a hub sync starts soon (at most one
++// sync start every 20 s; a request inside that window starts one when the 20 s are up). Never blocks.
++void RequestSync();
++bool SyncBusy();
++// completed syncs since boot (ERModes re-reads the mode cups once after each)
++u32 SyncGen();
++// 1.7.7 credit of the library track served in this slot now (manifest "credit", kept in lib/<id>/credit.json; older
++// entries: track.json author / name). ok = false: no library track here. CPU thread.
++struct Credit
++{
++  bool ok = false;
++  std::string name, author, version;
++};
++Credit CreditOf(int slot);
++// 1.7.7 library-run report: the player finished a race on the library track served in this slot (unlock path 2 on the
++// hub counts one per different starter track). Posted in its own thread; kept in ERTracks/runs-pending.json and sent
++// with the next sync when the hub could not be reached. CPU thread.
++void ReportRun(int slot, u32 ms, const std::string& mode, int racers);
 +// DVD interface / DVD thread
 +bool Covers(u64 offset, u32 length);
 +bool Read(u64 offset, u32 length, u8* out);
@@ -24152,7 +24340,7 @@ HcmV?d00001
 +};
 --- a/Source/Core/VideoCommon/ERModes.cpp
 +++ b/Source/Core/VideoCommon/ERModes.cpp
-@@ -0,0 +1,4189 @@
+@@ -0,0 +1,4439 @@
 +// Copyright 2026 Evolution Racing (Evolution Racing Dolphin)
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -24190,6 +24378,7 @@ HcmV?d00001
 +#include "Common/CommonPaths.h"
 +#include "Common/Config/Config.h"
 +#include "Common/FileUtil.h"
++#include "Common/StringUtil.h"
 +#include "Common/Swap.h"
 +#include "Core/Config/MainSettings.h"
 +#include "Core/ERGhosts.h"
@@ -26504,8 +26693,9 @@ HcmV?d00001
 +  static const std::array<ModeCup, 5> none{};
 +  if (mode < 0 || mode > 3)
 +    return none;
-+  static u32 s_lib_poll = 0;
-+  if (s_mc.cache && s_mc.applied < 0 && (++s_lib_poll % 120) == 0)  // the hub sync or the track swapper changed the cups: re-read (not while shown)
++  static u32 s_lib_poll = 0, s_lib_gen = 0;
++  const u32 gen = ERTrackLib::SyncGen();  // 1.7.7: a sync just finished: check at once (not on the 120th call)
++  if (s_mc.cache && s_mc.applied < 0 && ((++s_lib_poll % 120) == 0 || gen != s_lib_gen) && (s_lib_gen = gen, true))  // the hub sync or the track swapper changed the cups: re-read (not while shown)
 +  {
 +    static u64 s_lib_sig = 0;
 +    u64 sig2 = 0;
@@ -26830,6 +27020,7 @@ HcmV?d00001
 +    {
 +      s_gpsel.phase = SelPhase::Mode;
 +      std::fprintf(stderr, "ERMODES select: mode screen (%s)\n", kSelNames[SelLast()]);
++      ERTrackLib::RequestSync();  // 1.7.7: Track Swapper picks / hub cup changes land at this mode pick (rate limited)
 +    }
 +    else
 +    {
@@ -26842,6 +27033,8 @@ HcmV?d00001
 +    s->button &= ~PAD_BUTTON_Y;
 +    if (pressed & (PAD_BUTTON_A | PAD_BUTTON_START))
 +    {
++      if (ERTrackLib::SyncBusy())  // 1.7.7: never wait; the next mode pick gets the new cups
++        std::fprintf(stderr, "ERMODES modecup: hub sync still running, cups from the last sync\n");
 +      // the game never sees this A (it would leave for the next screen): its confirm sound and icon flash, driven from here
 +      s_pad_swallow |= PAD_BUTTON_A | PAD_BUTTON_START;
 +      std::memcpy(s_gpsel.timers, st + 0xF0, sizeof(s_gpsel.timers));
@@ -27028,6 +27221,221 @@ HcmV?d00001
 +u32 s_cost_batches = 0;
 +void OnFrameInner(Core::System& system);
 +
++// ---- 1.7.7 track credit ("Created by <author>") + library-run reports ----
++// CPU thread, every VI field of a race on a TRACK LIBRARY course (ERTrackLib serves the race's course slot): the race
++// intro (before GO) gets a "Created by <author>" line under the game's own course name; the pause menu and the result
++// screen get "<full name>  by <author>  v<version>" at the bottom. Disc courses: nothing (one RAM read a field).
++// When the player finishes, the run is reported to the hub once (ERTrackLib::ReportRun: library access unlock path 2).
++// Positions: User/pc5090-credit.txt "intro|pause|results X Y H" (HUD space 640 x 448) overrides the defaults.
++struct CreditPos
++{
++  float x, y, h;
++  int align;  // -1 left, 0 centre, 1 right
++};
++struct CreditView
++{
++  int phase = 0;  // 0 none, 1 intro, 2 pause, 3 results
++  float a = 0.0f;
++  std::string line;
++  CreditPos pos{};
++};
++std::mutex s_credit_mtx;
++CreditView s_credit_view;
++std::atomic<bool> s_credit_show{false};
++struct CreditRace
++{
++  u32 B = 0;
++  int slot = -1;
++  ERTrackLib::Credit c;
++  u32 last_fr = 0, clk_prev = 0, go_frames = 0;
++  int still = 0, intro = 0, after_go = 0, stable = 0, title_end = -1;
++  int player = -1;  // fixed before GO: once through the line the game drives the player's machine (its CPU byte flips)
++  int bgm_seen = -1;
++  bool flyover = false;  // the game plays course_view.adx: its course flyover with the venue / course-name title
++  bool reported = false;
++  // intro: under the game's course name (its title block is centred at x ~199 on every venue); pause: under the pause menu box;
++  // results: bottom left (the game's post-race menu sits bottom right, mode result lists top left)
++  std::array<CreditPos, 3> pos{{{199.0f, 222.0f, 14.0f, 0}, {320.0f, 322.0f, 12.0f, 0}, {24.0f, 418.0f, 12.0f, -1}}};
++} s_cr;
++static void CreditOff()
++{
++  if (s_credit_show)
++  {
++    std::lock_guard lk(s_credit_mtx);
++    s_credit_view = {};
++    s_credit_show = false;
++  }
++}
++static void CreditFrame()
++{
++  u32 B = 0, demo = 0;
++  const u8* pm = nullptr;
++  if (!R32(0x800030C8u, &B) || !InRam(B) || !(pm = P(B + 0x1BA9A0u, 4)) || BE16(pm) != 2 || !R32(B + 0x17D2FCu, &demo) ||
++      demo != 0)
++  {
++    if (s_trace && s_cr.slot >= 0)
++      std::fprintf(stderr, "ERMODES credit: race screen left (mode %d demo %u)\n", pm ? BE16(pm) : -1, demo);
++    if (s_cr.slot >= 0)
++      s_cr = {};
++    CreditOff();
++    return;
++  }
++  const u8* cid = P(B + 0x234CA4u, 2);
++  const int slot = cid ? cid[1] : -1;
++  if (slot != s_cr.slot || B != s_cr.B)
++  {
++    const auto pos = s_cr.pos;
++    s_cr = {};
++    s_cr.pos = pos;
++    s_cr.B = B;
++    s_cr.slot = slot;
++    s_cr.c = ERTrackLib::CreditOf(slot);
++    std::string t;
++    if (s_cr.c.ok && File::ReadFileToString(File::GetUserPath(D_USER_IDX) + "pc5090-credit.txt", t))
++    {
++      char what[16];
++      float x, y, h;
++      int al = 0;
++      for (const auto& ln : SplitString(t, '\n'))
++        if (const int n = std::sscanf(ln.c_str(), "%15s %f %f %f %d", what, &x, &y, &h, &al); n >= 4)
++        {
++          const std::string w = what;
++          const int k = w == "intro" ? 0 : w == "pause" ? 1 : w == "results" ? 2 : -1;
++          if (k >= 0)
++            s_cr.pos[k] = {x, y, h, n == 5 ? al : s_cr.pos[k].align};
++        }
++    }
++    if (s_cr.c.ok)
++      std::fprintf(stderr, "ERMODES credit: slot %d \"%s\" by %s v%s\n", slot, s_cr.c.name.c_str(), s_cr.c.author.c_str(),
++                   s_cr.c.version.c_str());
++  }
++  if (!s_cr.c.ok)
++  {
++    CreditOff();
++    return;
++  }
++  u32 fr = 0, clk = 0, arr = 0;
++  R32(0x801A66A0u, &fr);
++  R32(B + 0x1BF0E4u, &clk);  // the race clock: 0 until GO
++  const bool adv = fr != s_cr.last_fr;
++  s_cr.last_fr = fr;
++  s_cr.still = adv ? 0 : s_cr.still + 1;
++  if (clk == 0 && s_cr.clk_prev != 0)  // a retry / the next race on the same course
++    s_cr.intro = 0, s_cr.after_go = 0, s_cr.go_frames = 0, s_cr.reported = false, s_cr.title_end = -1, s_cr.bgm_seen = -1,
++    s_cr.player = -1;
++  // the BGM id the game plays (REL .bss + 0x6EAC4, scripts lead.py): the course flyover's, then the race song
++  int bgm = -1;
++  {
++    u32 si = 0, bss = 0;
++    if (R32(B + 0x10u, &si) && InRam(si) && R32(si + 48u, &bss) && InRam(bss & ~1u))
++      if (const u8* bp = P((bss & ~1u) + 0x6EAC4u, 1))
++        bgm = *bp;
++  }
++  if (bgm != s_cr.bgm_seen)  // its file name (REL BGM table B + 0x16D600 + 0x2D7B8, scripts lead.py), once per change
++  {
++    s_cr.bgm_seen = bgm;
++    s_cr.flyover = false;
++    u32 sp = 0;
++    if (bgm >= 0 && bgm < 200 && R32(B + 0x16D600u + 0x2D7B8u + static_cast<u32>(bgm) * 4u, &sp) && InRam(sp))
++      if (const u8* str = P(sp, 40))
++        s_cr.flyover = std::string_view(reinterpret_cast<const char*>(str), strnlen(reinterpret_cast<const char*>(str), 40))
++                           .find("course_view") != std::string_view::npos;
++  }
++  s_cr.clk_prev = clk;
++  // the player: the first racer that is not a CPU, taken before GO and kept
++  bool finished = false;
++  int racers = 0;
++  u32 pflags = 0;
++  if (R32(B + 0x227878u, &arr) && InRam(arr))
++    if (const u8* pc = P(B + 0x22788Au, 1); pc && *pc >= 1 && *pc <= kMax)
++      if (const u8* blk = P(arr, static_cast<size_t>(*pc) * 0x620u))
++      {
++        racers = *pc;
++        if (s_cr.player < 0 || s_cr.player >= racers)
++        {
++          s_cr.player = -1;
++          if (clk == 0)
++            for (int i = 0; i < racers; i++)
++              if (static_cast<s8>(blk[i * 0x620u + 0x474]) >= 0)
++              {
++                s_cr.player = i;
++                break;
++              }
++        }
++        if (s_cr.player >= 0)
++        {
++          const u32 f = BE32(blk + s_cr.player * 0x620u);
++          pflags = f;
++          finished = (f & F_FINISHED) && !(f & (F_RETIRED | F_KO | F_FELL));
++        }
++      }
++  if (racers == 0 || s_cr.player < 0)  // no field (a stale race screen at boot, the attract demo): nothing
++  {
++    CreditOff();
++    return;
++  }
++  int phase = 0;
++  float a = 0.0f;
++  if (clk == 0 && adv)
++    s_cr.intro++;
++  if (clk != 0 && adv && !finished)
++    s_cr.go_frames++;
++  if (clk != 0 && adv)
++    s_cr.after_go++;
++  if (finished)
++    phase = 3, a = 1.0f;
++  else if (s_cr.still >= 8 && clk != 0)  // the pause menu (the game's frame counter stands still; before GO it also
++    phase = 2, a = 1.0f;                 // stands still while the race song and the grid load: nothing then)
++  else if (clk == 0 && s_cr.still < 8)
++  {
++    // the course flyover (course_view.adx plays: the game's venue / course-name title is up): from 100 frames in (the
++    // title has slid in), fading in; it fades out when the race song replaces the flyover's music (the grid and the
++    // countdown follow: nothing of ours over them) or after 25 s at the latest. A Retry skips the flyover: no line.
++    if (s_cr.flyover && s_cr.intro <= 1500)
++      s_cr.title_end = s_cr.intro;  // the last intro frame with the flyover music
++    if (s_cr.intro >= 100 && s_cr.title_end >= 100 && s_cr.intro - s_cr.title_end < 15)
++    {
++      phase = 1;
++      a = std::clamp((s_cr.intro - 100) / 20.0f, 0.0f, 1.0f) * (1.0f - (s_cr.intro - s_cr.title_end) / 15.0f);
++    }
++  }
++  if (s_trace)
++  {
++    static u64 s_key = ~0ull;
++    const u64 key = (static_cast<u64>(phase) << 40) ^ (static_cast<u64>(finished) << 36) ^ (static_cast<u64>(clk == 0) << 35) ^
++                    (static_cast<u64>(s_cr.still >= 8) << 34) ^ (static_cast<u64>(bgm & 0xFF) << 24) ^ (pflags >> 8);
++    if (key != s_key)
++      std::fprintf(stderr, "ERMODES credit: phase %d finished %d clk %u still %d intro %d bgm %d pflags %08x racers %d\n", phase,
++                   finished, clk, s_cr.still, s_cr.intro, bgm, pflags, racers);
++    s_key = key;
++  }
++  if (finished && !s_cr.reported)
++  {
++    s_cr.reported = true;
++    const std::string mode = s_race.valid && s_race.kind != Kind::Off ? std::string(KindName(s_race.kind)) :
++                             racers == 1                             ? std::string("TIME ATTACK") :
++                                                                       std::string("RACE");
++    ERTrackLib::ReportRun(slot, static_cast<u32>(s_cr.go_frames * 1000ull / 60ull), mode, racers);
++  }
++  if (phase == 0 || a <= 0.0f)
++  {
++    CreditOff();
++    return;
++  }
++  CreditView v;
++  v.phase = phase;
++  v.a = a;
++  v.pos = s_cr.pos[phase - 1];
++  if (phase == 1)
++    v.line = "Created by " + s_cr.c.author;
++  else
++    v.line = (s_cr.c.name.empty() ? std::string() : s_cr.c.name + "   by ") + s_cr.c.author +
++             (s_cr.c.version.empty() ? std::string() : "   v" + s_cr.c.version);
++  std::lock_guard lk(s_credit_mtx);
++  s_credit_view = std::move(v);
++  s_credit_show = true;
++}
++
 +void OnFrame(Core::System& system)
 +{
 +  if (!s_trace)
@@ -27081,6 +27489,7 @@ HcmV?d00001
 +  const u8* id = P(0x80000000u, 6);
 +  if (!id || std::memcmp(id, "GFZE01", 6) != 0)
 +    return;
++  CreditFrame();  // 1.7.7 (also while paused)
 +  u32 frame = 0;
 +  if (!R32(0x801A66A0u, &frame) || frame == s_last_field_frame)
 +    return;  // paused, or this field is the same game frame
@@ -27984,7 +28393,7 @@ HcmV?d00001
 +
 +bool MenuLineActive()
 +{
-+  return s_menu_show.load() || s_ui_pending;
++  return s_menu_show.load() || s_ui_pending || s_credit_show.load();
 +}
 +
 +// the camera of this frame -> where the crown / hunter marks go (they are drawn with the rest of the UI, after the HUD)
@@ -28049,6 +28458,27 @@ HcmV?d00001
 +  }
 +}
 +
++// 1.7.7 the track credit (CreditFrame): the game's menu font with its dark edge; the intro line in the game's pale
++// course-name blue, the pause / result line white, shrunk to fit the screen
++static void DrawCredit()
++{
++  if (!s_credit_show.load())
++    return;
++  CreditView v;
++  {
++    std::lock_guard lk(s_credit_mtx);
++    v = s_credit_view;
++  }
++  if (v.phase == 0 || v.line.empty())
++    return;
++  float h = v.pos.h;
++  while (h > 8.0f && TextWidth(v.line, h) > 590.0f)
++    h -= 1.0f;
++  // the intro line in the pale steel blue of the game's course-name line, the others white
++  const Col c = v.phase == 1 ? Col{0.78f, 0.88f, 0.90f, v.a} : Col{1.0f, 1.0f, 1.0f, 0.92f * v.a};
++  GameText(v.line, v.pos.x, v.pos.y, h, c, v.pos.align);
++}
++
 +void DrawMenuLineInner(int src_left, int src_top, int src_right, int src_bottom);
 +void DrawMenuLine(int src_left, int src_top, int src_right, int src_bottom)
 +{
@@ -28067,7 +28497,8 @@ HcmV?d00001
 +  const bool race = s_ui_pending;
 +  s_ui_pending = false;
 +  const bool menu = s_menu_show.load();
-+  if ((!race && !menu) || g_framebuffer_manager->IsEFBStereo() || !EnsureGpu())
++  const bool credit = s_credit_show.load();
++  if ((!race && !menu && !credit) || g_framebuffer_manager->IsEFBStereo() || !EnsureGpu())
 +    return;
 +  auto pc = Core::System::GetInstance().GetVertexShaderManager().constants.pixelcentercorrection;
 +  if (pc[0] == 0.0f)
@@ -28101,6 +28532,12 @@ HcmV?d00001
 +      Rac(R_DOT, bx, y + 2.0f, 15.0f, 15.0f, {0.86f, 0.78f, 0.30f, 1.0f});
 +      GameText("Y", bx + 7.5f, y + 3.5f, 12.0f, {0.05f, 0.05f, 0.08f, 1.0f}, 0);
 +    }
++    FlushBatch();
++    return;
++  }
++  if (!race)  // a race without a mode: only the track credit
++  {
++    DrawCredit();
 +    FlushBatch();
 +    return;
 +  }
@@ -28339,6 +28776,7 @@ HcmV?d00001
 +    else
 +      Rac(R_WINNER, 170.0f - (1.0f - e) * 120.0f, 330.0f, 300.0f, 50.0f, A(kWhite, e * hold));
 +  }
++  DrawCredit();
 +  FlushBatch();
 +}
 +}  // namespace ERModes
