@@ -15131,7 +15131,7 @@ HcmV?d00001
  
 +// Evolution Racing member build id (one id for the Linux and the Windows build of the same source)
 +#ifndef ER_BUILD_ID
-+#define ER_BUILD_ID "lit17s43ermbt"
++#define ER_BUILD_ID "lit17s43ermbtg"
 +#endif
 +const std::string& GetERBuildStr()
 +{
@@ -15141,7 +15141,7 @@ HcmV?d00001
 +
 +// Evolution Racing X.Y (hub/server/versions.json; lighting_mod/updater/apply_version.py sets it)
 +#ifndef ER_VERSION
-+#define ER_VERSION "1.7.4"
++#define ER_VERSION "1.7.5"
 +#endif
 +// "ER_VERSION=1.3" stays in the binary (not const, read below): scripts/dolphinpack.py / winpack.py look for it
 +extern char er_version_marker[];
@@ -15239,13 +15239,15 @@ HcmV?d00001
  }  // namespace Common
 --- a/Source/Core/Core/CMakeLists.txt
 +++ b/Source/Core/Core/CMakeLists.txt
-@@ -57,6 +57,14 @@
+@@ -57,6 +57,16 @@
    ConfigManager.h
    Core.cpp
    Core.h
 +  ERTest.cpp
 +  ERTest.h
 +  EROrbitCam.cpp
++  ERTrackGpuHooks.cpp
++  ERTrackGpuHooks.h
 +  EROrbitCam.h
 +  ERGhosts.cpp
 +  ERGhosts.h
@@ -15254,7 +15256,7 @@ HcmV?d00001
    CoreTiming.cpp
    CoreTiming.h
    CPUThreadConfigCallback.cpp
-@@ -185,6 +193,8 @@
+@@ -185,6 +195,8 @@
    HW/DVD/DVDMath.cpp
    HW/DVD/DVDMath.h
    HW/DVD/DVDThread.cpp
@@ -15292,11 +15294,12 @@ HcmV?d00001
  extern const Info<int> GFX_CUSTOM_ASPECT_RATIO_HEIGHT;
 --- a/Source/Core/Core/Core.cpp
 +++ b/Source/Core/Core/Core.cpp
-@@ -46,6 +46,11 @@
+@@ -46,6 +46,12 @@
  #include "Core/CoreTiming.h"
  #include "Core/DSPEmulator.h"
  #include "Core/DolphinAnalytics.h"
 +#include "Core/EROrbitCam.h"
++#include "Core/ERTrackGpuHooks.h"
 +#include "Core/ERGhosts.h"
 +#include "VideoCommon/ERModes.h"
 +#include "Core/ERTest.h"
@@ -15304,7 +15307,7 @@ HcmV?d00001
  #include "Core/FifoPlayer/FifoPlayer.h"
  #include "Core/FreeLookManager.h"
  #include "Core/HLE/HLE.h"
-@@ -134,7 +139,8 @@
+@@ -134,7 +140,8 @@
  
  bool GetIsThrottlerTempDisabled()
  {
@@ -15314,19 +15317,20 @@ HcmV?d00001
  }
  
  void SetIsThrottlerTempDisabled(bool disable)
-@@ -150,6 +156,11 @@
+@@ -150,6 +157,12 @@
  
  void OnFrameEnd(Core::System& system)
  {
 +  ERTest::OnFrame(system);
 +  ERTrackLib::OnFrame(system);  // tracks on demand (nothing until a library mode or User/pc5090-tracklib.json is used)
++  ERTrackGpuHooks::OnFrame(system);  // 1.7.5 track drawn by the GPU (off when Config/er-trackgpu.txt is 0)
 +  EROrbitCam::OnFrame(system);  // orbit camera (nothing when Config/er-orbitcam.txt is 0)
 +  ERGhosts::OnFrame(system);  // Evolution Racing run telemetry (reads nothing unless linked + on)
 +  ERModes::OnFrame(system);   // lit17s43md race modes (Cutoff / Breakaway / Hunted)
  #ifdef USE_MEMORYWATCHER
    if (s_memory_watcher)
    {
-@@ -347,6 +358,33 @@
+@@ -347,6 +360,33 @@
      if (delete_savestate)
        File::Delete(*savestate_path);
    }
@@ -15360,7 +15364,7 @@ HcmV?d00001
  
    {
      std::unique_lock core_lock(s_core_mutex);
-@@ -899,7 +937,9 @@
+@@ -899,7 +939,9 @@
        "{} {} | {} | {}", system.GetPowerPC().GetCPUName(), system.IsDualCoreMode() ? "DC" : "SC",
        g_video_backend->GetDisplayName(), Config::Get(Config::MAIN_DSP_HLE) ? "HLE" : "LLE");
  
@@ -18541,6 +18545,555 @@ HcmV?d00001
 +bool Unthrottled();
 +void FilterPad(int chan, GCPadStatus* pad);
 +}  // namespace ERTest
+--- a/Source/Core/Core/ERTrackGpuHooks.cpp
++++ b/Source/Core/Core/ERTrackGpuHooks.cpp
+@@ -0,0 +1,514 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++//
++// CPU side of BGX phase 2 (track visuals on the host GPU), see VideoCommon/ERTrackGpu.h.
++//
++// GFZE01 (fzero-gx-decomp, src/dol + src/rel/main_rel/burner.c):
++//   main.dol GCMF model draws, prologue `stwu r1,-0x20(r1); mflr r0`:
++//     fn_80077F8C all submeshes (blr 0x800780A0), fn_800780A4 opaque (blr 0x800781B4),
++//     fn_800781B8 translucent (blr 0x80078340), fn_80077E7C all without material set-up (blr 0x80077F88).
++//     The caller has already loaded the model-view matrix (fn_80072558: locked cache 0xE0000000 -> pos/normal matrix 0).
++//   main REL fn_1_9BBE4 = the stage scene-object draw loop (text 0x9BBE4 entry, blr text 0x9C720).
++// The draw hooks sit on entry+4 (`mflr r0`, HLE replace): to skip the model they undo the stwu and return to LR; to let
++// the game draw they do the mflr themselves and continue at entry+8.
++
++#include "Core/ERTrackGpuHooks.h"
++
++#include <cstdio>
++#include <cctype>
++#include <cstring>
++#include <sstream>
++#include <vector>
++#include <string>
++#include <unordered_map>
++
++#include <xxhash.h>
++
++#include "Common/CommonTypes.h"
++#include "Common/FileUtil.h"
++#include "Common/Swap.h"
++#include "Core/ConfigManager.h"
++#include "Core/Core.h"
++#include "Core/HLE/HLE.h"
++#include "Core/HW/GPFifo.h"
++#include "Core/HW/Memmap.h"
++#include "Core/PowerPC/PowerPC.h"
++#include "Core/State.h"
++#include "Core/System.h"
++#include "VideoCommon/ERTrackGpu.h"
++
++namespace ERTrackGpuHooks
++{
++namespace
++{
++constexpr u32 kModPtr = 0x800030C8;
++constexpr u32 kStageIn = 0xDC + 0x9BBE4, kStageOut = 0xDC + 0x9C720;
++constexpr u32 kWordStageIn = 0x9421FEF0, kWordBlr = 0x4E800020;
++constexpr u32 kEntry[4] = {0x80077F8C, 0x800780A4, 0x800781B8, 0x80077E7C};
++constexpr u32 kBlr[4] = {0x800780A0, 0x800781B4, 0x80078340, 0x80077F88};
++constexpr u32 kWordStwu = 0x9421FFE0, kWordMflr = 0x7C0802A6;
++
++int s_mode = -1;  // 0 off, 1 replay, 2 verify only
++int s_log = 0;
++u32 s_kinds = 0xF;  // harness bisect: "kinds=13" replays only those draw functions
++u32 s_slot_lo = 0, s_slot_hi = 0xFFFFFFFF;  // harness bisect: "slots=a-b"
++bool s_hooked = false;
++u32 s_hook_base = 0;
++int s_stage_depth = 0;
++u64 s_frame = 0, s_last_stage = 0;
++int s_open = -1;  // the draw function whose kEnd marker is due at its blr
++u32 s_open_slot = 0;
++u32 s_next_slot = 1;
++u32 s_epoch = 1;
++struct Key
++{
++  u32 model, kind;
++  u64 ctx;
++  bool operator==(const Key& o) const { return model == o.model && kind == o.kind && ctx == o.ctx; }
++};
++struct KeyHash
++{
++  size_t operator()(const Key& k) const { return static_cast<size_t>(k.ctx ^ (u64(k.model) << 3) ^ k.kind); }
++};
++std::unordered_map<Key, u32, KeyHash> s_slots;
++std::unordered_map<u32, u32> s_calls;  // per slot: calls since the last check (periodic re-verify)
++std::unordered_map<u32, bool> s_stage_models;
++std::unordered_map<u32, u32> s_model_keys;
++u64 s_skipped = 0, s_drawn = 0, s_cb_draws = 0;
++// the stage loop's dyn object array (fn_1_9BBE4 r3) and index range (r4..r5), per nesting level
++struct StageCall
++{
++  u32 base, lo, hi;
++};
++StageCall s_stage[4];
++std::string s_filter;  // "track" (default) = only track models by LOD-0 name; "all" = every stage-loop model
++std::unordered_map<u32, std::string> s_slot_name;
++
++
++const u8* Ram(Core::System& system, u32 a, u32 n)
++{
++  auto& memory = system.GetMemory();
++  if (a < 0x80000000u)
++    return nullptr;
++  const u32 phys = a & 0x1FFFFFFFu;
++  if (phys > memory.GetRamSizeReal() || n > memory.GetRamSizeReal() - phys)
++    return nullptr;
++  return memory.GetPointerForRange(phys, n);
++}
++u32 R32(Core::System& system, u32 a)
++{
++  const u8* m = Ram(system, a, 4);
++  return m ? Common::swap32(m) : 0;
++}
++
++// LOD-0 name of the dyn object the stage loop is drawing: its pointer is in one of the loop's callee-saved registers
++std::unordered_map<u32, std::string> s_names;  // dyn object -> LOD-0 name (cleared each epoch)
++std::string CurrentObjectName(Core::System& system)
++{
++  if (s_stage_depth <= 0 || s_stage_depth > 4)
++    return {};
++  const StageCall& c = s_stage[s_stage_depth - 1];
++  const auto& ppc = system.GetPPCState();
++  u32 best = 0;
++  for (int r = 14; r < 32; r++)
++  {
++    const u32 v = ppc.gpr[r];
++    if (v >= c.base + c.lo * 0x40 && v <= c.base + c.hi * 0x40 && ((v - c.base) & 0x3F) == 0 && v > best)
++      best = v;
++  }
++  if (!best)
++    return {};
++  if (const auto it = s_names.find(best); it != s_names.end())
++    return it->second;
++  const u32 so = R32(system, best + 8), lods = so ? R32(system, so + 8) : 0, np = lods ? R32(system, lods + 4) : 0;
++  const u8* n = np ? Ram(system, np, 48) : nullptr;
++  if (!n)
++    return {};
++  size_t len = 0;
++  while (len < 48 && n[len] >= 0x20 && n[len] < 0x7F)
++    len++;
++  return s_names[best] = std::string(reinterpret_cast<const char*>(n), len);
++}
++
++// track pieces by name (loopgen + stock kits): road, rails, glass / edges, zone strips, pads, gates, start line
++bool IsTrackName(const std::string& n)
++{
++  if (n.empty())
++    return false;
++  static const char* const keys[] = {"LOOP", "ROAD", "RAIL", "GUARD", "GLASS", "EDGE", "DASH", "JUMP", "RECOVER",
++                                     "PIT",  "DIRT", "ICE",  "SLIP",  "DAMAGE", "MINE", "START", "GOAL", "GATE",
++                                     "ZONE", "STRIP", "TUBE", "PIPE", "CYLINDER", "BOOST", "PLATE", "LANE"};
++  std::string u = n;
++  for (auto& ch : u)
++    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
++  for (const char* k : keys)
++    if (u.find(k) != std::string::npos)
++      return true;
++  return false;
++}
++
++void NewEpoch()
++{
++  s_epoch++;
++  s_slots.clear();
++  s_calls.clear();
++  s_stage_models.clear();
++  s_model_keys.clear();
++  s_names.clear();
++  if (s_next_slot > ERTrackGpu::kMaxSlots - 4096)
++  {
++    s_next_slot = 1;
++    for (auto& st : ERTrackGpu::GetShared().state)
++      st.store(ERTrackGpu::kNew);
++  }
++  ERTrackGpu::GetShared().epoch.store(s_epoch);
++}
++
++void Marker(Core::System& system, u32 kind, u32 slot)
++{
++  auto& gp = system.GetGPFifo();
++  gp.Write8(0x40);
++  gp.Write32(ERTrackGpu::kMagic | (kind << 21) | ((slot & 0xFFFF) << 5));
++  gp.Write32((s_epoch & 0x07FFFFFF) << 5);
++}
++
++// the game globals that steer what the model draw writes (callback / no-material flags, colour overrides, the per-object
++// font-style state: scale, alpha fade, colour) -> part of the key, so each combination is verified on its own
++u64 Context(Core::System& system, u32 model, u32 rel)
++{
++  u8 buf[0x60 + 0x28 + 0x40 + 0x20];
++  std::memset(buf, 0, sizeof(buf));
++  if (const u8* g = Ram(system, 0x801A6D48, 0x60))
++    std::memcpy(buf, g, 0x60);
++  // caches the model draw consults (they change what it writes, not what it draws): left out of the key
++  // 0x801A6D9C cull-mode cache -> offset 0x54
++  std::memset(buf + 0x54, 0, 4);
++  if (rel)
++    if (const u8* f = Ram(system, rel + 0x1BA040 + 0x6C7A4, 0x28))
++      std::memcpy(buf + 0x60, f, 0x28);
++  if (const u8* h = Ram(system, model, 0x40))
++    std::memcpy(buf + 0x88, h, 0x40);
++  // the colour multiplier the material applies (lbl_8019F130: r, g, b, alpha fade)
++  if (const u8* c = Ram(system, 0x8019F130, 0x10))
++    std::memcpy(buf + 0xD8, c, 0x10);
++  // which machine-shadow projections are on (lbl_8019F040 + 0xE0, fn_800749B0): the material adds stages for them
++  if (const u8* f = Ram(system, 0x8019F120, 0x10))
++    std::memcpy(buf + 0xC8, f, 0x10);
++  return XXH64(buf, sizeof(buf), 0);
++}
++
++void Draw(const Core::CPUThreadGuard& guard, int kind)
++{
++  auto& system = guard.GetSystem();
++  auto& ppc = system.GetPPCState();
++  const u32 entry = kEntry[kind];
++  const u32 lr = LR(ppc);
++  bool skip = false;
++  if (s_mode > 0 && s_open < 0)
++  {
++    const u32 model = ppc.gpr[3];
++    const bool in_stage = s_stage_depth > 0;
++    if (in_stage)
++      s_stage_models[model] = true;  // (erased again below if the filter rejects it)
++    bool want = in_stage || (kind == 2 && s_stage_models.count(model));
++    // material extension callbacks (lbl_801A6D40: per-object extra TEV stages, e.g. machine shadows on the road near
++    // a racer; lbl_801A6D90: draw override) decide per call from live geometry: such draws stay on the game
++    if (want && (R32(system, 0x801A6D40) != 0 || R32(system, 0x801A6D90) != 0))
++    {
++      want = false;
++      s_cb_draws++;
++    }
++    std::string oname;
++    if (want && in_stage && s_filter != "all")
++    {
++      oname = CurrentObjectName(system);
++      want = IsTrackName(oname);
++      if (!want)
++        s_stage_models.erase(model);
++    }
++    if (want)
++    {
++      const u32 rel = R32(system, kModPtr);
++      const Key key{model, static_cast<u32>(kind), Context(system, model, rel)};
++      auto it = s_slots.find(key);
++      // a model whose key keeps changing (a per-frame colour / fade, e.g. lightning flashes) would never be trusted
++      // and would be captured every time: after 24 keys it stays on the game for this course
++      if (it == s_slots.end() && s_model_keys[model] >= 24)
++        want = false;
++      if (want && it == s_slots.end())
++      {
++        s_model_keys[model]++;
++        const u32 slot = s_next_slot++;
++        ERTrackGpu::GetShared().state[slot].store(ERTrackGpu::kNew);
++        ERTrackGpu::GetShared().model[slot] = model;
++        it = s_slots.emplace(key, slot).first;
++        if (oname.empty() && in_stage)
++          oname = CurrentObjectName(system);
++        s_slot_name[slot] = oname;
++        if (s_log > 1)
++          ERTrackGpu::Log("new slot %u model %08x kind %d depth %d lr %08x (rel text %05x) frame %llu name %s\n", slot,
++                          model, kind, s_stage_depth, lr, lr - rel - 0xDC, (unsigned long long)s_frame, oname.c_str());
++      }
++      const u32 slot = want ? it->second : 0;
++      const u32 st = want ? ERTrackGpu::GetShared().state[slot].load(std::memory_order_acquire) : ERTrackGpu::kBad;
++      if (st != ERTrackGpu::kBad)
++      {
++        ERTrackGpu::Payload p;
++        p.slot = slot;
++        p.epoch = s_epoch;
++        p.model = model;
++        if (const u8* g = Ram(system, 0x8019F040, sizeof(p.globals)))
++          std::memcpy(p.globals, g, sizeof(p.globals));
++        else
++          std::memset(p.globals, 0, sizeof(p.globals));
++        p.env_on = R32(system, 0x801A6D78);
++        const u8* l1 = system.GetMemory().GetL1Cache();
++        for (int i = 0; i < 12; i++)
++        {
++          const u32 w = l1 ? Common::swap32(l1 + 4 * i) : 0;
++          std::memcpy(&p.mtxA[i], &w, 4);
++        }
++        u32& calls = s_calls[slot];
++        const bool recheck = (++calls % 256) == 0;
++        if (st == ERTrackGpu::kTrusted && s_mode == 1 && !recheck && (s_kinds >> kind & 1) && slot >= s_slot_lo &&
++            slot <= s_slot_hi)
++        {
++          p.kind = ERTrackGpu::kReplay;
++          if (ERTrackGpu::PushPayload(p))
++          {
++            Marker(system, ERTrackGpu::kReplay, slot);
++            skip = true;
++          }
++        }
++        else if (st == ERTrackGpu::kNew || st == ERTrackGpu::kTrusted || (calls % 8) == 1)
++        {
++          // learning captures are spread over time (one in 8 calls) so slow per-frame changes show up
++          p.kind = ERTrackGpu::kBegin;
++          if (ERTrackGpu::PushPayload(p))
++          {
++            Marker(system, ERTrackGpu::kBegin, slot);
++            s_open = kind;
++            s_open_slot = slot;
++          }
++        }
++      }
++    }
++  }
++  if (skip)
++  {
++    // the RAM side effects every model draw has at its end (fn_80077F8C & co + fn_80078CDC): clear the model's
++    // per-draw flags 0x20 / 0x40 and reset the colour multiplier's alpha (lbl_8019F130[3] = lbl_801A74A8, the
++    // per-object fade the caller set: left stale it fades whatever the game draws next, e.g. machine shadows)
++    const u32 model = ppc.gpr[3];
++    if (u8* f = const_cast<u8*>(Ram(system, model + 4, 4)))
++      Common::WriteSwap32(f, Common::swap32(f) & 0xFFFFFF9Fu);
++    if (u8* a = const_cast<u8*>(Ram(system, 0x8019F13C, 4)))
++      Common::WriteSwap32(a, R32(system, 0x801A74A8));
++    s_skipped++;
++    ppc.gpr[1] += 0x20;  // undo `stwu r1,-0x20(r1)`
++    ppc.npc = lr;
++  }
++  else
++  {
++    s_drawn++;
++    ppc.gpr[0] = lr;  // `mflr r0`
++    ppc.npc = entry + 8;
++  }
++}
++
++// test harness only (Config/er-capture.txt, same format as the lit17s43so1 look-check build):
++//   shot <game frames> <name>  -> screenshot <name>.png that many game frames after the first moving frame / state load
++struct CapItem
++{
++  bool save;
++  float at;
++  std::string name;
++  bool done = false;
++};
++std::vector<CapItem> s_cap;
++int s_cap_on = -1;
++u32 s_cap_f0 = 0, s_cap_last = 0;
++void CapStep(Core::System& system)
++{
++  if (s_cap_on < 0)
++  {
++    std::string t;
++    s_cap_on = File::ReadFileToString(File::GetUserPath(D_CONFIG_IDX) + "er-capture.txt", t) ? 1 : 0;
++    std::istringstream is(t);
++    std::string kind, name;
++    float at;
++    while (is >> kind >> at >> name)
++      s_cap.push_back({kind == "save", at, name});
++  }
++  if (!s_cap_on)
++    return;
++  const u32 f = R32(system, 0x801A66A0);
++  if ((s_cap_f0 == 0 && f != 0) || (s_cap_last != 0 && (f > s_cap_last + 300 || f + 300 < s_cap_last)))
++    s_cap_f0 = f;
++  s_cap_last = f;
++  for (auto& c : s_cap)
++    if (!c.done && !c.save && s_cap_f0 != 0 && f - s_cap_f0 >= static_cast<u32>(c.at))
++    {
++      Core::SaveScreenShot(c.name);
++      c.done = true;
++      std::fprintf(stderr, "ERCAPTURE shot %s at game frame %u\n", c.name.c_str(), f);
++    }
++}
++}  // namespace
++
++bool SettingOn()
++{
++  std::string text;
++  File::ReadFileToString(File::GetUserPath(D_CONFIG_IDX) + "er-trackgpu.txt", text);
++  return text.empty() || text[0] != '0';
++}
++
++void SetSetting(bool on)
++{
++  File::WriteStringToFile(File::GetUserPath(D_CONFIG_IDX) + "er-trackgpu.txt", on ? "1\n" : "0\n");
++}
++
++void OnFrame(Core::System& system)
++{
++  CapStep(system);
++  if (s_mode < 0)
++  {
++    if (SConfig::GetInstance().GetGameID() != "GFZE01")
++      return;
++    std::string text;
++    // members (1.7.5): on unless Config/er-trackgpu.txt starts with "0" (Settings > Race view checkbox)
++    s_mode = 1;
++    if (File::ReadFileToString(File::GetUserPath(D_CONFIG_IDX) + "er-trackgpu.txt", text) && !text.empty())
++    {
++      if (text[0] == '0')
++        s_mode = 0;
++      else if (text.rfind("verify", 0) == 0)
++        s_mode = 2;
++      if (const auto kp = text.find("kinds="); kp != std::string::npos)
++      {
++        s_kinds = 0;
++        for (size_t i = kp + 6; i < text.size() && text[i] >= '0' && text[i] <= '3'; i++)
++          s_kinds |= 1u << (text[i] - '0');
++      }
++      if (const auto sp = text.find("slots="); sp != std::string::npos)
++        std::sscanf(text.c_str() + sp + 6, "%u-%u", &s_slot_lo, &s_slot_hi);
++      s_filter = text.find("all") != std::string::npos ? "all" : "track";
++      if (text.find("log2") != std::string::npos)
++        s_log = 2;
++      else if (text.find("log") != std::string::npos)
++        s_log = 1;
++    }
++    ERTrackGpu::GetShared().enabled.store(s_mode);
++    ERTrackGpu::GetShared().log.store(s_log);
++    ERTrackGpu::GetShared().noreplay.store(text.find("noreplay") != std::string::npos ? 1 : 0);
++    std::fprintf(stderr, "ERTRACKGPU mode %d log %d\n", s_mode, s_log);
++    if (s_log)
++      ERTrackGpu::Log("mode %d\n", s_mode);
++  }
++  if (s_mode <= 0)
++    return;
++  s_frame++;
++  if (s_log > 1 && s_frame % 600 == 0)
++    ERTrackGpu::Log("frame %llu: model calls skipped %llu drawn %llu with material callback %llu\n",
++                    (unsigned long long)s_frame, (unsigned long long)s_skipped, (unsigned long long)s_drawn,
++                    (unsigned long long)s_cb_draws);
++  s_stage_depth = 0;  // never carried across frames
++  if (s_open >= 0)
++  {
++    // a kEnd never came (state load inside the draw): close it
++    Marker(system, ERTrackGpu::kEnd, s_open_slot);
++    s_open = -1;
++  }
++  // a stretch without stage draws = a load / menu: everything is learnt again (new course data at old addresses)
++  if (s_last_stage != 0 && s_frame - s_last_stage > 30 && !s_slots.empty())
++  {
++    if (s_log)
++      ERTrackGpu::Log("frame %llu: no stage draws for 30 frames -> new epoch (skipped %llu drawn %llu callback %llu)\n",
++                      (unsigned long long)s_frame, (unsigned long long)s_skipped, (unsigned long long)s_drawn,
++                      (unsigned long long)s_cb_draws);
++    NewEpoch();
++  }
++  const Core::CPUThreadGuard guard(system);
++  const u32 b = R32(system, kModPtr);
++  bool ok = b >= 0x80000000u && R32(system, b + kStageIn) == kWordStageIn && R32(system, b + kStageOut) == kWordBlr;
++  for (int k = 0; k < 4 && ok; k++)
++    ok = R32(system, kEntry[k]) == kWordStwu && R32(system, kEntry[k] + 4) == kWordMflr &&
++         R32(system, kBlr[k]) == kWordBlr;
++  if (!ok)
++  {
++    if (s_hooked)
++    {
++      HLE::UnPatch(system, "ERTGStageIn");
++      HLE::UnPatch(system, "ERTGStageOut");
++      for (const char* n : {"ERTGDraw0", "ERTGDraw1", "ERTGDraw2", "ERTGDraw3", "ERTGDrawEnd"})
++        while (HLE::UnPatch(system, n) != 0)
++        {
++        }
++      s_hooked = false;
++      s_hook_base = 0;
++    }
++    return;
++  }
++  if (s_hooked && s_hook_base == b && HLE::GetHookByAddress(b + kStageIn) != 0 &&
++      HLE::GetHookByAddress(kEntry[0] + 4) != 0)
++    return;
++  if (s_hooked)
++  {
++    HLE::UnPatch(system, "ERTGStageIn");
++    HLE::UnPatch(system, "ERTGStageOut");
++  }
++  HLE::Patch(system, b + kStageIn, "ERTGStageIn");
++  HLE::Patch(system, b + kStageOut, "ERTGStageOut");
++  static const char* const names[4] = {"ERTGDraw0", "ERTGDraw1", "ERTGDraw2", "ERTGDraw3"};
++  for (int k = 0; k < 4; k++)
++  {
++    HLE::Patch(system, kEntry[k] + 4, names[k]);
++    HLE::Patch(system, kBlr[k], "ERTGDrawEnd");
++  }
++  s_hooked = true;
++  s_hook_base = b;
++  std::fprintf(stderr, "ERTRACKGPU hooks at REL %08x\n", b);
++  if (s_log)
++    ERTrackGpu::Log("hooks at REL %08x\n", b);
++}
++
++void HookStageIn(const Core::CPUThreadGuard& guard)
++{
++  const auto& ppc = guard.GetSystem().GetPPCState();
++  if (s_stage_depth >= 0 && s_stage_depth < 4)
++    s_stage[s_stage_depth] = {ppc.gpr[3], ppc.gpr[4], ppc.gpr[5]};
++  s_stage_depth++;
++  s_last_stage = s_frame;
++}
++void HookStageOut(const Core::CPUThreadGuard&)
++{
++  if (s_stage_depth > 0)
++    s_stage_depth--;
++}
++void HookDraw0(const Core::CPUThreadGuard& g)
++{
++  Draw(g, 0);
++}
++void HookDraw1(const Core::CPUThreadGuard& g)
++{
++  Draw(g, 1);
++}
++void HookDraw2(const Core::CPUThreadGuard& g)
++{
++  Draw(g, 2);
++}
++void HookDraw3(const Core::CPUThreadGuard& g)
++{
++  Draw(g, 3);
++}
++void HookDrawEnd(const Core::CPUThreadGuard& guard)
++{
++  if (s_open < 0)
++    return;
++  const u32 pc = guard.GetSystem().GetPPCState().pc;
++  (void)pc;
++  // the four draw functions do not call each other: the first blr reached is the open one's
++  Marker(guard.GetSystem(), ERTrackGpu::kEnd, s_open_slot);
++  s_open = -1;
++}
++}  // namespace ERTrackGpuHooks
+--- a/Source/Core/Core/ERTrackGpuHooks.h
++++ b/Source/Core/Core/ERTrackGpuHooks.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++//
++// CPU side of BGX phase 2 (track visuals on the host GPU), see VideoCommon/ERTrackGpu.h.
++// On unless User/Config/er-trackgpu.txt starts with "0"; "verify" = record + check only, never skip.
++
++#pragma once
++
++namespace Core
++{
++class CPUThreadGuard;
++class System;
++}  // namespace Core
++
++namespace ERTrackGpuHooks
++{
++void OnFrame(Core::System& system);
++// member setting (Config/er-trackgpu.txt, default on; read once when the game starts)
++bool SettingOn();
++void SetSetting(bool on);
++
++void HookStageIn(const Core::CPUThreadGuard& guard);
++void HookStageOut(const Core::CPUThreadGuard& guard);
++void HookDraw0(const Core::CPUThreadGuard& guard);  // fn_80077F8C: all submeshes
++void HookDraw1(const Core::CPUThreadGuard& guard);  // fn_800780A4: opaque submeshes
++void HookDraw2(const Core::CPUThreadGuard& guard);  // fn_800781B8: translucent submeshes (deferred, depth sorted)
++void HookDraw3(const Core::CPUThreadGuard& guard);  // fn_80077E7C: all submeshes, material already set
++void HookDrawEnd(const Core::CPUThreadGuard& guard);
++}  // namespace ERTrackGpuHooks
 --- a/Source/Core/Core/ERUpdates.cpp
 +++ b/Source/Core/Core/ERUpdates.cpp
 @@ -0,0 +1,1169 @@
@@ -19826,16 +20379,17 @@ HcmV?d00001
 +}  // namespace ERUpdates
 --- a/Source/Core/Core/HLE/HLE.cpp
 +++ b/Source/Core/Core/HLE/HLE.cpp
-@@ -11,6 +11,8 @@
+@@ -11,6 +11,9 @@
  
  #include "Core/Config/MainSettings.h"
  #include "Core/Core.h"
 +#include "Core/EROrbitCam.h"
++#include "Core/ERTrackGpuHooks.h"
 +#include "Core/HW/DVD/ERTrackLib.h"
  #include "Core/GeckoCode.h"
  #include "Core/HLE/HLE_Misc.h"
  #include "Core/HLE/HLE_OS.h"
-@@ -22,16 +24,31 @@
+@@ -22,16 +25,38 @@
  
  namespace HLE
  {
@@ -19854,7 +20408,7 @@ HcmV?d00001
  
  // clang-format off
 -constexpr std::array<Hook, 23> os_patches{{
-+constexpr std::array<Hook, 28> os_patches{{
++constexpr std::array<Hook, 35> os_patches{{
      // Placeholder, os_patches[0] is the "non-existent function" index
      {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
  
@@ -19864,6 +20418,13 @@ HcmV?d00001
 +    {"EROrbitStart",                 EROrbitCam::HookCameraStart,           HookType::Start,   HookFlag::Fixed},
 +    {"EROrbitLook",                  EROrbitCam::HookCameraLook,            HookType::Start,   HookFlag::Fixed},
 +    {"ERTrackSaveOut",               ERTrackSaveOut,                        HookType::Start,   HookFlag::Fixed},
++    {"ERTGStageIn",                  ERTrackGpuHooks::HookStageIn,          HookType::Start,   HookFlag::Fixed},
++    {"ERTGStageOut",                 ERTrackGpuHooks::HookStageOut,         HookType::Start,   HookFlag::Fixed},
++    {"ERTGDraw0",                    ERTrackGpuHooks::HookDraw0,            HookType::Replace, HookFlag::Fixed},
++    {"ERTGDraw1",                    ERTrackGpuHooks::HookDraw1,            HookType::Replace, HookFlag::Fixed},
++    {"ERTGDraw2",                    ERTrackGpuHooks::HookDraw2,            HookType::Replace, HookFlag::Fixed},
++    {"ERTGDraw3",                    ERTrackGpuHooks::HookDraw3,            HookType::Replace, HookFlag::Fixed},
++    {"ERTGDrawEnd",                  ERTrackGpuHooks::HookDrawEnd,          HookType::Start,   HookFlag::Fixed},
 +    {"ERTrackSaveLoad",              ERTrackSaveLoad,                       HookType::Start,   HookFlag::Fixed},
  
      // Debug/OS Support
@@ -21909,7 +22470,7 @@ HcmV?d00001
 +}
 --- a/Source/Core/DolphinQt/ERUpdatesUI.cpp
 +++ b/Source/Core/DolphinQt/ERUpdatesUI.cpp
-@@ -0,0 +1,929 @@
+@@ -0,0 +1,935 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -21953,6 +22514,7 @@ HcmV?d00001
 +#include "Common/Version.h"
 +#include "Core/Core.h"
 +#include "Core/ERGhosts.h"
++#include "Core/ERTrackGpuHooks.h"
 +#include "Core/EROrbitCam.h"
 +#include "Core/ERUpdates.h"
 +#include "Core/System.h"
@@ -22743,11 +23305,15 @@ HcmV?d00001
 +  auto* oc_on = new QCheckBox(tr("360 camera - in a race press D-pad down, swing round with the C-stick, D-pad up goes back"));
 +  oc_on->setToolTip(tr("A change applies the next time you start the game."));
 +  rvl->addWidget(oc_on);
++  auto* tg_on = new QCheckBox(tr("Track drawn by your graphics card - lighter on the emulated CPU (turn off if the road looks wrong)"));
++  tg_on->setToolTip(tr("A change applies the next time you start the game."));
++  rvl->addWidget(tg_on);
 +  lay->addWidget(rv);
 +  th_on->setChecked(ERThreatHud::SettingOn());
 +  th_m->setChecked(ERThreatHud::SettingMetres());
 +  th_m->setEnabled(th_on->isChecked());
 +  oc_on->setChecked(EROrbitCam::SettingOn());
++  tg_on->setChecked(ERTrackGpuHooks::SettingOn());
 +  auto set_th = [=] {
 +    th_m->setEnabled(th_on->isChecked());
 +    ERThreatHud::SetSetting(th_on->isChecked(), th_m->isChecked());
@@ -22755,6 +23321,7 @@ HcmV?d00001
 +  connect(th_on, &QCheckBox::toggled, dlg, set_th);
 +  connect(th_m, &QCheckBox::toggled, dlg, set_th);
 +  connect(oc_on, &QCheckBox::toggled, dlg, [](bool on) { EROrbitCam::SetSetting(on); });
++  connect(tg_on, &QCheckBox::toggled, dlg, [](bool on) { ERTrackGpuHooks::SetSetting(on); });
 +
 +  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
 +  lay->addWidget(buttons);
@@ -23523,7 +24090,7 @@ HcmV?d00001
    GraphicsModSystem/Runtime/Actions/MoveAction.cpp
    GraphicsModSystem/Runtime/Actions/MoveAction.h
    GraphicsModSystem/Runtime/Actions/PrintAction.cpp
-@@ -125,6 +127,14 @@
+@@ -125,6 +127,16 @@
    OnScreenDisplay.h
    OnScreenUI.cpp
    OnScreenUI.h
@@ -23531,6 +24098,8 @@ HcmV?d00001
 +  PC5090Menu.h
 +  ERNameplates.cpp
 +  ERNameplates.h
++  ERTrackGpu.cpp
++  ERTrackGpu.h
 +  ERModes.cpp
 +  ERModes.h
 +  ERThreatHud.cpp
@@ -29676,6 +30245,1139 @@ HcmV?d00001
 +bool SettingMetres();
 +void SetSetting(bool on, bool metres);
 +}  // namespace ERThreatHud
+--- a/Source/Core/VideoCommon/ERTrackGpu.cpp
++++ b/Source/Core/VideoCommon/ERTrackGpu.cpp
+@@ -0,0 +1,1043 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++//
++// GPU-thread side of BGX phase 2 ("GX replay"), see ERTrackGpu.h.
++
++#include "VideoCommon/ERTrackGpu.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <set>
++#include <string>
++#include <vector>
++
++#include <xxhash.h>
++
++#include "Common/FileUtil.h"
++#include "Common/Swap.h"
++#include "Core/HW/Memmap.h"
++#include "Core/System.h"
++#include "VideoCommon/BPMemory.h"
++#include "VideoCommon/CPMemory.h"
++#include "VideoCommon/DataReader.h"
++#include "VideoCommon/OpcodeDecoding.h"
++#include "VideoCommon/VertexLoaderBase.h"
++#include "VideoCommon/XFMemory.h"
++
++namespace ERTrackGpu
++{
++bool g_capturing = false;
++bool g_pending = false;
++
++namespace
++{
++Shared s_shared;
++
++// ---------------------------------------------------------------- payload ring (CPU -> GPU, single producer/consumer)
++constexpr u32 kRing = 8192;
++std::unique_ptr<Payload[]> s_ring(new Payload[kRing]);
++std::atomic<u32> s_head{0}, s_tail{0};
++
++std::FILE* s_log = nullptr;
++std::mutex s_log_mutex;
++
++constexpr u32 kXfRegs = 0x58;  // 0x1000 .. 0x1057
++constexpr int kNeedMatches = 3;
++constexpr int kMaxFails = 4;
++
++struct Snap
++{
++  u32 bp[256];
++  u32 tev[8][2];  // 0xE0-0xE7 per register type (bit 23: 0 colour, 1 konst)
++  u32 xf[kXfRegs];
++  u32 cp[0x100];
++};
++
++u32 s_tev[8][2];  // live shadow of both TEV register banks
++bool s_tev_known[8][2];  // written since boot (a state load restores bpmem but not this shadow)
++
++void TakeSnap(Snap* s)
++{
++  std::memcpy(s->bp, &bpmem, sizeof(s->bp));
++  std::memcpy(s->tev, s_tev, sizeof(s->tev));
++  std::memcpy(s->xf, reinterpret_cast<const u32*>(&xfmem) + 0x1000, sizeof(s->xf));
++  std::memset(s->cp, 0, sizeof(s->cp));
++  g_main_cp_state.FillCPMemoryArray(s->cp);
++}
++
++// the registers a draw depends on (everything else is left as it is: the game's frame state, lights, fog, viewport,
++// projection, the model-view matrix the game loaded before the model call)
++struct Eff
++{
++  std::array<bool, 256> bp{};
++  std::array<bool, kXfRegs> xf{};
++  std::array<bool, 0x100> cp{};
++  bool tev = true;
++};
++
++void AddTexMap(Eff& e, u32 m)
++{
++  if (m > 7)
++    return;
++  const u32 b = m < 4 ? 0x80 + m : 0xA0 + (m - 4);
++  for (u32 k = 0; k < 7; k++)
++    e.bp[b + 4 * k] = true;  // mode0, mode1, image0..3, tlut
++}
++
++void ComputeEff(const Snap& s, u32 used_vats, Eff* out)
++{
++  Eff& e = *out;
++  const BPMemory& b = *reinterpret_cast<const BPMemory*>(s.bp);
++  const u32 ntev = b.genMode.numtevstages + 1;
++  const u32 ntg = b.genMode.numtexgens;
++  const u32 nind = b.genMode.numindstages;
++  e.bp[0x00] = true;  // (0x22 line / point width: triangles never read it)
++  for (u32 st = 0; st < ntev && st < 16; st++)
++  {
++    e.bp[0xC0 + 2 * st] = e.bp[0xC1 + 2 * st] = true;
++    e.bp[0x10 + st] = true;
++    e.bp[0x28 + st / 2] = true;
++    const auto& o = b.tevorders[st / 2];
++    if (o.getEnable(st & 1))
++      AddTexMap(e, o.getTexMap(st & 1));
++  }
++  for (u32 r = 0xF6; r <= 0xFD; r++)
++    e.bp[r] = true;
++  for (u32 r = 0xE0; r <= 0xE7; r++)
++    e.bp[r] = true;
++  for (u32 r : {0xF3u, 0xF4u, 0xF5u, 0x40u, 0x41u, 0x42u, 0x43u})
++    e.bp[r] = true;
++  for (u32 c = 0; c < ntg && c < 8; c++)
++    e.bp[0x30 + 2 * c] = e.bp[0x31 + 2 * c] = true;
++  if (nind > 0)
++  {
++    for (u32 r = 0x06; r <= 0x0F; r++)
++      e.bp[r] = true;
++    e.bp[0x25] = e.bp[0x26] = e.bp[0x27] = true;
++    for (u32 j = 0; j < nind && j < 4; j++)
++      AddTexMap(e, b.tevindref.getTexMap(j));
++  }
++  // XF
++  const u32 nchan = s.xf[0x09] & 3;
++  const u32 xntg = s.xf[0x3F] & 0xF;
++  const bool dual = (s.xf[0x12] & 1) != 0;
++  e.xf[0x08] = e.xf[0x09] = e.xf[0x12] = e.xf[0x18] = e.xf[0x19] = e.xf[0x3F] = true;
++  for (u32 c = 0; c < nchan && c < 2; c++)
++    e.xf[0x0A + c] = e.xf[0x0C + c] = e.xf[0x0E + c] = e.xf[0x10 + c] = true;
++  for (u32 t = 0; t < xntg && t < 8; t++)
++  {
++    e.xf[0x40 + t] = true;
++    if (dual)
++      e.xf[0x50 + t] = true;
++  }
++  // CP
++  e.cp[0x30] = e.cp[0x40] = e.cp[0x50] = e.cp[0x60] = true;
++  for (u32 v = 0; v < 8; v++)
++    if (used_vats & (1u << v))
++      e.cp[0x70 + v] = e.cp[0x80 + v] = e.cp[0x90 + v] = true;
++  const u32 lo = s.cp[0x50], hi = s.cp[0x60];
++  const auto idx = [](u32 f) { return f == 2 || f == 3; };
++  const u32 fmts[4] = {(lo >> 9) & 3, (lo >> 11) & 3, (lo >> 13) & 3, (lo >> 15) & 3};
++  for (u32 a = 0; a < 4; a++)
++    if (idx(fmts[a]))
++      e.cp[0xA0 + a] = e.cp[0xB0 + a] = true;
++  for (u32 t = 0; t < 8; t++)
++    if (idx((hi >> (2 * t)) & 3))
++      e.cp[0xA4 + t] = e.cp[0xB4 + t] = true;
++}
++
++// registers the game's model draw keeps in caches of its own (vertex descriptor, cull mode): they are set from the
++// record even when this capture did not write them
++// BP: the material code also caches TEV stage set-up (orders lbl_8019E308, combiners / swap tables in *lbl_801A6D38), so
++// a capture may not write a register it depends on; everything except the TEV colour registers, z mode, blend and
++// destination alpha (which the stage loop may set outside the model draw) is taken from the record
++bool ForcedBP(int k) { return !(k >= 0xE0 && k <= 0xE7) && !(k >= 0xF6 && k <= 0xFD) && k != 0x40 && k != 0x41 && k != 0x42; }
++bool ForcedXF(u32 k) { return k == 0x08 || k == 0x09 || k == 0x3F; }
++bool ForcedCP(int k) { return k == 0x50 || k == 0x60 || (k >= 0x70 && k < 0x98); }
++// what replay sets: every register the draw depends on, except the ones learnt to come from outside the model draw
++void UseSet(const Eff& e, const Eff& w, const Eff& live, Eff* out)
++{
++  for (int k = 0; k < 256; k++)
++    out->bp[k] = e.bp[k] && (w.bp[k] || ForcedBP(k) || !live.bp[k]);
++  for (u32 k = 0; k < kXfRegs; k++)
++    out->xf[k] = e.xf[k] && (w.xf[k] || ForcedXF(k) || !live.xf[k]);
++  for (int k = 0; k < 0x100; k++)
++    out->cp[k] = e.cp[k] && (w.cp[k] || ForcedCP(k) || !live.cp[k]);
++}
++Eff s_written;
++
++// ---------------------------------------------------------------- records
++struct MtxRun
++{
++  u16 addr = 0;
++  std::vector<u32> v;      // host-endian words as loaded
++  std::vector<u16> src;    // candidate offsets (words) into the payload search buffer; empty = literal
++};
++
++struct DrawRec
++{
++  Snap s;
++  Eff e;  // registers the draw depends on
++  Eff live;  // registers set outside the model draw (they differed between captures and the draw never wrote them)
++  Eff w;  // registers the game's model draw wrote before this display list (union over the verified captures)
++  u32 dl_addr = 0, dl_size = 0;
++  u64 dl_hash = 0;
++  std::shared_ptr<std::vector<u8>> dl;  // host copy
++  u32 vats = 0;
++  std::vector<MtxRun> runs;  // matrix / light memory loads issued since the previous display list
++  // replay lists (built on the first replay after the template last changed)
++  bool lists = false;
++  std::vector<u8> l_bp, l_cp, l_tev;
++  std::vector<u8> l_xf;
++};
++
++struct Rec
++{
++  std::vector<DrawRec> draws;
++  std::vector<MtxRun> tail_runs;  // after the last display list (kept for the restore set only)
++  std::string unsupported;
++};
++
++struct SlotData
++{
++  bool have = false;
++  Rec tmpl;
++  int matches = 0;
++  int fails = 0;
++  u32 last_mismatch_log = 0;
++};
++
++std::vector<SlotData> s_slots(kMaxSlots);
++u32 s_epoch_seen = 0;
++std::map<std::pair<u32, u64>, std::shared_ptr<std::vector<u8>>> s_dls;  // (addr, size << 32 | hash)
++
++// current capture
++Rec s_cur;
++u32 s_cur_slot = 0;
++Payload s_cur_payload;
++std::vector<MtxRun> s_pending_runs;
++std::vector<u32> s_search;  // payload words (host-endian) the matrix runs are matched against
++
++void BuildSearch(const Payload& p, std::vector<u32>* out)
++{
++  out->clear();
++  for (size_t i = 0; i + 4 <= sizeof(p.globals); i += 4)
++    out->push_back(Common::swap32(p.globals + i));
++  for (int i = 0; i < 12; i++)
++  {
++    u32 w;
++    std::memcpy(&w, &p.mtxA[i], 4);
++    out->push_back(w);
++  }
++}
++
++void FindSources(MtxRun& r, const std::vector<u32>& search)
++{
++  r.src.clear();
++  const size_t n = r.v.size();
++  if (n == 0 || n > search.size())
++    return;
++  for (size_t o = 0; o + n <= search.size(); o++)
++    if (std::equal(r.v.begin(), r.v.end(), search.begin() + o))
++      r.src.push_back(static_cast<u16>(o));
++}
++
++bool PopPayload(u32 slot, u32 kind, Payload* out)
++{
++  u32 t = s_tail.load(std::memory_order_relaxed);
++  const u32 h = s_head.load(std::memory_order_acquire);
++  while (t != h)
++  {
++    const Payload& p = s_ring[t % kRing];
++    t++;
++    if (p.slot == slot && p.kind == kind)
++    {
++      *out = p;
++      s_tail.store(t, std::memory_order_release);
++      return true;
++    }
++  }
++  s_tail.store(t, std::memory_order_release);
++  return false;
++}
++
++u32 UsedVats(const u8* d, u32 size, const Snap& s, std::string* why)
++{
++  CPState cp(s.cp);
++  u32 vats = 0, i = 0;
++  while (i < size)
++  {
++    const u8 op = d[i];
++    if (op == 0x00)
++    {
++      i++;
++      continue;
++    }
++    if (op & 0x80)
++    {
++      if (i + 3 > size)
++        break;
++      const u32 vat = op & 7;
++      const u32 n = (static_cast<u32>(d[i + 1]) << 8) | d[i + 2];
++      const u32 vs = VertexLoaderBase::GetVertexSize(cp.vtx_desc, cp.vtx_attr[vat]);
++      vats |= 1u << vat;
++      i += 3 + n * vs;
++      continue;
++    }
++    if (why->empty())
++      *why = "display list carries state commands (op " + std::to_string(op) + ")";
++    break;
++  }
++  return vats;
++}
++
++// TMEM placement of non-preloaded textures (the game rotates its TMEM cache regions per draw) does not change the
++// picture in Dolphin: only the preload flag of SETIMAGE1 is compared, SETIMAGE2 only for preloaded textures
++u32 BpCmpMask(int k, const u32* bp)
++{
++  const bool img1 = (k >= 0x8C && k <= 0x8F) || (k >= 0xAC && k <= 0xAF);
++  const bool img2 = (k >= 0x90 && k <= 0x93) || (k >= 0xB0 && k <= 0xB3);
++  if (img1)
++    return 1u << 21;
++  if (img2)
++    return (bp[k - 4] & (1u << 21)) ? 0xFFFFFFu : 0u;
++  // per-stage halves of TEV orders (0x28-0x2F) and konst selections (0xF6-0xFD) only matter for active stages
++  const u32 ntev = ((bp[0] >> 10) & 15) + 1;
++  if (k >= 0x28 && k <= 0x2F)
++  {
++    const u32 st = 2 * (k - 0x28);
++    return (st < ntev ? 0xFFFu : 0u) | (st + 1 < ntev ? 0xFFF000u : 0u);
++  }
++  if (k >= 0xF6 && k <= 0xFD)
++  {
++    const u32 st = 2 * ((k - 0xF6) / 2) + 0;
++    // bits 0-3: swap table half; kcsel/kasel of stage 2i (bits 4-13) and 2i+1 (bits 14-23)
++    const u32 i = (k - 0xF6) / 2;
++    (void)st;
++    return 0xFu | (2 * i < ntev ? 0x3FF0u : 0u) | (2 * i + 1 < ntev ? 0xFFC000u : 0u);
++  }
++  return 0xFFFFFFu;
++}
++
++// fn_800756B0 loads these texture matrices for every model from game globals (fn_800749B0 sets them: the environment
++// map matrix and up to three machine-shadow projections). Replay computes them the way the game does.
++// returns the payload byte offset of the source, or -1 if `addr` is not one of them
++int GameTexMtxSource(u16 addr, size_t n, const Payload& p)
++{
++  if (n != 12)
++    return -1;
++  constexpr u32 kIdent = 0x8019F178 - 0x8019F040;  // lbl_8019F158 + 0x20
++  if (addr == 0x24 * 4)
++    return p.env_on ? 0x20 : kIdent;
++  for (u32 i = 0; i < 3; i++)
++    if (addr == (0x33 + 3 * i) * 4)
++      return Common::swap32(p.globals + 0xE0 + 4 * i) ? static_cast<int>(0x50 + 0x30 * i) : static_cast<int>(kIdent);
++  return -1;
++}
++bool IsGameTexMtx(u16 addr, size_t n)
++{
++  return n == 12 && (addr == 0x90 || addr == 0xCC || addr == 0xD8 || addr == 0xE4);
++}
++
++// compare a new capture with the template; on success the template's matrix sources become the intersection
++bool Compare(Rec& t, const Rec& r, std::string* diff)
++{
++  if (t.draws.size() != r.draws.size())
++  {
++    *diff = "draw count " + std::to_string(t.draws.size()) + " vs " + std::to_string(r.draws.size());
++    return false;
++  }
++  char buf[320];
++  for (size_t i = 0; i < t.draws.size(); i++)
++  {
++    DrawRec& a = t.draws[i];
++    const DrawRec& b = r.draws[i];
++    if (a.dl_addr != b.dl_addr || a.dl_size != b.dl_size || a.dl_hash != b.dl_hash)
++    {
++      std::snprintf(buf, sizeof(buf), "draw %zu display list %08x/%u vs %08x/%u", i, a.dl_addr, a.dl_size, b.dl_addr,
++                    b.dl_size);
++      *diff = buf;
++      return false;
++    }
++    // registers the model draw wrote (or keeps in its caches) must match; any other register the draw depends on that
++    // differs between captures is set outside the model draw (per-object colours, lights...): it stays live on replay
++    Eff wu, eu;
++    for (int k = 0; k < 256; k++)
++      wu.bp[k] = a.w.bp[k] || b.w.bp[k] || ForcedBP(k), eu.bp[k] = a.e.bp[k] || b.e.bp[k];
++    for (u32 k = 0; k < kXfRegs; k++)
++      wu.xf[k] = a.w.xf[k] || b.w.xf[k] || ForcedXF(k), eu.xf[k] = a.e.xf[k] || b.e.xf[k];
++    for (int k = 0; k < 0x100; k++)
++      wu.cp[k] = a.w.cp[k] || b.w.cp[k] || ForcedCP(k), eu.cp[k] = a.e.cp[k] || b.e.cp[k];
++    for (int k = 0; k < 256; k++)
++      if (eu.bp[k] && !(k >= 0xE0 && k <= 0xE7) && (a.s.bp[k] & BpCmpMask(k, a.s.bp)) != (b.s.bp[k] & BpCmpMask(k, b.s.bp)))
++      {
++        if (!wu.bp[k])
++        {
++          a.live.bp[k] = true;
++          continue;
++        }
++        std::snprintf(buf, sizeof(buf), "draw %zu BP %02x %06x vs %06x", i, k, a.s.bp[k] & 0xFFFFFF, b.s.bp[k] & 0xFFFFFF);
++        *diff = buf;
++        return false;
++      }
++    for (int k = 0; k < 8; k++)
++      for (int ty = 0; ty < 2; ty++)
++        if (eu.bp[0xE0 + k] && a.s.tev[k][ty] != b.s.tev[k][ty])
++        {
++          if (!wu.bp[0xE0 + k])
++          {
++            a.live.bp[0xE0 + k] = true;
++            continue;
++          }
++          std::snprintf(buf, sizeof(buf), "draw %zu TEV reg %02x type %d %06x vs %06x", i, 0xE0 + k, ty,
++                        a.s.tev[k][ty] & 0xFFFFFF, b.s.tev[k][ty] & 0xFFFFFF);
++          *diff = buf;
++          return false;
++        }
++    for (u32 k = 0; k < kXfRegs; k++)
++      if (eu.xf[k] && a.s.xf[k] != b.s.xf[k])
++      {
++        if (!wu.xf[k])
++        {
++          a.live.xf[k] = true;
++          continue;
++        }
++        std::snprintf(buf, sizeof(buf), "draw %zu XF %04x %08x vs %08x", i, 0x1000 + k, a.s.xf[k], b.s.xf[k]);
++        *diff = buf;
++        return false;
++      }
++    for (int k = 0; k < 0x100; k++)
++      if (eu.cp[k] && a.s.cp[k] != b.s.cp[k])
++      {
++        if (!wu.cp[k])
++        {
++          a.live.cp[k] = true;
++          continue;
++        }
++        std::snprintf(buf, sizeof(buf), "draw %zu CP %02x %08x vs %08x", i, k, a.s.cp[k], b.s.cp[k]);
++        *diff = buf;
++        return false;
++      }
++    if (a.runs.size() != b.runs.size())
++    {
++      std::snprintf(buf, sizeof(buf), "draw %zu matrix loads %zu vs %zu", i, a.runs.size(), b.runs.size());
++      *diff = buf;
++      return false;
++    }
++    for (size_t k = 0; k < a.runs.size(); k++)
++    {
++      MtxRun& x = a.runs[k];
++      const MtxRun& y = b.runs[k];
++      if (x.addr != y.addr || x.v.size() != y.v.size())
++      {
++        std::snprintf(buf, sizeof(buf), "draw %zu matrix load %zu at %04x/%zu vs %04x/%zu", i, k, x.addr, x.v.size(),
++                      y.addr, y.v.size());
++        *diff = buf;
++        return false;
++      }
++      if (IsGameTexMtx(x.addr, x.v.size()))
++        continue;  // computed from the payload on replay
++      if (x.v == y.v && (x.src.empty() || y.src.empty()))
++      {
++        x.src.clear();  // a literal that never changed: keep it literal
++        continue;
++      }
++      std::vector<u16> inter;
++      std::set_intersection(x.src.begin(), x.src.end(), y.src.begin(), y.src.end(), std::back_inserter(inter));
++      if (inter.empty())
++      {
++        float f[4], m[4];
++        for (int q = 0; q < 4; q++)
++        {
++          std::memcpy(&f[q], &y.v[q], 4);
++          std::memcpy(&m[q], &s_cur_payload.mtxA[q], 4);
++        }
++        std::snprintf(buf, sizeof(buf),
++                      "draw %zu matrix load at %04x/%zu changed with no game source (%zu/%zu cand.) row0 %.4f %.4f %.4f %.4f "
++                      "mtxA %.4f %.4f %.4f %.4f",
++                      i, x.addr, y.v.size(), x.src.size(), y.src.size(), f[0], f[1], f[2], f[3], m[0], m[1], m[2], m[3]);
++        *diff = buf;
++        return false;
++      }
++      x.src = inter;
++    }
++  }
++  for (size_t i = 0; i < t.draws.size(); i++)
++  {
++    t.draws[i].lists = false;
++    Eff& w = t.draws[i].w;
++    const Eff& v = r.draws[i].w;
++    for (int k = 0; k < 256; k++)
++      w.bp[k] = w.bp[k] || v.bp[k];
++    for (u32 k = 0; k < kXfRegs; k++)
++      w.xf[k] = w.xf[k] || v.xf[k];
++    for (int k = 0; k < 0x100; k++)
++      w.cp[k] = w.cp[k] || v.cp[k];
++  }
++  return true;
++}
++
++// ---------------------------------------------------------------- replay stream
++void PutU32(std::vector<u8>& b, u32 v)
++{
++  b.push_back(static_cast<u8>(v >> 24));
++  b.push_back(static_cast<u8>(v >> 16));
++  b.push_back(static_cast<u8>(v >> 8));
++  b.push_back(static_cast<u8>(v));
++}
++void PutBP(std::vector<u8>& b, u32 reg, u32 v)
++{
++  b.push_back(0x61);
++  PutU32(b, (reg << 24) | (v & 0xFFFFFF));
++}
++void PutCP(std::vector<u8>& b, u32 reg, u32 v)
++{
++  b.push_back(0x08);
++  b.push_back(static_cast<u8>(reg));
++  PutU32(b, v);
++}
++void PutXF(std::vector<u8>& b, u32 addr, const u32* v, u32 n)
++{
++  b.push_back(0x10);
++  PutU32(b, ((n - 1) << 16) | addr);
++  for (u32 i = 0; i < n; i++)
++    PutU32(b, v[i]);
++}
++void Run(std::vector<u8>& b)
++{
++  if (b.empty())
++    return;
++  OpcodeDecoder::RunFifo<false>(DataReader(b.data(), b.data() + b.size()), nullptr);
++  b.clear();
++}
++
++const u32* LiveXF() { return reinterpret_cast<const u32*>(&xfmem); }
++
++// write the target state's registers in `e` that differ from the live state; `touched` collects what was written
++void EmitState(std::vector<u8>& b, const Snap& target, const Eff& e, Eff& touched, u32* skipped43)
++{
++  // CP first (vertex format), then XF, then BP
++  u32 cp_live[0x100] = {};
++  g_main_cp_state.FillCPMemoryArray(cp_live);
++  for (int k = 0; k < 0x100; k++)
++    if (e.cp[k] && cp_live[k] != target.cp[k])
++    {
++      PutCP(b, k, target.cp[k]);
++      touched.cp[k] = true;
++    }
++  const u32* xl = LiveXF() + 0x1000;
++  for (u32 k = 0; k < kXfRegs; k++)
++    if (e.xf[k] && xl[k] != target.xf[k])
++    {
++      PutXF(b, 0x1000 + k, &target.xf[k], 1);
++      touched.xf[k] = true;
++    }
++  const u32* bl = reinterpret_cast<const u32*>(&bpmem);
++  for (int k = 0; k < 256; k++)
++  {
++    if (!e.bp[k] || (k >= 0xE0 && k <= 0xE7))
++      continue;
++    if (k == 0x43)
++    {
++      // pixel / z format bits (0..5) must not change here (EFB reinterpretation); only the z-compare location may
++      if ((bl[k] & 0x3F) != (target.bp[k] & 0x3F))
++      {
++        (*skipped43)++;
++        continue;
++      }
++    }
++    if ((bl[k] & 0xFFFFFF) != (target.bp[k] & 0xFFFFFF))
++    {
++      PutBP(b, k, target.bp[k]);
++      touched.bp[k] = true;
++    }
++  }
++  // TEV registers: both banks, the bank written last in the target last
++  for (int r = 0; r < 8; r++)
++  {
++    if (!e.bp[0xE0 + r])
++      continue;
++    const u32 last = target.bp[0xE0 + r];
++    const int lt = (last >> 23) & 1;
++    const u32 other = target.tev[r][lt ^ 1];
++    bool w = false;
++    if ((s_tev[r][lt ^ 1] & 0xFFFFFF) != (other & 0xFFFFFF) && ((other >> 23) & 1) == static_cast<u32>(lt ^ 1))
++    {
++      PutBP(b, 0xE0 + r, other);
++      w = true;
++    }
++    if (w || (s_tev[r][lt] & 0xFFFFFF) != (last & 0xFFFFFF) || (bl[0xE0 + r] & 0xFFFFFF) != (last & 0xFFFFFF))
++    {
++      PutBP(b, 0xE0 + r, last);
++      w = true;
++    }
++    if (w)
++      touched.bp[0xE0 + r] = true;
++  }
++}
++
++u64 s_replay_draws = 0, s_skip43 = 0, s_noslot = 0;
++
++void BuildLists(DrawRec& d)
++{
++  Eff use;
++  UseSet(d.e, d.w, d.live, &use);
++  d.l_bp.clear();
++  d.l_cp.clear();
++  d.l_xf.clear();
++  d.l_tev.clear();
++  for (int k = 0; k < 0x100; k++)
++    if (use.cp[k])
++      d.l_cp.push_back(static_cast<u8>(k));
++  for (u32 k = 0; k < kXfRegs; k++)
++    if (use.xf[k])
++      d.l_xf.push_back(static_cast<u8>(k));
++  for (int k = 0; k < 256; k++)
++    if (use.bp[k])
++      ((k >= 0xE0 && k <= 0xE7) ? d.l_tev : d.l_bp).push_back(static_cast<u8>(k));
++  d.lists = true;
++}
++
++// replay: one command stream for the whole model, diffed against a running image of the register state.
++// The game's register state is put back lazily, right before the next command that is not ours (FlushPending): back to
++// back replayed models then batch exactly like the game's own draws did (a restore between them would split Dolphin's
++// vertex batches, which changes what effects anchored on those draws see in the EFB).
++struct MtxSave
++{
++  u16 addr, n;
++  u32 v[16];
++};
++Snap s_before, s_img;
++std::array<bool, 256> t_bp;
++std::array<bool, kXfRegs> t_xf;
++std::array<bool, 0x100> t_cp;
++std::vector<MtxSave> s_msave;
++std::vector<u8> s_rb;
++bool s_in_replay = false;
++
++void PutBPImage(u32 k, u32 v)
++{
++  PutBP(s_rb, k, v);
++  s_img.bp[k] = v;
++  if (k >= 0xE0 && k <= 0xE7)
++    s_img.tev[k - 0xE0][(v >> 23) & 1] = v;
++  t_bp[k] = true;
++}
++void EmitTev(const Snap& target, u32 r, bool restore)
++{
++  const u32 last = target.bp[0xE0 + r];
++  const int lt = (last >> 23) & 1;
++  const u32 other = target.tev[r][lt ^ 1];
++  bool w = false;
++  // the other bank is only put back when its value is known (after a state load the shadow is not)
++  if ((!restore || s_tev_known[r][lt ^ 1]) && (s_img.tev[r][lt ^ 1] & 0xFFFFFF) != (other & 0xFFFFFF) &&
++      ((other >> 23) & 1) == static_cast<u32>(lt ^ 1))
++  {
++    PutBPImage(0xE0 + r, other);
++    w = true;
++  }
++  if (w || (s_img.tev[r][lt] & 0xFFFFFF) != (last & 0xFFFFFF) || (s_img.bp[0xE0 + r] & 0xFFFFFF) != (last & 0xFFFFFF))
++    PutBPImage(0xE0 + r, last);
++}
++void RunOurs()
++{
++  s_in_replay = true;
++  Run(s_rb);
++  s_in_replay = false;
++}
++
++void Replay(u32 slot, const Payload& p)
++{
++  SlotData& sd = s_slots[slot];
++  if (s_shared.noreplay.load(std::memory_order_relaxed))
++    return;
++  if (!sd.have || s_shared.state[slot].load(std::memory_order_relaxed) != kTrusted)
++  {
++    s_noslot++;
++    return;
++  }
++  if (!g_pending)
++  {
++    TakeSnap(&s_before);
++    s_img = s_before;
++    t_bp.fill(false);
++    t_xf.fill(false);
++    t_cp.fill(false);
++    s_msave.clear();
++  }
++  else
++    TakeSnap(&s_img);
++  s_rb.clear();
++  u32 sk = 0;
++  for (DrawRec& d : sd.tmpl.draws)
++  {
++    if (!d.lists)
++      BuildLists(d);
++    for (const MtxRun& r : d.runs)
++    {
++      const u32 n = static_cast<u32>(r.v.size());
++      if (n > 16)
++        continue;
++      bool saved = false;
++      for (const MtxSave& m : s_msave)
++        saved = saved || (m.addr == r.addr && m.n == n);
++      if (!saved)
++      {
++        MtxSave ms{r.addr, static_cast<u16>(n), {}};
++        std::memcpy(ms.v, LiveXF() + r.addr, 4 * n);
++        s_msave.push_back(ms);
++      }
++      if (const int g = GameTexMtxSource(r.addr, n, p); g >= 0)
++      {
++        u32 w[12];
++        for (int i = 0; i < 12; i++)
++          w[i] = Common::swap32(p.globals + g + 4 * i);
++        PutXF(s_rb, r.addr, w, 12);
++      }
++      else
++        PutXF(s_rb, r.addr, r.v.data(), n);
++    }
++    for (u8 k : d.l_cp)
++      if (s_img.cp[k] != d.s.cp[k])
++      {
++        PutCP(s_rb, k, d.s.cp[k]);
++        s_img.cp[k] = d.s.cp[k];
++        t_cp[k] = true;
++      }
++    for (u8 k : d.l_xf)
++      if (s_img.xf[k] != d.s.xf[k])
++      {
++        PutXF(s_rb, 0x1000 + k, &d.s.xf[k], 1);
++        s_img.xf[k] = d.s.xf[k];
++        t_xf[k] = true;
++      }
++    for (u8 k : d.l_bp)
++    {
++      if (k == 0x43 && (s_img.bp[k] & 0x3F) != (d.s.bp[k] & 0x3F))
++      {
++        static int logged = 0;
++        if (s_shared.log.load() > 1 && logged < 20)
++          logged++, Log("slot %u: zcontrol skip live %06x record %06x\n", slot, s_img.bp[k] & 0xFFFFFF, d.s.bp[k] & 0xFFFFFF);
++        sk++;  // pixel / z format must not change here (EFB reinterpretation)
++        continue;
++      }
++      if ((s_img.bp[k] & 0xFFFFFF) != (d.s.bp[k] & 0xFFFFFF))
++        PutBPImage(k, d.s.bp[k]);
++    }
++    for (u8 k : d.l_tev)
++      EmitTev(d.s, k - 0xE0, false);
++    if (d.dl)
++      s_rb.insert(s_rb.end(), d.dl->begin(), d.dl->end());
++    s_replay_draws++;
++  }
++  RunOurs();
++  g_pending = true;
++  s_skip43 += sk;
++  s_shared.replays++;
++}
++
++}  // namespace
++
++// put everything back: the game never saw the replayed draws
++void FlushPending()
++{
++  if (!g_pending || s_in_replay)
++    return;
++  g_pending = false;
++  TakeSnap(&s_img);
++  s_rb.clear();
++  for (int k = 0; k < 0x100; k++)
++    if (t_cp[k] && s_img.cp[k] != s_before.cp[k])
++      PutCP(s_rb, k, s_before.cp[k]);
++  for (u32 k = 0; k < kXfRegs; k++)
++    if (t_xf[k] && s_img.xf[k] != s_before.xf[k])
++      PutXF(s_rb, 0x1000 + k, &s_before.xf[k], 1);
++  for (int k = 0; k < 256; k++)
++    if (t_bp[k] && !(k >= 0xE0 && k <= 0xE7) && (s_img.bp[k] & 0xFFFFFF) != (s_before.bp[k] & 0xFFFFFF))
++      PutBP(s_rb, k, s_before.bp[k]);
++  for (u32 r = 0; r < 8; r++)
++    if (t_bp[0xE0 + r])
++      EmitTev(s_before, r, true);
++  for (size_t i = s_msave.size(); i-- > 0;)
++    PutXF(s_rb, s_msave[i].addr, s_msave[i].v, s_msave[i].n);
++  RunOurs();
++}
++
++namespace
++{
++void FinishCapture()
++{
++  g_capturing = false;
++  s_cur.tail_runs = std::move(s_pending_runs);
++  s_pending_runs.clear();
++  const u32 slot = s_cur_slot;
++  SlotData& sd = s_slots[slot];
++  auto& st = s_shared.state[slot];
++  if (st.load() == kBad)
++    return;
++  if (!s_cur.unsupported.empty() || s_cur.draws.empty())
++  {
++    if (s_cur.draws.empty() && s_cur.unsupported.empty())
++      s_cur.unsupported = "no display list drawn";
++    st.store(kBad);
++    s_shared.bad++;
++    if (s_shared.log.load())
++      Log("slot %u model %08x BAD: %s\n", slot, s_shared.model[slot], s_cur.unsupported.c_str());
++    return;
++  }
++  if (!sd.have)
++  {
++    sd.tmpl = std::move(s_cur);
++    sd.have = true;
++    sd.matches = 0;
++    st.store(kVerifying);
++    return;
++  }
++  std::string diff;
++  if (Compare(sd.tmpl, s_cur, &diff))
++  {
++    s_shared.matches++;
++    if (++sd.matches >= kNeedMatches && st.load() != kTrusted)
++    {
++      st.store(kTrusted);
++      s_shared.trusted++;
++      if (s_shared.log.load() > 1)
++      {
++        std::string d;
++        {
++          std::string lv;
++          for (const auto& dr : sd.tmpl.draws)
++            for (int k = 0; k < 256; k++)
++              if (dr.live.bp[k] && dr.e.bp[k] && lv.find(std::to_string(k) + ",") == std::string::npos)
++                lv += std::to_string(k) + ",";
++          for (const auto& dr : sd.tmpl.draws)
++            for (u32 k = 0; k < kXfRegs; k++)
++              if (dr.live.xf[k] && dr.e.xf[k] && lv.find("x" + std::to_string(k) + ",") == std::string::npos)
++                lv += "x" + std::to_string(k) + ",";
++          if (!lv.empty())
++            d += " live{" + lv + "}";
++        }
++        for (const auto& dr : sd.tmpl.draws)
++        {
++          char t[96];
++          std::snprintf(t, sizeof(t), " [tev %u tg %u tex %06x dl %u runs %zu]", (dr.s.bp[0] >> 10 & 15) + 1,
++                        dr.s.bp[0] & 15, dr.s.bp[0x94] & 0xFFFFFF, dr.dl_size, dr.runs.size());
++          d += t;
++        }
++        Log("slot %u model %08x trusted (%zu draws)%s\n", slot, s_shared.model[slot], sd.tmpl.draws.size(), d.c_str());
++      }
++    }
++    return;
++  }
++  s_shared.mismatches++;
++  if (s_shared.log.load())
++    Log("slot %u model %08x mismatch (%d): %s\n", slot, s_shared.model[slot], sd.fails + 1, diff.c_str());
++  sd.tmpl = std::move(s_cur);
++  sd.matches = 0;
++  if (++sd.fails >= kMaxFails)
++  {
++    st.store(kBad);
++    s_shared.bad++;
++  }
++  else
++    st.store(kVerifying);
++}
++
++void CheckEpoch(u32 epoch)
++{
++  if (epoch == s_epoch_seen)
++    return;
++  s_epoch_seen = epoch;
++  for (auto& s : s_slots)
++    s = SlotData{};
++  s_dls.clear();
++  g_capturing = false;
++  if (s_shared.log.load())
++    Log("epoch %u: all records cleared\n", epoch);
++}
++}  // namespace
++
++Shared& GetShared()
++{
++  return s_shared;
++}
++
++void Log(const char* fmt, ...)
++{
++  std::lock_guard lk(s_log_mutex);
++  if (!s_log)
++  {
++    s_log = std::fopen((File::GetUserPath(D_LOGS_IDX) + "er-trackgpu.log").c_str(), "w");
++    if (!s_log)
++      return;
++  }
++  va_list ap;
++  va_start(ap, fmt);
++  std::vfprintf(s_log, fmt, ap);
++  va_end(ap);
++  std::fflush(s_log);
++}
++
++bool PushPayload(const Payload& p)
++{
++  const u32 h = s_head.load(std::memory_order_relaxed);
++  if (h - s_tail.load(std::memory_order_acquire) >= kRing - 1)
++    return false;
++  s_ring[h % kRing] = p;
++  s_head.store(h + 1, std::memory_order_release);
++  return true;
++}
++
++void TrackBP(u8 reg)
++{
++  if (reg >= 0xE0 && reg <= 0xE7)
++  {
++    const u32 v = reinterpret_cast<const u32*>(&bpmem)[reg];
++    s_tev[reg - 0xE0][(v >> 23) & 1] = v;
++    s_tev_known[reg - 0xE0][(v >> 23) & 1] = true;
++  }
++}
++
++bool OnDisplayListMarker(u32 address, u32 size)
++{
++  if ((address & kMagicMask) != kMagic)
++    return false;
++  const u32 kind = (address >> 21) & 7;
++  const u32 slot = (address >> 5) & 0xFFFF;
++  const u32 epoch = size >> 5;
++  CheckEpoch(epoch);
++  static u64 n = 0, next_stat = 600000;
++  n++;
++  if (kind != kReplay)
++    FlushPending();
++  if (kind == kBegin)
++  {
++    if (g_capturing)
++      g_capturing = false;  // a missing end (state load): drop it
++    Payload p;
++    if (!PopPayload(slot, kBegin, &p))
++      return true;
++    s_cur = Rec{};
++    s_written = Eff{};
++    s_cur_slot = slot;
++    s_cur_payload = p;
++    BuildSearch(p, &s_search);
++    s_pending_runs.clear();
++    g_capturing = true;
++    s_shared.begins++;
++  }
++  else if (kind == kEnd)
++  {
++    if (g_capturing && slot == s_cur_slot)
++      FinishCapture();
++    g_capturing = false;
++  }
++  else if (kind == kReplay)
++  {
++    Payload p;
++    if (PopPayload(slot, kReplay, &p))
++      Replay(slot, p);
++  }
++  if (s_shared.log.load() && n >= next_stat)
++  {
++    next_stat = n + 600000;
++    Log("stats markers %llu begins %llu replays %llu draws %llu matches %llu mismatches %llu trusted %llu bad %llu "
++        "noslot %llu skip43 %llu\n",
++        (unsigned long long)n, (unsigned long long)s_shared.begins.load(), (unsigned long long)s_shared.replays.load(),
++        (unsigned long long)s_replay_draws, (unsigned long long)s_shared.matches.load(),
++        (unsigned long long)s_shared.mismatches.load(), (unsigned long long)s_shared.trusted.load(),
++        (unsigned long long)s_shared.bad.load(), (unsigned long long)s_noslot, (unsigned long long)s_skip43);
++  }
++  return true;
++}
++
++void OnCaptureDL(u32 address, u32 size, bool in_dl)
++{
++  if (in_dl)
++  {
++    s_cur.unsupported = "nested display list";
++    return;
++  }
++  DrawRec d;
++  TakeSnap(&d.s);
++  d.dl_addr = address;
++  d.dl_size = size;
++  auto& memory = Core::System::GetInstance().GetMemory();
++  const u8* src = memory.GetPointerForRange(address, size);
++  if (!src)
++  {
++    s_cur.unsupported = "display list outside RAM";
++    return;
++  }
++  d.dl_hash = XXH64(src, size, 0);
++  const auto key = std::make_pair(address, (static_cast<u64>(size) << 32) ^ d.dl_hash);
++  auto it = s_dls.find(key);
++  if (it == s_dls.end())
++    it = s_dls.emplace(key, std::make_shared<std::vector<u8>>(src, src + size)).first;
++  d.dl = it->second;
++  d.vats = UsedVats(src, size, d.s, &s_cur.unsupported);
++  ComputeEff(d.s, d.vats, &d.e);
++  d.w = s_written;
++  d.runs = std::move(s_pending_runs);
++  s_pending_runs.clear();
++  s_cur.draws.push_back(std::move(d));
++}
++
++void OnCaptureXF(u16 address, u8 count, const u8* data)
++{
++  if (address >= 0x1000)
++  {
++    for (u32 i = 0; i < count; i++)
++      if (address + i >= 0x1000 && address + i < 0x1000 + kXfRegs)
++        s_written.xf[address + i - 0x1000] = true;
++    return;
++  }
++  MtxRun r;
++  r.addr = address;
++  for (u32 i = 0; i < count; i++)
++    r.v.push_back(Common::swap32(data + 4 * i));
++  // only fn_800756B0's texture matrices are understood (computed on replay); a model draw that loads others (the
++  // env / reflection / projected-light matrices of fn_80074D88 / fn_8007698C, skinning) stays on the game
++  if (!IsGameTexMtx(r.addr, r.v.size()) && s_cur.unsupported.empty())
++  {
++    char t[64];
++    std::snprintf(t, sizeof(t), "matrix load at %04x/%zu", r.addr, r.v.size());
++    s_cur.unsupported = t;
++  }
++  FindSources(r, s_search);
++  s_pending_runs.push_back(std::move(r));
++}
++
++void OnCaptureBP(u8 reg, u32 value)
++{
++  s_written.bp[reg] = true;
++  (void)value;
++  // triggers whose effect is not a register value (TLUT / TMEM loads, EFB copies, tokens)
++  if ((reg >= 0x45 && reg <= 0x48) || reg == 0x52 || (reg >= 0x60 && reg <= 0x67))
++  {
++    if (reg == 0x66)
++      return;  // texture cache invalidate: harmless
++    if (s_cur.unsupported.empty())
++      s_cur.unsupported = "BP trigger " + std::to_string(reg);
++  }
++}
++
++void OnCaptureCP(u8 reg, u32 value)
++{
++  s_written.cp[reg] = true;
++  (void)reg;
++  (void)value;
++}
++
++void OnCaptureOther(const char* what)
++{
++  if (s_cur.unsupported.empty())
++    s_cur.unsupported = what;
++}
++}  // namespace ERTrackGpu
+--- a/Source/Core/VideoCommon/ERTrackGpu.h
++++ b/Source/Core/VideoCommon/ERTrackGpu.h
+@@ -0,0 +1,84 @@
++// Copyright 2026 Evolution Racing contributors
++// SPDX-License-Identifier: GPL-2.0-or-later
++//
++// Evolution Racing lit17s45 BGX phase 2: track visuals on the host GPU ("GX replay").
++// The game keeps every decision (which stage objects, LOD, culling, the model-view matrix it loads before each model).
++// For track models our Dolphin skips the game's own GCMF model-draw code (fn_80077F8C / fn_800780A4 / fn_800781B8 /
++// fn_80077E7C, HLE replace at entry+4) and draws the model itself on the GPU thread from host-held draw records: the
++// effective material register state (BP / XF / CP) of each display-list call plus a host copy of the display list.
++// The draws go through Dolphin's normal GX pipeline, so texture hashes (GraphicMods / HD packs), EFB depth, draw order,
++// headlights / shadows behave exactly as before. A model is only replayed after the game's own draws of it matched the
++// records several times (verification); a mismatch puts it back on the game. CPU side: Core/ERTrackGpuHooks.cpp.
++
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++
++#include "Common/CommonTypes.h"
++
++namespace ERTrackGpu
++{
++// FIFO marker = GX CALL_DL with this address prefix (never valid RAM): address = kMagic | kind << 21 | slot << 5,
++// size = epoch << 5. Decoded on the GPU thread before any memory access.
++constexpr u32 kMagicMask = 0xFF000000u;
++constexpr u32 kMagic = 0x7E000000u;
++enum MarkerKind : u32
++{
++  kBegin = 1,   // the game draws this model now: record / verify its draws
++  kEnd = 2,     // end of the game's draw
++  kReplay = 3,  // the game skipped the model: draw it from the records
++};
++constexpr u32 kMaxSlots = 0x10000;
++
++enum SlotState : u32
++{
++  kNew = 0,
++  kVerifying = 1,
++  kTrusted = 2,
++  kBad = 3,  // never replayed (unsupported content or repeated mismatches)
++};
++
++// per-marker game data the CPU hook copies from RAM at the call (consumed in order by the GPU thread)
++struct Payload
++{
++  u32 slot = 0;
++  u32 kind = 0;
++  u32 epoch = 0;
++  u32 model = 0;
++  u8 globals[0x170];  // RAM 0x8019F040..0x8019F1B0: the texture matrices fn_800756B0 loads (+0x20, +0x50.., lbl_8019F158)
++  u32 env_on = 0;      // lbl_801A6D78: texture matrix 0x24 = globals + 0x20 (else the identity-like lbl_8019F158 + 0x20)
++  float mtxA[12];     // locked cache 0xE0000000: the game's current model-view matrix (diagnostics)
++};
++
++struct Shared
++{
++  std::atomic<u32> state[kMaxSlots];
++  u32 model[kMaxSlots];
++  std::atomic<u32> epoch{1};
++  std::atomic<u32> enabled{0};  // 1 replay on, 2 verify only (never skip)
++  std::atomic<u32> log{0};
++  std::atomic<u32> noreplay{0};  // harness: skip on the CPU but draw nothing (isolates CPU-side effects)
++  // stats (GPU thread writes, anyone reads)
++  std::atomic<u64> replays{0}, begins{0}, matches{0}, mismatches{0}, bad{0}, trusted{0};
++};
++Shared& GetShared();
++
++// CPU thread: queue the payload, then write the marker into the gather pipe
++bool PushPayload(const Payload& p);
++
++// GPU thread hooks (OpcodeDecoding.cpp RunCallback<false>)
++extern bool g_capturing;  // true between a kBegin and its kEnd
++extern bool g_pending;    // replayed draws left their state: put the game's back before its next command
++void FlushPending();
++bool OnDisplayListMarker(u32 address, u32 size);  // true = it was ours (consumed)
++void OnCaptureDL(u32 address, u32 size, bool in_dl);
++void OnCaptureXF(u16 address, u8 count, const u8* data);
++void OnCaptureBP(u8 reg, u32 value);
++void OnCaptureCP(u8 reg, u32 value);
++void OnCaptureOther(const char* what);  // indexed loads / inline primitives / unknown opcodes inside the region
++// every BP write (both TEV colour register banks are kept here: bpmem holds only the last write of 0xE0-0xE7)
++void TrackBP(u8 reg);
++
++void Log(const char* fmt, ...);
++}  // namespace ERTrackGpu
 --- a/Source/Core/VideoCommon/FramebufferManager.cpp
 +++ b/Source/Core/VideoCommon/FramebufferManager.cpp
 @@ -2,6 +2,8 @@
@@ -48018,6 +49720,106 @@ HcmV?d00001
    OSD::DrawMessages();
    DrawChallengesAndLeaderboards();
    ImGui::Render();
+--- a/Source/Core/VideoCommon/OpcodeDecoding.cpp
++++ b/Source/Core/VideoCommon/OpcodeDecoding.cpp
+@@ -23,6 +23,7 @@
+ #include "VideoCommon/CPMemory.h"
+ #include "VideoCommon/CommandProcessor.h"
+ #include "VideoCommon/DataReader.h"
++#include "VideoCommon/ERTrackGpu.h"
+ #include "VideoCommon/Fifo.h"
+ #include "VideoCommon/Statistics.h"
+ #include "VideoCommon/VertexLoaderBase.h"
+@@ -44,6 +45,10 @@
+ 
+     if constexpr (!is_preprocess)
+     {
++      if (ERTrackGpu::g_pending)
++        ERTrackGpu::FlushPending();
++      if (ERTrackGpu::g_capturing)
++        ERTrackGpu::OnCaptureXF(address, count, data);
+       LoadXFReg(address, count, data);
+ 
+       INCSTAT(g_stats.this_frame.num_xf_loads);
+@@ -55,6 +60,8 @@
+     const u8 sub_command = command & CP_COMMAND_MASK;
+     if constexpr (!is_preprocess)
+     {
++      if (ERTrackGpu::g_pending)
++        ERTrackGpu::FlushPending();
+       if (sub_command == MATINDEX_A)
+       {
+         VertexLoaderManager::g_needs_cp_xf_consistency_check = true;
+@@ -99,6 +106,9 @@
+       }
+     }
+     GetCPState().LoadCPReg(command, value);
++    if constexpr (!is_preprocess)
++      if (ERTrackGpu::g_capturing)
++        ERTrackGpu::OnCaptureCP(command, value);
+   }
+   OPCODE_CALLBACK(void OnBP(u8 command, u32 value))
+   {
+@@ -110,7 +120,12 @@
+     }
+     else
+     {
++      if (ERTrackGpu::g_pending)
++        ERTrackGpu::FlushPending();
+       LoadBPReg(command, value, m_cycles);
++      ERTrackGpu::TrackBP(command);
++      if (ERTrackGpu::g_capturing)
++        ERTrackGpu::OnCaptureBP(command, value);
+       INCSTAT(g_stats.this_frame.num_bp_loads);
+     }
+   }
+@@ -121,11 +136,24 @@
+     if constexpr (is_preprocess)
+       PreprocessIndexedXF(array, index, address, size);
+     else
++    {
++      if (ERTrackGpu::g_pending)
++        ERTrackGpu::FlushPending();
++      if (ERTrackGpu::g_capturing)
++        ERTrackGpu::OnCaptureOther("indexed XF load");
+       LoadIndexedXF(array, index, address, size);
++    }
+   }
+   OPCODE_CALLBACK(void OnPrimitiveCommand(OpcodeDecoder::Primitive primitive, u8 vat,
+                                           u32 vertex_size, u16 num_vertices, const u8* vertex_data))
+   {
++    if constexpr (!is_preprocess)
++    {
++      if (ERTrackGpu::g_pending)
++        ERTrackGpu::FlushPending();
++      if (ERTrackGpu::g_capturing && !m_in_display_list)
++        ERTrackGpu::OnCaptureOther("inline primitives");
++    }
+     // load vertices
+     const u32 size = vertex_size * num_vertices;
+ 
+@@ -144,6 +172,21 @@
+   {
+     m_cycles += 6;
+ 
++    // BGX phase 2 markers (never valid RAM): consumed on the GPU thread, ignored by the preprocessor
++    if ((address & ERTrackGpu::kMagicMask) == ERTrackGpu::kMagic)
++    {
++      if constexpr (!is_preprocess)
++        ERTrackGpu::OnDisplayListMarker(address, size);
++      return;
++    }
++    if constexpr (!is_preprocess)
++    {
++      if (ERTrackGpu::g_pending)
++        ERTrackGpu::FlushPending();
++      if (ERTrackGpu::g_capturing)
++        ERTrackGpu::OnCaptureDL(address, size, m_in_display_list);
++    }
++
+     if (m_in_display_list)
+     {
+       WARN_LOG_FMT(VIDEO, "recursive display list detected");
 --- a/Source/Core/VideoCommon/PC5090Menu.cpp
 +++ b/Source/Core/VideoCommon/PC5090Menu.cpp
 @@ -0,0 +1,973 @@
