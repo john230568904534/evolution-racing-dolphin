@@ -15131,7 +15131,7 @@ HcmV?d00001
  
 +// Evolution Racing member build id (one id for the Linux and the Windows build of the same source)
 +#ifndef ER_BUILD_ID
-+#define ER_BUILD_ID "lit17s43er"
++#define ER_BUILD_ID "lit17s43erm"
 +#endif
 +const std::string& GetERBuildStr()
 +{
@@ -15141,7 +15141,7 @@ HcmV?d00001
 +
 +// Evolution Racing X.Y (hub/server/versions.json; lighting_mod/updater/apply_version.py sets it)
 +#ifndef ER_VERSION
-+#define ER_VERSION "1.7"
++#define ER_VERSION "1.7.2"
 +#endif
 +// "ER_VERSION=1.3" stays in the binary (not const, read below): scripts/dolphinpack.py / winpack.py look for it
 +extern char er_version_marker[];
@@ -22027,7 +22027,7 @@ HcmV?d00001
 +};
 --- a/Source/Core/VideoCommon/ERModes.cpp
 +++ b/Source/Core/VideoCommon/ERModes.cpp
-@@ -0,0 +1,3046 @@
+@@ -0,0 +1,3333 @@
 +// Copyright 2026 Evolution Racing (Evolution Racing Dolphin)
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
@@ -22245,6 +22245,12 @@ HcmV?d00001
 +}
 +
 +// ---- the disc's mode file (files/evo/racemodes.json) ----
++struct ModeCup
++{
++  std::vector<int> ids;  // 5 course ids, or empty
++  std::string name;      // optional cup name
++};
++const char* const kModeKeys[4] = {"normal", "cutoff", "breakaway", "hunted"};
 +struct DiscModes
 +{
 +  std::string path;
@@ -22253,8 +22259,60 @@ HcmV?d00001
 +  std::array<Kind, 64> course{};  // per course id (overrides the cup)
 +  std::array<bool, 64> course_set{};
 +  int hunted_level = 1;
++  // "modeCups": each mode's own five cups of five tracks (course ids), shown on the cup screen after that mode is picked on
++  // SELECT MODE. Index = the mode screen's order (0 Normal, 1 Cutoff, 2 Breakaway, 3 Hunted); a cup without tracks = the
++  // regular cup in that place.
++  std::array<std::array<ModeCup, 5>, 4> mode_cup{};
 +};
 +DiscModes s_disc;
++// one "modeCups" object -> cups. Per mode: [ids x5] (= cup 1), [[ids], [ids], ...], [{"name", "courses"}, ...] or
++// {"cups": [...]}; null / [] clears the mode (a user file can switch a disc's cups off).
++void ParseModeCups(const picojson::value& v, std::array<std::array<ModeCup, 5>, 4>& out)
++{
++  if (!v.is<picojson::object>())
++    return;
++  const auto& o = v.get<picojson::object>();
++  auto ids_of = [](const picojson::value& e) {
++    std::vector<int> ids;
++    if (e.is<picojson::array>())
++      for (const auto& x : e.get<picojson::array>())
++        if (x.is<double>() && x.get<double>() >= 1 && x.get<double>() < 64 && ids.size() < 5)
++          ids.push_back(static_cast<int>(x.get<double>()));
++    while (!ids.empty() && ids.size() < 5)
++      ids.push_back(ids.back());
++    return ids;
++  };
++  for (int m = 0; m < 4; m++)
++  {
++    if (!o.count(kModeKeys[m]))
++      continue;
++    out[m] = {};
++    const picojson::value* e = &o.at(kModeKeys[m]);
++    if (e->is<picojson::object>() && e->get<picojson::object>().count("cups"))
++      e = &e->get<picojson::object>().at("cups");
++    if (!e->is<picojson::array>() || e->get<picojson::array>().empty())
++      continue;
++    const auto& a = e->get<picojson::array>();
++    if (a[0].is<double>())
++    {
++      out[m][0].ids = ids_of(*e);
++      continue;
++    }
++    for (size_t c = 0; c < a.size() && c < 5; c++)
++    {
++      if (a[c].is<picojson::object>())
++      {
++        const auto& co = a[c].get<picojson::object>();
++        if (co.count("courses"))
++          out[m][c].ids = ids_of(co.at("courses"));
++        if (co.count("name") && co.at("name").is<std::string>())
++          out[m][c].name = co.at("name").get<std::string>();
++      }
++      else
++        out[m][c].ids = ids_of(a[c]);
++    }
++  }
++}
 +
 +// the mode picked on the cup screen with the pad: -1 = none yet (the disc's mode for the cup, else Normal). Lasts until
 +// the console is reset / the game is booted again.
@@ -22324,6 +22382,8 @@ HcmV?d00001
 +    if (l >= 0)
 +      s_disc.hunted_level = l;
 +  }
++  if (o.count("modeCups"))
++    ParseModeCups(o.at("modeCups"), s_disc.mode_cup);
 +  std::fprintf(stderr, "ERMODES disc racemodes.json: Ruby %s, Sapphire %s, Emerald %s, Diamond %s, AX %s, hunted level %s\n",
 +               KindName(s_disc.cup[0]), KindName(s_disc.cup[1]), KindName(s_disc.cup[2]), KindName(s_disc.cup[3]),
 +               KindName(s_disc.cup[4]), kHunt[s_disc.hunted_level].name);
@@ -23557,6 +23617,222 @@ HcmV?d00001
 +    s->substickX = std::min<u8>(s->substickX, 128);
 +  }
 +}
++// ---- Mode cups: each mode's own five cups of five tracks (racemodes.json "modeCups", User/pc5090-mode-cups.json per mode) ----
++// After a mode with cups is picked on SELECT MODE, page 1 of the cup screen holds that mode's cups: each set cup's row of the
++// cup table (main REL B + 0x167940, rows 1-5, all three copies) holds its five tracks and its name row (sel string table
++// rows 24-28) the cup's name; a cup without tracks stays the regular cup. The game's own cup screen, Select Course, Grand Prix
++// order and race loading then use them. The page edges are held while they show (a page flip swaps the table). Restored on
++// B to SELECT MODE, on the main menu and on other game types; kept through Select Course and the races.
++// Practice remembers the cup and course last raced per mode (User/pc5090-mode-course: "CI" per mode, cup row 1-5 + index 0-4).
++struct ModeCupState
++{
++  bool cache = false;
++  std::array<std::array<ModeCup, 5>, 4> cups{};
++  int applied = -1;  // mode whose rows are in the table
++  std::vector<SelBackup> rows, menu;
++  int prev_step = -1;
++  int cur_row = 1, cur_idx = 0;
++  bool saved = true;
++  bool row_set = false;
++} s_mc;
++constexpr u32 kCupTable = 0x167940;
++std::string McCourseFile()
++{
++  return File::GetUserPath(D_USER_IDX) + "pc5090-mode-course";
++}
++const std::array<ModeCup, 5>& McCups(int mode)
++{
++  static const std::array<ModeCup, 5> none{};
++  if (mode < 0 || mode > 3)
++    return none;
++  if (!s_mc.cache)
++  {
++    LoadDiscModes();
++    s_mc.cups = s_disc.mode_cup;
++    std::string t;
++    picojson::value v;
++    if (File::ReadFileToString(File::GetUserPath(D_USER_IDX) + "pc5090-mode-cups.json", t) && picojson::parse(v, t).empty() &&
++        v.is<picojson::object>() && v.get<picojson::object>().count("modeCups"))
++      ParseModeCups(v.get<picojson::object>().at("modeCups"), s_mc.cups);
++    s_mc.cache = true;
++    for (int m = 0; m < 4; m++)
++      for (int c = 0; c < 5; c++)
++        if (s_mc.cups[m][c].ids.size() == 5)
++          std::fprintf(stderr, "ERMODES modecup %s cup %d \"%s\": %d %d %d %d %d\n", kModeKeys[m], c + 1, s_mc.cups[m][c].name.c_str(),
++                       s_mc.cups[m][c].ids[0], s_mc.cups[m][c].ids[1], s_mc.cups[m][c].ids[2], s_mc.cups[m][c].ids[3],
++                       s_mc.cups[m][c].ids[4]);
++  }
++  return s_mc.cups[mode];
++}
++bool McHasCups(int mode)
++{
++  for (const auto& c : McCups(mode))
++    if (c.ids.size() == 5)
++      return true;
++  return false;
++}
++std::pair<int, int> McRemembered(int mode)  // cup row 1-5, course index 0-4
++{
++  std::string t;
++  if (File::ReadFileToString(McCourseFile(), t) && static_cast<int>(t.size()) >= 2 * mode + 2 && t[2 * mode] >= '1' &&
++      t[2 * mode] <= '5' && t[2 * mode + 1] >= '0' && t[2 * mode + 1] <= '4')
++    return {t[2 * mode] - '0', t[2 * mode + 1] - '0'};
++  return {1, 0};
++}
++void McRemember(int mode, int row, int idx)
++{
++  std::string t;
++  File::ReadFileToString(McCourseFile(), t);
++  t.resize(8, '0');
++  for (int m = 0; m < 4; m++)
++    if (t[2 * m] < '1' || t[2 * m] > '5' || t[2 * m + 1] < '0' || t[2 * m + 1] > '4')
++      t[2 * m] = '1', t[2 * m + 1] = '0';
++  t[2 * mode] = static_cast<char>('0' + std::clamp(row, 1, 5));
++  t[2 * mode + 1] = static_cast<char>('0' + std::clamp(idx, 0, 4));
++  File::WriteStringToFile(McCourseFile(), t);
++}
++void McRestoreMenu(bool menu_alive)
++{
++  if (menu_alive)
++    SelRestoreList(s_mc.menu);
++  s_mc.menu.clear();
++}
++void McRestoreAll(bool menu_alive)
++{
++  McRestoreMenu(menu_alive);
++  if (s_mc.applied >= 0)
++    std::fprintf(stderr, "ERMODES modecup: %s cups off, regular cups back\n", kModeKeys[s_mc.applied]);
++  SelRestoreList(s_mc.rows);
++  s_mc.applied = -1;
++  s_mc.row_set = false;
++}
++// the cups' names on the cup screen (name buffers / the REL's own strings; the game draws them itself)
++void McApplyMenu(int mode)
++{
++  if (!s_mc.menu.empty())
++    return;
++  const u32 size = s_mem->GetRamSizeReal();
++  const u8* ram = P(0x80000000u, size);
++  static const char hint[] = "Select a Cup. ";
++  const u8* f = ram ? static_cast<const u8*>(memmem(ram, size, hint, sizeof(hint))) : nullptr;
++  if (!f)
++    return;
++  const u32 tab = 0x80000000u + static_cast<u32>(f - ram) + (0x2CDC - 0x11E8);
++  static const char* const roman[5] = {"I", "II", "III", "IV", "V"};
++  const auto& cups = McCups(mode);
++  for (int c = 0; c < 5; c++)
++  {
++    if (cups[c].ids.size() != 5)
++      continue;
++    u32 name = 0;
++    if (!R32(tab + (24 + c) * 24, &name) || !InRam(name))
++      continue;
++    const u8* old = P(name, 32);
++    if (!old)
++      continue;
++    std::string nm = cups[c].name.empty() ? std::string(kSelNames[mode]) + " " + roman[c] : cups[c].name;
++    for (auto& ch : nm)
++      ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
++    const bool buf32 = name >= 0x817C0000u;  // page discs: 32-byte buffers; else the REL's own string (its own length)
++    const size_t room = buf32 ? 31 : std::strlen(reinterpret_cast<const char*>(old));
++    if (nm.size() > room)
++      nm = cups[c].name.empty() && room >= std::strlen(kSelNames[mode]) ? std::string(kSelNames[mode]) : nm.substr(0, room);
++    char txt[32] = {};
++    std::strncpy(txt, nm.c_str(), 31);
++    SelPatch(s_mc.menu, name, txt, buf32 ? sizeof(txt) : room + 1);
++  }
++}
++void McApplyRows(u32 B, int mode)
++{
++  if (s_mc.applied == mode)
++    return;
++  SelRestoreList(s_mc.rows);
++  const auto& cups = McCups(mode);
++  for (int c = 0; c < 5; c++)
++  {
++    if (cups[c].ids.size() != 5)
++      continue;
++    u8 row[10];
++    for (int k = 0; k < 5; k++)
++    {
++      row[2 * k] = 0;
++      row[2 * k + 1] = static_cast<u8>(cups[c].ids[k]);
++    }
++    for (u32 cp = 0; cp < 3; cp++)
++      SelPatch(s_mc.rows, B + kCupTable + cp * 132 + 12u * static_cast<u32>(c + 1), row, sizeof(row));
++  }
++  s_mc.applied = mode;
++  std::fprintf(stderr, "ERMODES modecup: %s cups on\n", kModeKeys[mode]);
++}
++// every pad poll: outside the cup screen
++void McOutside(int mo, int sub, int gtype)
++{
++  if (mo != 1)
++  {
++    s_mc.menu.clear();  // the menu heap is gone; it reloads from the disc
++    if (mo == 2 && s_mc.applied >= 0 && !s_mc.saved)
++    {
++      McRemember(s_mc.applied, s_mc.cur_row, s_mc.cur_idx);
++      s_mc.saved = true;
++    }
++    return;
++  }
++  if (sub == 14 || (sub == 15 && gtype != 1 && gtype != 3))
++  {
++    if (s_mc.applied >= 0 || !s_mc.menu.empty())
++      McRestoreAll(true);
++    s_mc.cache = false;
++  }
++  else if (sub != 15 && sub != -1)
++    McRestoreMenu(true);
++}
++// on the cup screen (Cups phase); step = the screen's step (0 cups, 1 Select Course)
++void McCupScreen(u32 B, u8* st, int page, int row, int step, int gtype, GCPadStatus* s, int last)
++{
++  const int mode = s_gpsel.last;
++  const bool has = page == 0 && mode >= 0 && mode < 4 && McHasCups(mode);
++  if (step == 0)
++  {
++    if (has)
++    {
++      McApplyRows(B, mode);
++      McApplyMenu(mode);
++      if (!s_mc.row_set && gtype == 3)
++      {
++        const int r = McRemembered(mode).first;  // Practice: the cup last raced from
++        if (r >= 1 && r <= last)
++        {
++          st[0x8C] = 0;
++          st[0x8D] = static_cast<u8>(r);
++        }
++      }
++      s_mc.row_set = true;
++      SelNoEdge(s, row <= 1, row >= last);  // the mode's cups only: no page flips
++    }
++    else if (s_mc.applied >= 0 || !s_mc.menu.empty())
++      McRestoreAll(true);
++  }
++  else if (step == 1 && s_mc.applied >= 0)
++  {
++    const auto& cup = McCups(s_mc.applied)[std::clamp(row, 1, 5) - 1];
++    if (s_mc.prev_step == 0 && gtype == 3 && cup.ids.size() == 5)
++    {
++      const auto rem = McRemembered(s_mc.applied);
++      const int idx = rem.first == row ? rem.second : 0;
++      st[0x8E] = 0;
++      st[0x8F] = static_cast<u8>(idx);
++      st[0x90] = 0;
++      st[0x91] = static_cast<u8>(cup.ids[idx]);
++      std::fprintf(stderr, "ERMODES modecup: Select Course on %s cup %d track %d (course %d)\n", kModeKeys[s_mc.applied], row,
++                   idx + 1, cup.ids[idx]);
++    }
++    s_mc.cur_row = std::clamp(row, 1, 5);
++    s_mc.cur_idx = std::clamp<int>(BE16(st + 0x8E), 0, 4);
++    s_mc.saved = gtype != 3;
++  }
++  s_mc.prev_step = step;
++}
++
 +// Practice options (menu state): +0x12C CPU racers (0..29), +0x136 Restore, +0x13A laps (0 = free run, game mode 3; else game mode 6).
 +// Cutoff, Breakaway, Hunted and a Gauntlet stage need rivals and a finish, so while one is picked the field is held at 29
 +// CPUs and a free run becomes 3 laps (a lap count he set himself stays). His own values come back when the mode is Normal
@@ -23617,6 +23893,7 @@ HcmV?d00001
 +  const int mo = BE16(pm), sub = BE16(pm + 2);
 +  const int gtype = BE16(st);
 +  SelPracticeField(st, mo, sub, gtype);
++  McOutside(mo, sub, gtype);
 +  const bool scr = mo == 1 && sub == 15 && (gtype == 1 || gtype == 3) && BE32(st + 0x98) == 0x80000000u;
 +  if (!scr)
 +  {
@@ -23648,6 +23925,7 @@ HcmV?d00001
 +  switch (s_gpsel.phase)
 +  {
 +  case SelPhase::Leave:
++    McRestoreAll(true);
 +    SelBlockAll(s);
 +    if (page >= 2)
 +    {
@@ -23690,6 +23968,7 @@ HcmV?d00001
 +      std::memcpy(st + 0xF0, s_gpsel.timers, sizeof(s_gpsel.timers));  // the game's confirm timers: as before the A press
 +      const int pick = std::clamp(row - 1, 0, s_gpsel.modes - 1);
 +      s_gpsel.last = pick;
++      s_mc.cache = false;
 +      File::WriteStringToFile(SelFile(), std::to_string(pick));
 +      s_pick = pick < 4 ? pick : 0;
 +      s_pick_practice = gtype == 3;
@@ -23736,6 +24015,7 @@ HcmV?d00001
 +      s_pad_swallow |= PAD_BUTTON_B;
 +      s->button &= ~PAD_BUTTON_B;
 +      s_gpsel.phase = SelPhase::Leave;
++      McRestoreAll(true);
 +      s_gpsel.t0 = fr;
 +      if (page >= 2)
 +      {
@@ -23751,10 +24031,16 @@ HcmV?d00001
 +      const u8* b = InRam(cp) ? P(cp + 2, 1) : nullptr;
 +      const bool open = SelAllOpen(B), ax = open || (flags & kAxBits) == kAxBits, dia = open || (b && (*b & 1));
 +      const int last = ax ? 5 : dia ? 4 : 3;
-+      if (page >= 2)
++      // only while the CUPS are chosen: on Select Course (step 1, same screen) left / right pick the course. Clamping there
++      // too kept the Gauntlet page's Select Course on its first stage (and Ruby's on its first course for left).
++      const bool course_step = e && BE16(e) == 1;
++      if (course_step)
++        ;
++      else if (page >= 2)
 +        SelNoSideways(s);
 +      else if (pages)
 +        SelNoEdge(s, page == 0 && row <= 1, page == 1 && row >= last);
++      McCupScreen(B, st, page, row, e ? BE16(e) : -1, gtype, s, last);
 +    }
 +    break;
 +  default:
@@ -23790,6 +24076,7 @@ HcmV?d00001
 +      s_gpsel.menu.clear();
 +      s_gpsel.save.clear();
 +      s_gpsel.prev_sub = 0;
++      s_mc = ModeCupState{};  // a new boot: nothing of ours in its RAM
 +    }
 +    s_menu_frame = fr;
 +    const bool select_screen = SelectModeFilter(B, fr, s, pressed);
