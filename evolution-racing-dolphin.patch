@@ -15131,7 +15131,7 @@ HcmV?d00001
  
 +// Evolution Racing member build id (one id for the Linux and the Windows build of the same source)
 +#ifndef ER_BUILD_ID
-+#define ER_BUILD_ID "lit17s43ermbtghlp"
++#define ER_BUILD_ID "lit17s43ermbtghlpx"
 +#endif
 +const std::string& GetERBuildStr()
 +{
@@ -15141,7 +15141,7 @@ HcmV?d00001
 +
 +// Evolution Racing X.Y (hub/server/versions.json; lighting_mod/updater/apply_version.py sets it)
 +#ifndef ER_VERSION
-+#define ER_VERSION "1.7.8"
++#define ER_VERSION "1.7.9"
 +#endif
 +// "ER_VERSION=1.3" stays in the binary (not const, read below): scripts/dolphinpack.py / winpack.py look for it
 +extern char er_version_marker[];
@@ -18547,7 +18547,7 @@ HcmV?d00001
 +}  // namespace ERTest
 --- a/Source/Core/Core/ERTrackGpuHooks.cpp
 +++ b/Source/Core/Core/ERTrackGpuHooks.cpp
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,522 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +//
@@ -18812,6 +18812,14 @@ HcmV?d00001
 +        else
 +          std::memset(p.globals, 0, sizeof(p.globals));
 +        p.env_on = R32(system, 0x801A6D78);
++        if (const u8* q = Ram(system, 0x8019F008, sizeof(p.proj)))
++          std::memcpy(p.proj, q, sizeof(p.proj));
++        else
++          std::memset(p.proj, 0, sizeof(p.proj));
++        if (const u8* q = Ram(system, 0x801A7480, sizeof(p.consts)))
++          std::memcpy(p.consts, q, sizeof(p.consts));
++        else
++          std::memset(p.consts, 0, sizeof(p.consts));
 +        const u8* l1 = system.GetMemory().GetL1Cache();
 +        for (int i = 0; i < 12; i++)
 +        {
@@ -31593,7 +31601,7 @@ HcmV?d00001
 +}  // namespace ERThreatHud
 --- a/Source/Core/VideoCommon/ERTrackGpu.cpp
 +++ b/Source/Core/VideoCommon/ERTrackGpu.cpp
-@@ -0,0 +1,1043 @@
+@@ -0,0 +1,1108 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +//
@@ -31772,8 +31780,11 @@ HcmV?d00001
 +struct MtxRun
 +{
 +  u16 addr = 0;
-+  std::vector<u32> v;      // host-endian words as loaded
-+  std::vector<u16> src;    // candidate offsets (words) into the payload search buffer; empty = literal
++  std::vector<u32> v;      // host-endian words as loaded (first capture of the template)
++  // per word: candidate indices into the payload search buffer that held the same value (intersection over the
++  // verified captures; order = preference, see BuildSearch), and whether the value changed between captures
++  std::vector<std::vector<u16>> wsrc;
++  std::vector<u8> changed;
 +};
 +
 +struct DrawRec
@@ -31819,29 +31830,61 @@ HcmV?d00001
 +Payload s_cur_payload;
 +std::vector<MtxRun> s_pending_runs;
 +std::vector<u32> s_search;  // payload words (host-endian) the matrix runs are matched against
++std::vector<u32> s_rsearch;  // the same, built from a replay call's payload
 +
++// the values a matrix the model draw loads can be made of, in order of preference: the env / reflection matrices of
++// fn_80074D88 / fn_8007698C & co are the current model-view matrix (locked cache 0xE0000000) with some entries replaced
++// by sdata2 constants (0, 1, 0.5) or by a constant times a projection scale (lbl_8019F008, post matrix 76); scroll /
++// projection matrices come from the game globals 0x8019F040..
++constexpr u32 kSearchM = 0, kSearchC = 12, kSearchP = kSearchC + 12, kSearchPC = kSearchP + 7,
++              kSearchG = kSearchPC + 12 * 7 * 2;
 +void BuildSearch(const Payload& p, std::vector<u32>* out)
 +{
 +  out->clear();
-+  for (size_t i = 0; i + 4 <= sizeof(p.globals); i += 4)
-+    out->push_back(Common::swap32(p.globals + i));
++  out->reserve(kSearchG + sizeof(p.globals) / 4);
 +  for (int i = 0; i < 12; i++)
 +  {
 +    u32 w;
 +    std::memcpy(&w, &p.mtxA[i], 4);
 +    out->push_back(w);
 +  }
++  float c[12], pr[7];
++  for (int i = 0; i < 12; i++)
++  {
++    const u32 w = Common::swap32(p.consts + 4 * i);
++    out->push_back(w);
++    std::memcpy(&c[i], &w, 4);
++  }
++  for (int i = 0; i < 7; i++)
++  {
++    const u32 w = Common::swap32(p.proj + 4 * i);
++    out->push_back(w);
++    std::memcpy(&pr[i], &w, 4);
++  }
++  for (int i = 0; i < 12; i++)
++    for (int j = 0; j < 7; j++)
++      for (int sg = 0; sg < 2; sg++)
++      {
++        // single-precision product, as the game's fmuls computes it
++        volatile float f = c[i] * (sg ? -pr[j] : pr[j]);
++        const float ff = f;
++        u32 w;
++        std::memcpy(&w, &ff, 4);
++        out->push_back(w);
++      }
++  for (size_t i = 0; i + 4 <= sizeof(p.globals); i += 4)
++    out->push_back(Common::swap32(p.globals + i));
 +}
 +
 +void FindSources(MtxRun& r, const std::vector<u32>& search)
 +{
-+  r.src.clear();
 +  const size_t n = r.v.size();
-+  if (n == 0 || n > search.size())
-+    return;
-+  for (size_t o = 0; o + n <= search.size(); o++)
-+    if (std::equal(r.v.begin(), r.v.end(), search.begin() + o))
-+      r.src.push_back(static_cast<u16>(o));
++  r.wsrc.assign(n, {});
++  r.changed.assign(n, 0);
++  for (size_t i = 0; i < n; i++)
++    for (size_t o = 0; o < search.size(); o++)
++      if (search[o] == r.v[i])
++        r.wsrc[i].push_back(static_cast<u16>(o));
 +}
 +
 +bool PopPayload(u32 slot, u32 kind, Payload* out)
@@ -32039,29 +32082,34 @@ HcmV?d00001
 +      }
 +      if (IsGameTexMtx(x.addr, x.v.size()))
 +        continue;  // computed from the payload on replay
-+      if (x.v == y.v && (x.src.empty() || y.src.empty()))
++      // per word: the sources that held the value in every capture; a word whose value changed must keep one
++      for (size_t q = 0; q < x.v.size(); q++)
 +      {
-+        x.src.clear();  // a literal that never changed: keep it literal
-+        continue;
-+      }
-+      std::vector<u16> inter;
-+      std::set_intersection(x.src.begin(), x.src.end(), y.src.begin(), y.src.end(), std::back_inserter(inter));
-+      if (inter.empty())
-+      {
-+        float f[4], m[4];
-+        for (int q = 0; q < 4; q++)
++        std::vector<u16> inter;
++        std::set_intersection(x.wsrc[q].begin(), x.wsrc[q].end(), y.wsrc[q].begin(), y.wsrc[q].end(),
++                              std::back_inserter(inter));
++        const bool ch = x.changed[q] || x.v[q] != y.v[q];
++        if (ch && inter.empty())
 +        {
-+          std::memcpy(&f[q], &y.v[q], 4);
-+          std::memcpy(&m[q], &s_cur_payload.mtxA[q], 4);
++          float f, m;
++          std::memcpy(&f, &y.v[q], 4);
++          std::memcpy(&m, &s_cur_payload.mtxA[q % 12], 4);
++          std::snprintf(buf, sizeof(buf),
++                        "draw %zu matrix load at %04x/%zu word %zu changed with no game source (%zu/%zu cand.) %.5f "
++                        "(mtxA[%zu] %.5f)",
++                        i, x.addr, y.v.size(), q, x.wsrc[q].size(), y.wsrc[q].size(), f, q % 12, m);
++          *diff = buf;
++          return false;
 +        }
-+        std::snprintf(buf, sizeof(buf),
-+                      "draw %zu matrix load at %04x/%zu changed with no game source (%zu/%zu cand.) row0 %.4f %.4f %.4f %.4f "
-+                      "mtxA %.4f %.4f %.4f %.4f",
-+                      i, x.addr, y.v.size(), x.src.size(), y.src.size(), f[0], f[1], f[2], f[3], m[0], m[1], m[2], m[3]);
-+        *diff = buf;
-+        return false;
 +      }
-+      x.src = inter;
++      for (size_t q = 0; q < x.v.size(); q++)
++      {
++        std::vector<u16> inter;
++        std::set_intersection(x.wsrc[q].begin(), x.wsrc[q].end(), y.wsrc[q].begin(), y.wsrc[q].end(),
++                              std::back_inserter(inter));
++        x.changed[q] = x.changed[q] || x.v[q] != y.v[q];
++        x.wsrc[q] = std::move(inter);
++      }
 +    }
 +  }
 +  for (size_t i = 0; i < t.draws.size(); i++)
@@ -32271,6 +32319,7 @@ HcmV?d00001
 +    TakeSnap(&s_img);
 +  s_rb.clear();
 +  u32 sk = 0;
++  bool have_search = false;
 +  for (DrawRec& d : sd.tmpl.draws)
 +  {
 +    if (!d.lists)
@@ -32280,7 +32329,11 @@ HcmV?d00001
 +      const u32 n = static_cast<u32>(r.v.size());
 +      if (n > 16)
 +        continue;
-+      bool saved = false;
++      // fn_800756B0's matrices are put back after the replay (every game model draw loads them itself). The other
++      // matrices (env / reflection, built from the model-view matrix) are left as the game's own draw leaves them: the
++      // game's next draws may use them without loading them again (e.g. the translucent pass of the same model)
++      const bool restore = GameTexMtxSource(r.addr, n, p) >= 0;
++      bool saved = !restore;
 +      for (const MtxSave& m : s_msave)
 +        saved = saved || (m.addr == r.addr && m.n == n);
 +      if (!saved)
@@ -32297,7 +32350,25 @@ HcmV?d00001
 +        PutXF(s_rb, r.addr, w, 12);
 +      }
 +      else
-+        PutXF(s_rb, r.addr, r.v.data(), n);
++      {
++        // every word from its learnt source in this call's payload (current model-view matrix, constants,
++        // projection scales, game globals); a word with no source never changed: the recorded value
++        u32 w[16];
++        for (u32 i = 0; i < n; i++)
++        {
++          w[i] = r.v[i];
++          if (i < r.wsrc.size() && !r.wsrc[i].empty())
++          {
++            if (!have_search)
++            {
++              BuildSearch(p, &s_rsearch);
++              have_search = true;
++            }
++            w[i] = s_rsearch[r.wsrc[i][0]];
++          }
++        }
++        PutXF(s_rb, r.addr, w, n);
++      }
 +    }
 +    for (u8 k : d.l_cp)
 +      if (s_img.cp[k] != d.s.cp[k])
@@ -32598,15 +32669,17 @@ HcmV?d00001
 +  r.addr = address;
 +  for (u32 i = 0; i < count; i++)
 +    r.v.push_back(Common::swap32(data + 4 * i));
-+  // only fn_800756B0's texture matrices are understood (computed on replay); a model draw that loads others (the
-+  // env / reflection / projected-light matrices of fn_80074D88 / fn_8007698C, skinning) stays on the game
-+  if (!IsGameTexMtx(r.addr, r.v.size()) && s_cur.unsupported.empty())
++  // fn_800756B0's texture matrices are computed on replay from the payload globals; every other matrix the model draw
++  // loads (the env / reflection matrices of fn_80074D88 / fn_8007698C & co, built per frame from the model-view
++  // matrix) is rebuilt word by word from the sources learnt over the verification captures (FindSources / Compare)
++  if ((r.v.empty() || r.v.size() > 16) && s_cur.unsupported.empty())
 +  {
 +    char t[64];
 +    std::snprintf(t, sizeof(t), "matrix load at %04x/%zu", r.addr, r.v.size());
 +    s_cur.unsupported = t;
 +  }
-+  FindSources(r, s_search);
++  if (!IsGameTexMtx(r.addr, r.v.size()))
++    FindSources(r, s_search);
 +  s_pending_runs.push_back(std::move(r));
 +}
 +
@@ -32639,7 +32712,7 @@ HcmV?d00001
 +}  // namespace ERTrackGpu
 --- a/Source/Core/VideoCommon/ERTrackGpu.h
 +++ b/Source/Core/VideoCommon/ERTrackGpu.h
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,86 @@
 +// Copyright 2026 Evolution Racing contributors
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +//
@@ -32690,7 +32763,9 @@ HcmV?d00001
 +  u32 model = 0;
 +  u8 globals[0x170];  // RAM 0x8019F040..0x8019F1B0: the texture matrices fn_800756B0 loads (+0x20, +0x50.., lbl_8019F158)
 +  u32 env_on = 0;      // lbl_801A6D78: texture matrix 0x24 = globals + 0x20 (else the identity-like lbl_8019F158 + 0x20)
-+  float mtxA[12];     // locked cache 0xE0000000: the game's current model-view matrix (diagnostics)
++  float mtxA[12];     // locked cache 0xE0000000: the game's current model-view matrix (source of env matrices)
++  u8 proj[0x1C];      // RAM 0x8019F008 (lbl_8019F008: projection scales fn_80074D88 puts into post matrix 76)
++  u8 consts[0x30];    // RAM 0x801A7480..0x801A74B0 (sdata2 float constants the env matrix code writes: 0, 1, 0.5..)
 +};
 +
 +struct Shared
